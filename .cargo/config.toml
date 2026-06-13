@@ -1,0 +1,3 @@
+# web-sys gates the WebHID API behind this cfg until the spec stabilizes.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=web_sys_unstable_apis"]

@@ -1,10 +1,11 @@
 //! WebAssembly backend: [WebHID](https://wicg.github.io/webhid/) via `web-sys`.
 //!
-//! Unlike the native backends this API is inherently async (every WebHID
-//! operation returns a Promise) and event-driven (input reports arrive as
-//! `inputreport` events instead of being read from a handle), so it does not
-//! share the blocking `HidApi`/`HidDevice` surface. Method names and buffer
-//! conventions still mirror hidapi where they make sense:
+//! Internal module: the public `wasm32` surface is [`crate::HidApi`] /
+//! [`crate::HidDevice`], which wrap the types here. Unlike the native backends
+//! this API is inherently async (every WebHID operation returns a Promise) and
+//! event-driven (input reports arrive as `inputreport` events instead of being
+//! read from a handle). Method names and buffer conventions still mirror
+//! hidapi where they make sense:
 //!
 //! * [`WebHidDevice::write`] / [`WebHidDevice::send_feature_report`] take
 //!   hidapi-style buffers whose first byte is the report ID (0 when the
@@ -15,22 +16,22 @@
 //! WebHID is only available in secure contexts (HTTPS or localhost) on
 //! Chromium-based browsers, and device access is permission-gated: the user
 //! must pick devices from the chooser shown by
-//! [`WebHidApi::request_device`], which in turn may only be called from a
+//! [`crate::HidApi::request_device`], which in turn may only be called from a
 //! user gesture (e.g. a click handler).
 //!
 //! ```no_run
 //! # #[cfg(target_arch = "wasm32")] async fn demo() -> hidra::HidResult<()> {
-//! use hidra::webhid::{DeviceFilter, WebHidApi};
+//! use hidra::{DeviceFilter, HidApi};
 //!
-//! let api = WebHidApi::new()?;
+//! let api = HidApi::new()?;
 //! // Must run inside a user gesture:
 //! let devices = api.request_device(&[DeviceFilter::new().vendor_id(0x046d)]).await?;
 //! let device = &devices[0];
 //! device.open().await?;
 //! device.write(&[0x00, 0x01, 0x02]).await?; // report ID 0 + payload
-//! let mut reports = device.start_reading();
-//! let report = reports.read().await?;
-//! # Ok(()) }
+//! let mut buf = [0u8; 64];
+//! let len = device.read(&mut buf).await?;
+//! # let _ = len; Ok(()) }
 //! ```
 
 use std::cell::RefCell;
@@ -83,9 +84,9 @@ fn dataview_to_vec(view: &js_sys::DataView) -> Vec<u8> {
 /// Keeps an event listener (and the Rust closure backing it) alive;
 /// removes the listener when dropped.
 ///
-/// Returned by [`WebHidApi::on_connect`], [`WebHidApi::on_disconnect`] and
-/// [`WebHidDevice::on_input_report`]. Dropping the handle unregisters the
-/// callback; call [`forget`](Self::forget) to leak it and keep the listener
+/// Returned by [`crate::HidApi::on_connect`], [`crate::HidApi::on_disconnect`]
+/// and [`crate::HidDevice::on_input_report`]. Dropping the handle unregisters
+/// the callback; call [`forget`](Self::forget) to leak it and keep the listener
 /// installed for the lifetime of the page.
 pub struct EventListenerHandle {
     target: web_sys::EventTarget,
@@ -129,7 +130,7 @@ impl Drop for EventListenerHandle {
     }
 }
 
-/// A device filter for [`WebHidApi::request_device`], mirroring WebHID's
+/// A device filter for [`crate::HidApi::request_device`], mirroring WebHID's
 /// `HIDDeviceFilter` dictionary. Unset fields match anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DeviceFilter {
@@ -566,7 +567,7 @@ struct StreamState {
 }
 
 /// A buffered reader over `inputreport` events, created by
-/// [`WebHidDevice::start_reading`].
+/// [`crate::HidDevice::start_reading`].
 ///
 /// Reports follow the native `read()` convention: each buffer is prefixed
 /// with its report ID byte iff the device declares numbered reports. At most
@@ -590,6 +591,15 @@ impl InputReportStream {
     /// mode; `None` when no report is queued).
     pub fn try_read(&mut self) -> Option<Vec<u8>> {
         self.state.borrow_mut().queue.pop_front()
+    }
+
+    /// An owned read future that does not borrow the stream, only its shared
+    /// queue. Lets [`crate::HidDevice::read`] hold the stream in a `RefCell`
+    /// without keeping the cell borrowed across the await.
+    pub(crate) fn next_report(&self) -> impl Future<Output = HidResult<Vec<u8>>> {
+        ReadFuture {
+            state: self.state.clone(),
+        }
     }
 }
 

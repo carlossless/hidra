@@ -11,14 +11,19 @@
 //! | Windows  | `hid.dll` / SetupAPI via `windows-sys` declarations |
 //! | macOS    | IOHIDManager via direct framework FFI |
 //! | Any (feature `nusb`) | USB interrupt/control transfers via [nusb] |
-//! | WebAssembly | [WebHID](https://wicg.github.io/webhid/) via `web-sys` (async, in `webhid`) |
+//! | WebAssembly | [WebHID](https://wicg.github.io/webhid/) via `web-sys` |
 //!
 //! Following nusb's model, every [`HidApi`] / [`HidDevice`] I/O method returns
-//! an `impl Future`. Bring [`MaybeFuture`] into scope to drive it blocking with
-//! `.wait()` on native targets, or `.await` it under any async runtime (no
-//! executor dependency, wake-ups are plain `Waker`s like nusb). On `wasm32` the
-//! `webhid` module provides an async equivalent, and [`descriptor`] offers
-//! report-descriptor primitives that work everywhere.
+//! an `impl Future`. On native targets bring `MaybeFuture` into scope to drive
+//! it blocking with `.wait()`, or `.await` it under any async runtime (no
+//! executor dependency, wake-ups are plain `Waker`s like nusb).
+//!
+//! On `wasm32` the same [`HidApi`] / [`HidDevice`] types are backed by WebHID;
+//! there is no blocking mode, so always `.await` their futures (no `.wait()`).
+//! Discovery is WebHID-shaped: `HidApi::request_device` shows the browser's
+//! device chooser (filtered with `DeviceFilter`) and `HidApi::get_devices`
+//! lists previously granted devices. [`descriptor`] offers report-descriptor
+//! primitives that work everywhere.
 //!
 //! ```no_run
 //! # #[cfg(not(target_arch = "wasm32"))] fn demo() -> hidra::HidResult<()> {
@@ -57,7 +62,13 @@ pub use maybe_future::MaybeFuture;
 pub(crate) mod test_util;
 
 #[cfg(target_arch = "wasm32")]
-pub mod webhid;
+mod webhid;
+
+/// WebHID-only public surface: the device filter for `HidApi::request_device`,
+/// the listener handle returned by the event hooks, and the buffered input
+/// report stream from `HidDevice::start_reading`.
+#[cfg(target_arch = "wasm32")]
+pub use webhid::{DeviceFilter, EventListenerHandle, InputReportStream};
 
 /// hidra's version, mirroring `hid_version()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +105,9 @@ pub const fn version_str() -> &'static str {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::{HidApi, HidDevice};
+
+#[cfg(target_arch = "wasm32")]
+pub use web::{HidApi, HidDevice};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
@@ -369,3 +383,272 @@ mod native {
 /// Largest report descriptor a HID device can have
 /// (`HID_API_MAX_REPORT_DESCRIPTOR_SIZE`).
 pub const MAX_REPORT_DESCRIPTOR_SIZE: usize = 4096;
+
+#[cfg(target_arch = "wasm32")]
+mod web {
+    use core::cell::RefCell;
+    use core::future::Future;
+
+    use crate::webhid::{
+        CollectionInfo, DeviceFilter, EventListenerHandle, InputReportStream, WebHidApi,
+        WebHidDevice,
+    };
+    use crate::{DeviceInfo, HidResult};
+
+    /// Entry point to the library, backed by WebHID (`navigator.hid`).
+    ///
+    /// Discovery is WebHID-shaped rather than hidapi-shaped: the browser only
+    /// ever exposes devices the user has granted access to, so there is no
+    /// enumerate / open-by-vid-pid. Use [`request_device`](Self::request_device)
+    /// to show the permission chooser and [`get_devices`](Self::get_devices) to
+    /// list previously granted devices.
+    pub struct HidApi {
+        backend: WebHidApi,
+    }
+
+    // These I/O methods return `impl Future` to mirror the native `HidApi` /
+    // `HidDevice` signatures exactly (native backs them with `Blocking`, not an
+    // async block), so the `manual_async_fn` suggestion does not apply.
+    #[allow(clippy::manual_async_fn)]
+    impl HidApi {
+        /// Bind to `window.navigator.hid`.
+        ///
+        /// Fails with [`HidError::Initialization`](crate::HidError::Initialization)
+        /// when WebHID is unavailable (no window, a non-secure context, or a
+        /// browser without WebHID support).
+        pub fn new() -> HidResult<Self> {
+            Ok(HidApi {
+                backend: WebHidApi::new()?,
+            })
+        }
+
+        /// Ask the user to grant access to devices matching `filters`
+        /// (`navigator.hid.requestDevice`). An empty filter list matches every
+        /// device.
+        ///
+        /// Shows the browser's device chooser and resolves with every device
+        /// the user granted (an empty `Vec` when the chooser was dismissed).
+        /// **Must be called from within a user gesture** (e.g. a click event
+        /// handler), otherwise the browser rejects the request.
+        pub fn request_device<'a>(
+            &'a self,
+            filters: &'a [DeviceFilter],
+        ) -> impl Future<Output = HidResult<Vec<HidDevice>>> + 'a {
+            async move {
+                let devices = self.backend.request_device(filters).await?;
+                Ok(devices.into_iter().map(HidDevice::new).collect())
+            }
+        }
+
+        /// Devices the user has already granted this origin access to
+        /// (`navigator.hid.getDevices`). Needs no user gesture.
+        pub fn get_devices(&self) -> impl Future<Output = HidResult<Vec<HidDevice>>> + '_ {
+            async move {
+                let devices = self.backend.get_devices().await?;
+                Ok(devices.into_iter().map(HidDevice::new).collect())
+            }
+        }
+
+        /// Invoke `f` whenever a granted device is plugged in (the `connect`
+        /// event). Drop the returned handle to unregister.
+        pub fn on_connect(&self, mut f: impl FnMut(HidDevice) + 'static) -> EventListenerHandle {
+            self.backend.on_connect(move |dev| f(HidDevice::new(dev)))
+        }
+
+        /// Invoke `f` whenever a granted device is unplugged (the `disconnect`
+        /// event). Drop the returned handle to unregister.
+        pub fn on_disconnect(&self, mut f: impl FnMut(HidDevice) + 'static) -> EventListenerHandle {
+            self.backend
+                .on_disconnect(move |dev| f(HidDevice::new(dev)))
+        }
+
+        /// The underlying `navigator.hid` object (WebHID escape hatch).
+        pub fn raw(&self) -> &web_sys::Hid {
+            self.backend.raw()
+        }
+    }
+
+    /// An HID device exposed by the browser (`hid_device` equivalent), backed
+    /// by WebHID.
+    ///
+    /// Unlike native hidapi the handle exists before the device is opened, so
+    /// call [`open`](Self::open) before transferring reports.
+    pub struct HidDevice {
+        backend: WebHidDevice,
+        /// Lazily started on the first [`read`](Self::read); reused thereafter.
+        stream: RefCell<Option<InputReportStream>>,
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    impl HidDevice {
+        fn new(backend: WebHidDevice) -> Self {
+            HidDevice {
+                backend,
+                stream: RefCell::new(None),
+            }
+        }
+
+        // --- shared methods (signatures match native) ----------------------
+
+        /// Send an output report (`hid_write`).
+        ///
+        /// `data[0]` must be the report ID (0 when the device has no numbered
+        /// reports); the first byte is consumed accordingly and counts toward
+        /// the returned length.
+        pub fn write<'a>(&'a self, data: &'a [u8]) -> impl Future<Output = HidResult<usize>> + 'a {
+            self.backend.write(data)
+        }
+
+        /// Read one input report asynchronously (hidra's async `hid_read`).
+        ///
+        /// Resolves once a report has been copied into `buf`, returning its
+        /// length. Reports are prefixed with their report ID only when the
+        /// device uses numbered reports, matching native.
+        ///
+        /// Backed by a single [`InputReportStream`] lazily started on the first
+        /// call (so reports are queued from that point on); subsequent reads
+        /// reuse it and drain the queue in order.
+        pub fn read<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> impl Future<Output = HidResult<usize>> + 'a {
+            async move {
+                if self.stream.borrow().is_none() {
+                    *self.stream.borrow_mut() = Some(self.backend.start_reading());
+                }
+                // `next_report` clones the stream's shared queue handle, so the
+                // RefCell borrow is released before awaiting.
+                let read = {
+                    let guard = self.stream.borrow();
+                    let stream = guard.as_ref().expect("stream started above");
+                    stream.next_report()
+                };
+                let report = read.await?;
+                let len = report.len().min(buf.len());
+                buf[..len].copy_from_slice(&report[..len]);
+                Ok(len)
+            }
+        }
+
+        /// Send a feature report (`hid_send_feature_report`). `data[0]` is the
+        /// report ID, 0 if unnumbered.
+        pub fn send_feature_report<'a>(
+            &'a self,
+            data: &'a [u8],
+        ) -> impl Future<Output = HidResult<()>> + 'a {
+            self.backend.send_feature_report(data)
+        }
+
+        /// Get a feature report (`hid_get_feature_report`). Set `buf[0]` to the
+        /// report ID before calling; returns the report (ID included) and its
+        /// length.
+        pub fn get_feature_report<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> impl Future<Output = HidResult<usize>> + 'a {
+            async move {
+                let report_id =
+                    buf.first()
+                        .copied()
+                        .ok_or_else(|| crate::HidError::InvalidData {
+                            message: "get_feature_report requires at least the report ID byte"
+                                .into(),
+                        })?;
+                let report = self.backend.get_feature_report(report_id).await?;
+                let len = report.len().min(buf.len());
+                buf[..len].copy_from_slice(&report[..len]);
+                Ok(len)
+            }
+        }
+
+        /// Raw report descriptor (`hid_get_report_descriptor`). Returns the
+        /// number of bytes written into `buf`; 4096 bytes is always enough.
+        pub fn get_report_descriptor<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> impl Future<Output = HidResult<usize>> + 'a {
+            async move {
+                let descriptor = self.backend.report_descriptor()?;
+                let len = descriptor.len().min(buf.len());
+                buf[..len].copy_from_slice(&descriptor[..len]);
+                Ok(len)
+            }
+        }
+
+        /// Raw report descriptor as a vector (convenience over
+        /// [`get_report_descriptor`](Self::get_report_descriptor)).
+        pub fn report_descriptor(&self) -> impl Future<Output = HidResult<Vec<u8>>> + '_ {
+            async move { self.backend.report_descriptor() }
+        }
+
+        /// Parsed report descriptor (hidra extension built on
+        /// [`crate::descriptor`]).
+        pub async fn parsed_report_descriptor(
+            &self,
+        ) -> HidResult<crate::descriptor::ReportDescriptor> {
+            self.backend.parsed_report_descriptor()
+        }
+
+        /// Product string (`hid_get_product_string`).
+        pub fn get_product_string(&self) -> impl Future<Output = HidResult<Option<String>>> + '_ {
+            async move { Ok(self.backend.product_name()) }
+        }
+
+        /// Metadata for this open device (`hid_get_device_info`).
+        pub fn get_device_info(&self) -> impl Future<Output = HidResult<DeviceInfo>> + '_ {
+            async move { Ok(self.backend.device_info()) }
+        }
+
+        // --- WebHID-specific extras ----------------------------------------
+
+        /// Open the device for I/O (`HIDDevice.open`). Required before any
+        /// report transfer.
+        pub async fn open(&self) -> HidResult<()> {
+            self.backend.open().await
+        }
+
+        /// Close the device (`HIDDevice.close`). The permission grant is kept,
+        /// reopen with [`open`](Self::open).
+        pub async fn close(&self) -> HidResult<()> {
+            // Drop any input stream so a reopen starts a fresh listener.
+            *self.stream.borrow_mut() = None;
+            self.backend.close().await
+        }
+
+        /// Whether the device is currently open (`HIDDevice.opened`).
+        pub fn opened(&self) -> bool {
+            self.backend.opened()
+        }
+
+        /// Revoke the user's permission grant for this device
+        /// (`HIDDevice.forget`).
+        pub async fn forget(&self) -> HidResult<()> {
+            self.backend.forget().await
+        }
+
+        /// Invoke `f` with `(report_id, payload)` for every incoming input
+        /// report (the `inputreport` event). Drop the returned handle to
+        /// unregister.
+        pub fn on_input_report(&self, f: impl FnMut(u8, Vec<u8>) + 'static) -> EventListenerHandle {
+            self.backend.on_input_report(f)
+        }
+
+        /// Start an independent buffered input-report stream. Most callers
+        /// should use [`read`](Self::read) instead; this is exposed for the
+        /// WebHID streaming idiom.
+        pub fn start_reading(&self) -> InputReportStream {
+            self.backend.start_reading()
+        }
+
+        /// The collection tree the browser parsed from the device's report
+        /// descriptor (`HIDDevice.collections`).
+        pub fn collections(&self) -> Vec<CollectionInfo> {
+            self.backend.collections()
+        }
+
+        /// The underlying `HIDDevice` object (WebHID escape hatch).
+        pub fn raw(&self) -> &web_sys::HidDevice {
+            self.backend.raw()
+        }
+    }
+}

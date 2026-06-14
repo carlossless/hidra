@@ -1,66 +1,73 @@
 # hidra
 
-A pure-Rust HID library, with a complete blocking HID API, a WebHID backend
-for WebAssembly, and standalone HID report-descriptor primitives.
+A pure-Rust HID library with a unified async API (with blocking `.wait()` on
+native targets, like nusb), a WebHID backend for WebAssembly, and standalone
+HID report-descriptor primitives.
 
-No C library is linked. Every backend talks to the operating system directly:
+No C library is linked. One `HidApi` / `HidDevice` regardless of backend:
 
 | Platform | Backend | Notes |
 |----------|---------|-------|
 | Linux | `hidraw` device nodes, sysfs enumeration | no libudev dependency |
 | Windows | `hid.dll` + SetupAPI (via `windows-sys` declarations) | |
 | macOS | IOHIDManager (direct framework FFI) | |
-| any native OS | raw USB transfers via [nusb](https://docs.rs/nusb) | optional `nusb` feature, a pure-Rust USB transport |
-| WebAssembly | [WebHID](https://wicg.github.io/webhid/) via `web-sys` | async API in `hidra::webhid` |
+| any native OS | raw USB transfers via [nusb](https://docs.rs/nusb) | optional `nusb` feature, swaps in a pure-Rust USB transport |
+| WebAssembly | [WebHID](https://wicg.github.io/webhid/) via `web-sys` | same `HidApi`/`HidDevice`, await-only |
 
 ## Quick start
 
+Every I/O method returns a future. On native, bring [`MaybeFuture`] into scope
+and call `.wait()` to run it blocking:
+
 ```rust
+use hidra::MaybeFuture;
+
 let api = hidra::HidApi::new()?;
 for dev in api.device_list() {
     println!("{:04x}:{:04x} {}", dev.vendor_id(), dev.product_id(),
              dev.product_string().unwrap_or("<unnamed>"));
 }
 
-let device = api.open(0x046d, 0xc216)?;
-device.write(&[0x00, 0x01, 0x02])?;        // report ID 0 + payload
+let device = api.open(0x046d, 0xc216).wait()?;
+device.write(&[0x00, 0x01, 0x02]).wait()?;        // report ID 0 + payload
 let mut buf = [0u8; 64];
-let len = device.read_timeout(&mut buf, 1000)?;
+let len = device.read(&mut buf).wait()?;          // one input report
 ```
 
 See `examples/` for runnable versions (`cargo run --example enumerate`).
 
-## Async
+## Async and blocking
 
-Input reads, the one HID operation that actually waits, are also available
-as runtime-agnostic futures on every backend, in the same spirit as
-[nusb](https://docs.rs/nusb): plain `Waker` wake-ups backed by OS readiness
-(a `poll(2)` reactor on Linux, overlapped-event waits on Windows, the
-IOHIDManager callback queue on macOS, nusb itself for the `nusb` feature). No
-tokio/async-std dependency; the futures run under any executor.
+Following nusb's design, every `HidApi` / `HidDevice` method returns an
+`impl Future`. Drive it either way:
+
+- `.await` it in any async runtime (the futures are runtime-agnostic: plain
+  `Waker` wake-ups, no tokio/async-std dependency).
+- `.wait()` it to block the current thread (a tiny built-in executor). This
+  is the `MaybeFuture` extension trait, available on native targets only;
+  `wasm32` cannot block, so there you must `.await`.
 
 ```rust,ignore
-let len = device.read_async(&mut buf).await?;   // never 0; resolves per report
+let len = device.read(&mut buf).await?;          // async
+let len = device.read(&mut buf).wait()?;         // blocking (native)
 ```
 
-- `read_async` never returns `Ok(0)`; for timeouts use your runtime's
-  combinator (e.g. `tokio::time::timeout`). On unplug it fails with
-  `HidError::Disconnected`.
-- Futures are cancel-safe: dropping one never loses a report; pending input
-  stays queued for the next read.
-- Writes and feature reports remain blocking by design: they are synchronous
-  kernel calls on every OS (there is no async primitive for them); they
-  complete quickly and hidapi treats them identically. On wasm32 everything
-  is async via `hidra::webhid`.
+Input reads genuinely wait on the OS (a `poll(2)` reactor on Linux,
+overlapped-event waits on Windows, the IOHIDManager callback queue on macOS,
+nusb's own I/O with the `nusb` feature, `inputreport` events on WebHID).
+`read` resolves with exactly one input report (never empty); for a timeout
+use your runtime's combinator (e.g. `tokio::time::timeout`). On unplug it
+fails with `HidError::Disconnected`, and the read future is cancel-safe:
+dropping it never loses a report. Writes and feature reports complete
+promptly; their futures simply run the synchronous OS call when polled.
 
-`cargo run --example read_async` shows the futures driven by a 20-line
-hand-rolled executor.
+[`MaybeFuture`]: https://docs.rs/hidra/latest/hidra/trait.MaybeFuture.html
 
 ## API
 
 Buffer and report-ID conventions follow hidapi's (`data[0]` is the report ID
-for writes and feature reports, etc.). Equivalents for common hidapi
-functions:
+for writes and feature reports, etc.); every method below returns a future
+(`.await` or, on native, `.wait()`). Equivalents for common hidapi functions:
 
 | hidapi | hidra |
 |--------|-------|
@@ -70,10 +77,9 @@ functions:
 | `hid_open_path` | `HidApi::open_path(path)` |
 | `hid_close` | drop the `HidDevice` |
 | `hid_write` | `HidDevice::write` |
-| `hid_read` / `hid_read_timeout` | `HidDevice::read` / `read_timeout` |
-| `hid_set_nonblocking` | `HidDevice::set_blocking_mode` (inverted, no double negative) |
+| `hid_read` / `hid_read_timeout` | `HidDevice::read` (one report; use a runtime timeout combinator for deadlines) |
 | `hid_send_feature_report` / `hid_get_feature_report` | `send_feature_report` / `get_feature_report` |
-| `hid_get_input_report` | `HidDevice::get_input_report` |
+| `hid_get_input_report` | `HidDevice::get_input_report` (native) |
 | `hid_get_manufacturer_string` / `..._product_string` / `..._serial_number_string` | `get_manufacturer_string` / `get_product_string` / `get_serial_number_string` |
 | `hid_get_indexed_string` | `get_indexed_string` (hidraw backend: unsupported, like hidapi; `nusb` backend: supported) |
 | `hid_get_report_descriptor` | `get_report_descriptor` (+ `report_descriptor()` / `parsed_report_descriptor()` conveniences) |
@@ -83,50 +89,50 @@ functions:
 | `hid_darwin_set_open_exclusive` / `..._get_...` | `HidApi::set_open_exclusive` / `open_exclusive` (macOS) |
 | `hid_winapi_get_container_id` | `HidDevice::container_id()` (Windows) |
 | `hid_winapi_set_write_timeout` | `HidDevice::set_write_timeout()` (Windows) |
-| `hid_libusb_wrap_sys_device` | not applicable, use the `nusb` feature backend |
+| `hid_libusb_wrap_sys_device` | not applicable, enable the `nusb` feature |
+
+`hid_set_nonblocking` has no equivalent: `read` is always the async "next
+report" operation, so blocking versus non-blocking is just `.wait()` versus
+`.await` plus your own timeout.
 
 ## USB backend (`nusb` feature)
 
-The `nusb` feature provides a USB-transport backend built on
-[nusb](https://docs.rs/nusb): pure Rust, no libusb.
+Enabling the `nusb` feature swaps the per-OS native backend for a pure-Rust
+USB transport built on [nusb](https://docs.rs/nusb) (no libusb), behind the
+same `HidApi` / `HidDevice` (there is no separate type):
 
 ```toml
 hidra = { version = "0.1", features = ["nusb"] }
 ```
 
-```rust
-let api = hidra::usb::UsbHidApi::new()?;
-let device = api.open(0x16c0, 0x27dd, None)?;
-```
-
-`UsbHidDevice` has the same method surface as `HidDevice`. Use it when you
-need raw USB access (kernel-driver detach on Linux, indexed string
+Use it for raw USB access (kernel-driver detach on Linux, indexed string
 descriptors) instead of the OS HID stack. Like hidapi-libusb it claims the
 interface away from the OS driver and needs appropriate permissions (udev
 rules on Linux).
 
 ## WebHID (wasm32)
 
-On `wasm32-unknown-unknown` the `hidra::webhid` module provides an async API
-over WebHID:
+On `wasm32-unknown-unknown` the same `hidra::HidApi` / `hidra::HidDevice` types
+are backed by WebHID. There is no blocking mode, so always `.await` their
+futures (no `.wait()`), and discovery is WebHID-shaped:
 
 ```rust,ignore
-let api = hidra::webhid::WebHidApi::new()?;
+let api = hidra::HidApi::new()?;
 // must be called from a user gesture:
 let devices = api.request_device(&[
-    hidra::webhid::DeviceFilter::new().vendor_id(0x046d),
+    hidra::DeviceFilter::new().vendor_id(0x046d),
 ]).await?;
 let device = &devices[0];
 device.open().await?;
 device.write(&[0x00, 0x01, 0x02]).await?;
 
-let mut reports = device.start_reading();
-let report = reports.read().await?;
+let mut buf = [0u8; 64];
+let len = device.read(&mut buf).await?;
 ```
 
 WebHID requires a secure context, browser support (Chromium-based browsers),
 and a user gesture for `request_device`. Because browsers expose parsed
-collections rather than descriptor bytes, `WebHidDevice::report_descriptor()`
+collections rather than descriptor bytes, `HidDevice::report_descriptor()`
 *reconstructs* a descriptor from the collection data, it parses back to the
 same reports/usages even though it is not byte-identical to the original.
 

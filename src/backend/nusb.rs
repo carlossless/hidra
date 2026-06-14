@@ -1,12 +1,13 @@
-//! USB-transport backend built on [nusb].
+//! USB-transport backend built on [nusb], selected for [`crate::HidApi`] when
+//! the `nusb` feature is enabled.
 //!
-//! Unlike the native backends behind [`crate::HidApi`], this module talks to
-//! devices with raw USB interrupt and control transfers, bypassing the OS HID
-//! stack entirely. Prefer it when:
+//! Unlike the per-OS native backends, this one talks to devices with raw USB
+//! interrupt and control transfers, bypassing the OS HID stack entirely.
+//! Prefer it when:
 //!
 //! * no hidraw node / OS HID driver is available for the device, or the OS
 //!   HID stack restricts access;
-//! * you need [`UsbHidDevice::get_indexed_string`], which the hidraw backend
+//! * you need [`NusbDevice::get_indexed_string`], which the hidraw backend
 //!   cannot provide;
 //! * you want the kernel driver detached from the interface (Linux), e.g. to
 //!   take a vendor interface away from `usbhid`.
@@ -22,11 +23,10 @@
 //! on Linux). Paths are stable for as long as the device stays connected, but
 //! are not preserved across replug, like libusb bus addresses.
 //!
-//! Input reports can be read both blocking ([`UsbHidDevice::read`] /
-//! [`UsbHidDevice::read_timeout`]) and asynchronously
-//! ([`UsbHidDevice::read_async`]). Writes and feature reports remain
-//! blocking, they are control or interrupt OUT transfers that complete
-//! quickly, matching the native backends behind [`crate::HidApi`].
+//! Input reports can be read both blocking ([`NusbDevice::read`] /
+//! [`NusbDevice::read_timeout`]) and asynchronously
+//! ([`NusbDevice::read_async`]). Writes and feature reports remain blocking,
+//! they are control or interrupt OUT transfers that complete quickly.
 //!
 //! [nusb]: https://docs.rs/nusb
 
@@ -234,39 +234,17 @@ fn transfer_length(max_input_wire: usize, max_packet_size: usize) -> usize {
 
 // --- backend API ---------------------------------------------------------------
 
-/// Entry point for the USB backend; the libusb-flavored counterpart of
-/// [`crate::HidApi`] with the same method surface, including the cached
-/// device list. See the [module docs](self) for when to prefer it.
-pub struct UsbHidApi {
-    device_list: Vec<DeviceInfo>,
+/// Entry point for the USB backend; the platform backend behind
+/// [`crate::HidApi`] when the `nusb` feature is enabled. See the
+/// [module docs](self) for when to prefer it.
+pub(crate) struct NusbApi {
+    _private: (),
 }
 
-impl UsbHidApi {
-    /// Initialize the backend and enumerate all connected USB HID interfaces.
+impl NusbApi {
+    /// Initialize the backend.
     pub fn new() -> HidResult<Self> {
-        let mut api = Self::new_without_enumerate()?;
-        api.refresh_devices()?;
-        Ok(api)
-    }
-
-    /// Initialize without enumerating (cheaper when you only need
-    /// [`open_path`](Self::open_path)).
-    pub fn new_without_enumerate() -> HidResult<Self> {
-        Ok(UsbHidApi {
-            device_list: Vec::new(),
-        })
-    }
-
-    /// Re-enumerate connected devices, refreshing
-    /// [`device_list`](Self::device_list).
-    pub fn refresh_devices(&mut self) -> HidResult<()> {
-        self.device_list = self.enumerate(0, 0)?;
-        Ok(())
-    }
-
-    /// The cached device list from the last enumeration.
-    pub fn device_list(&self) -> impl Iterator<Item = &DeviceInfo> {
-        self.device_list.iter()
+        Ok(NusbApi { _private: () })
     }
 
     /// Enumerate connected USB HID interfaces. `vendor_id`/`product_id` of 0
@@ -329,7 +307,7 @@ impl UsbHidApi {
         vendor_id: u16,
         product_id: u16,
         serial: Option<&str>,
-    ) -> HidResult<UsbHidDevice> {
+    ) -> HidResult<NusbDevice> {
         let candidates = self.enumerate(vendor_id, product_id)?;
         let info = candidates
             .into_iter()
@@ -343,7 +321,7 @@ impl UsbHidApi {
 
     /// Open a device by `usb:<bus>:<device-address>:<interface>` path, as
     /// reported by [`enumerate`](Self::enumerate).
-    pub fn open_path(&self, path: &str) -> HidResult<UsbHidDevice> {
+    pub fn open_path(&self, path: &str) -> HidResult<NusbDevice> {
         let (bus_id, device_address, interface_number) =
             parse_path(path).ok_or_else(|| HidError::InvalidData {
                 message: format!("invalid USB device path: {path}"),
@@ -354,7 +332,7 @@ impl UsbHidApi {
         let dev = devices
             .find(|d| d.bus_id() == bus_id && d.device_address() == device_address)
             .ok_or(HidError::DeviceNotFound)?;
-        UsbHidDevice::open(&dev, interface_number)
+        NusbDevice::open(&dev, interface_number)
     }
 }
 
@@ -411,7 +389,7 @@ impl Shared {
         }
     }
 
-    /// Pop-or-park core of [`UsbHidDevice::read_async`]: copy one queued
+    /// Pop-or-park core of [`NusbDevice::read_async`]: copy one queued
     /// report into `buf`, fail once the device is gone and the queue has
     /// drained, or park the task's waker on the queue.
     ///
@@ -444,13 +422,13 @@ impl Shared {
     }
 }
 
-/// An open USB HID interface; the libusb-flavored counterpart of
-/// [`crate::HidDevice`].
+/// An open USB HID interface; the platform device behind
+/// [`crate::HidDevice`] when the `nusb` feature is enabled.
 ///
 /// Holding this claims the interface exclusively (detached from the kernel
 /// driver on Linux); dropping it releases the interface, returning it to the
 /// OS. All methods take `&self`; the handle is `Send + Sync`.
-pub struct UsbHidDevice {
+pub(crate) struct NusbDevice {
     /// Keeps the device open; also used for string descriptor requests.
     device: nusb::Device,
     interface: Interface,
@@ -461,12 +439,15 @@ pub struct UsbHidDevice {
     report_descriptor: Vec<u8>,
     /// Interrupt OUT endpoint; writes fall back to `SET_REPORT` without one.
     out_endpoint: Option<Mutex<Endpoint<Interrupt, Out>>>,
+    // Part of the backend contract; the wrapper now reads input via
+    // `read_async`, so the blocking-mode state is unused on this path.
+    #[allow(dead_code)]
     blocking: AtomicBool,
     shared: Arc<Shared>,
     reader: Option<JoinHandle<()>>,
 }
 
-impl UsbHidDevice {
+impl NusbDevice {
     fn open(dev_info: &nusb::DeviceInfo, interface_number: u8) -> HidResult<Self> {
         let device = dev_info.open().wait().map_err(|e| HidError::OpenFailed {
             message: format!("opening USB device: {e}"),
@@ -548,7 +529,7 @@ impl UsbHidDevice {
                 .map_err(|e| HidError::io("spawning USB reader thread", e))?
         };
 
-        Ok(UsbHidDevice {
+        Ok(NusbDevice {
             device,
             interface,
             interface_number,
@@ -610,6 +591,7 @@ impl UsbHidDevice {
     }
 
     /// Read an input report, honoring the blocking mode.
+    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
     pub fn read(&self, buf: &mut [u8]) -> HidResult<usize> {
         let timeout = if self.blocking.load(Ordering::Relaxed) {
             -1
@@ -624,6 +606,7 @@ impl UsbHidDevice {
     /// through in USB wire format, which already matches hidapi's
     /// convention: the report ID prefix is present only for devices with
     /// numbered reports.
+    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
     pub fn read_timeout(&self, buf: &mut [u8], timeout_ms: i32) -> HidResult<usize> {
         if buf.is_empty() {
             return Err(HidError::InvalidData {
@@ -694,6 +677,7 @@ impl UsbHidDevice {
         }
     }
 
+    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
     pub fn set_blocking_mode(&self, blocking: bool) -> HidResult<()> {
         self.blocking.store(blocking, Ordering::Relaxed);
         Ok(())
@@ -827,7 +811,7 @@ impl UsbHidDevice {
     }
 }
 
-impl Drop for UsbHidDevice {
+impl Drop for NusbDevice {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::SeqCst);
         self.shared.wake_readers();
@@ -837,7 +821,7 @@ impl Drop for UsbHidDevice {
     }
 }
 
-/// Future returned by [`UsbHidDevice::read_async`].
+/// Future returned by [`NusbDevice::read_async`].
 ///
 /// Cancel-safe: reports are popped from the shared queue only inside
 /// [`Future::poll`], so dropping the future before completion leaves any
@@ -941,8 +925,8 @@ mod tests {
     #[test]
     fn api_and_device_are_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<UsbHidApi>();
-        assert_send_sync::<UsbHidDevice>();
+        assert_send_sync::<NusbApi>();
+        assert_send_sync::<NusbDevice>();
     }
 
     /// Drive `Shared::poll_read` as a future, as `read_async` does.
@@ -1051,7 +1035,7 @@ mod tests {
     fn enumerate_does_not_panic() {
         // The machine may or may not have USB HID devices; either way this
         // must return cleanly. Enumeration never claims interfaces.
-        let api = UsbHidApi::new().unwrap();
+        let api = NusbApi::new().unwrap();
         let devices = api.enumerate(0, 0).unwrap();
         for d in &devices {
             assert!(d.path().starts_with("usb:"));

@@ -1,11 +1,13 @@
 //! Open a device by VID/PID and dump input reports plus its parsed report
-//! descriptor.
+//! descriptor, driving hidra's futures blocking with `.wait()`.
 //!
 //! ```sh
 //! cargo run --example read_input -- 046d c216
 //! ```
 
 use std::env;
+
+use hidra::MaybeFuture;
 
 fn main() -> hidra::HidResult<()> {
     let mut args = env::args().skip(1);
@@ -15,10 +17,10 @@ fn main() -> hidra::HidResult<()> {
         .expect("pid must be hex");
 
     let api = hidra::HidApi::new()?;
-    let device = api.open(vid, pid)?;
+    let device = api.open(vid, pid).wait()?;
 
-    println!("product: {:?}", device.get_product_string()?);
-    let descriptor = device.parsed_report_descriptor()?;
+    println!("product: {:?}", device.get_product_string().wait()?);
+    let descriptor = device.parsed_report_descriptor().wait()?;
     println!(
         "report descriptor: {} top-level collection(s), max input report {} bytes, numbered ids: {}",
         descriptor.collections.len(),
@@ -26,13 +28,11 @@ fn main() -> hidra::HidResult<()> {
         descriptor.uses_report_ids(),
     );
 
-    println!("reading input reports (1s timeout each, ctrl-c to quit)...");
+    println!("reading input reports (ctrl-c to quit)...");
     let mut buf = [0u8; 256];
     loop {
-        let len = device.read_timeout(&mut buf, 1000)?;
-        if len == 0 {
-            continue; // timeout
-        }
+        // Blocks until a report arrives; never returns 0.
+        let len = device.read(&mut buf).wait()?;
         println!("{:02x?}", &buf[..len]);
     }
 }

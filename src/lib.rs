@@ -13,24 +13,26 @@
 //! | Any (feature `nusb`) | USB interrupt/control transfers via [nusb] |
 //! | WebAssembly | [WebHID](https://wicg.github.io/webhid/) via `web-sys` (async, in `webhid`) |
 //!
-//! The blocking API (`HidApi`, `HidDevice`) follows hidapi's conventions.
-//! Input reports can also be awaited via the runtime-agnostic
-//! `HidDevice::read_async`, no executor dependency, like nusb. On `wasm32`
-//! the `webhid` module provides an async equivalent, and [`descriptor`]
-//! offers report-descriptor primitives that work everywhere.
+//! Following nusb's model, every [`HidApi`] / [`HidDevice`] I/O method returns
+//! an `impl Future`. Bring [`MaybeFuture`] into scope to drive it blocking with
+//! `.wait()` on native targets, or `.await` it under any async runtime (no
+//! executor dependency, wake-ups are plain `Waker`s like nusb). On `wasm32` the
+//! `webhid` module provides an async equivalent, and [`descriptor`] offers
+//! report-descriptor primitives that work everywhere.
 //!
 //! ```no_run
 //! # #[cfg(not(target_arch = "wasm32"))] fn demo() -> hidra::HidResult<()> {
+//! use hidra::MaybeFuture;
 //! let api = hidra::HidApi::new()?;
 //! for dev in api.device_list() {
 //!     println!("{:04x}:{:04x} {}", dev.vendor_id(), dev.product_id(),
 //!              dev.product_string().unwrap_or("<unnamed>"));
 //! }
-//! let device = api.open(0x046d, 0xc216)?;
-//! device.write(&[0x00, 0x01, 0x02])?; // report ID 0 + payload
+//! let device = api.open(0x046d, 0xc216).wait()?;
+//! device.write(&[0x00, 0x01, 0x02]).wait()?; // report ID 0 + payload
 //! let mut buf = [0u8; 64];
-//! let len = device.read_timeout(&mut buf, 1000)?;
-//! # Ok(()) }
+//! let len = device.read(&mut buf).wait()?;
+//! # let _ = len; Ok(()) }
 //! ```
 //!
 //! [nusb]: https://docs.rs/nusb
@@ -46,11 +48,13 @@ pub use error::{HidError, HidResult};
 #[cfg(not(target_arch = "wasm32"))]
 mod backend;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod maybe_future;
+#[cfg(not(target_arch = "wasm32"))]
+pub use maybe_future::MaybeFuture;
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) mod test_util;
-
-#[cfg(all(feature = "nusb", not(target_arch = "wasm32")))]
-pub mod usb;
 
 #[cfg(target_arch = "wasm32")]
 pub mod webhid;
@@ -93,6 +97,8 @@ pub use native::{HidApi, HidDevice};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
+    use core::future::Future;
+
     use crate::backend::{PlatformApi, PlatformDevice};
     use crate::{DeviceInfo, HidResult};
 
@@ -144,38 +150,51 @@ mod native {
 
         /// Open the first device matching `vendor_id`/`product_id`
         /// (`hid_open` with a null serial).
-        pub fn open(&self, vendor_id: u16, product_id: u16) -> HidResult<HidDevice> {
-            Ok(HidDevice {
-                backend: self.backend.open(vendor_id, product_id, None)?,
+        pub fn open(
+            &self,
+            vendor_id: u16,
+            product_id: u16,
+        ) -> impl Future<Output = HidResult<HidDevice>> + '_ {
+            crate::maybe_future::Blocking::new(move || {
+                Ok(HidDevice {
+                    backend: self.backend.open(vendor_id, product_id, None)?,
+                })
             })
         }
 
         /// Open the device matching `vendor_id`/`product_id` and serial
         /// number (`hid_open` equivalent).
-        pub fn open_serial(
-            &self,
+        pub fn open_serial<'a>(
+            &'a self,
             vendor_id: u16,
             product_id: u16,
-            serial_number: &str,
-        ) -> HidResult<HidDevice> {
-            Ok(HidDevice {
-                backend: self
-                    .backend
-                    .open(vendor_id, product_id, Some(serial_number))?,
+            serial_number: &'a str,
+        ) -> impl Future<Output = HidResult<HidDevice>> + 'a {
+            crate::maybe_future::Blocking::new(move || {
+                Ok(HidDevice {
+                    backend: self
+                        .backend
+                        .open(vendor_id, product_id, Some(serial_number))?,
+                })
             })
         }
 
         /// Open a device by platform path (`hid_open_path` equivalent). Use
         /// the paths reported by [`DeviceInfo::path`].
-        pub fn open_path(&self, path: &str) -> HidResult<HidDevice> {
-            Ok(HidDevice {
-                backend: self.backend.open_path(path)?,
+        pub fn open_path<'a>(
+            &'a self,
+            path: &'a str,
+        ) -> impl Future<Output = HidResult<HidDevice>> + 'a {
+            crate::maybe_future::Blocking::new(move || {
+                Ok(HidDevice {
+                    backend: self.backend.open_path(path)?,
+                })
             })
         }
     }
 
     /// macOS-specific options (`hid_darwin_*` equivalents).
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(feature = "nusb")))]
     impl HidApi {
         /// Whether subsequently opened devices are seized exclusively
         /// (`hid_darwin_set_open_exclusive`). Defaults to shared, matching
@@ -204,134 +223,139 @@ mod native {
         /// `data[0]` must be the report ID (0 when the device has no
         /// numbered reports); the first byte is consumed accordingly and
         /// counts toward the returned length.
-        pub fn write(&self, data: &[u8]) -> HidResult<usize> {
-            self.backend.write(data)
-        }
-
-        /// Read an input report, honoring the blocking mode set by
-        /// [`set_blocking_mode`](Self::set_blocking_mode) (`hid_read`).
         ///
-        /// Returns the number of bytes read; reports are prefixed with their
-        /// report ID only when the device uses numbered reports. In
-        /// non-blocking mode returns `Ok(0)` when no report is waiting.
-        pub fn read(&self, buf: &mut [u8]) -> HidResult<usize> {
-            self.backend.read(buf)
+        /// Writes are synchronous kernel calls on every platform (there is no
+        /// async OS primitive for them), so the returned future completes on
+        /// first poll; it is exposed as a future only so blocking and async
+        /// callers share one API.
+        pub fn write<'a>(&'a self, data: &'a [u8]) -> impl Future<Output = HidResult<usize>> + 'a {
+            crate::maybe_future::Blocking::new(move || self.backend.write(data))
         }
 
-        /// Read an input report, waiting at most `timeout_ms` milliseconds
-        /// (`hid_read_timeout`). Negative timeout blocks indefinitely; `0`
-        /// polls. Returns `Ok(0)` on timeout.
-        pub fn read_timeout(&self, buf: &mut [u8], timeout_ms: i32) -> HidResult<usize> {
-            self.backend.read_timeout(buf, timeout_ms)
-        }
-
-        /// Read an input report asynchronously (hidra extension; hidapi has
-        /// no async API).
+        /// Read one input report asynchronously (hidra's async `hid_read`).
         ///
         /// Resolves once a report has been copied into `buf`, returning its
         /// length, never `Ok(0)`; use your runtime's timeout combinator
-        /// (e.g. `tokio::time::timeout`) instead of [`read_timeout`]. Fails
-        /// with [`HidError::Disconnected`](crate::HidError::Disconnected)
-        /// when the device is removed.
+        /// (e.g. `tokio::time::timeout`) to bound the wait. Reports are
+        /// prefixed with their report ID only when the device uses numbered
+        /// reports. Fails with
+        /// [`HidError::Disconnected`](crate::HidError::Disconnected) when the
+        /// device is removed.
         ///
-        /// The future is runtime-agnostic (plain `Waker` wake-ups, like
-        /// nusb, works under tokio, async-std, smol or a hand-rolled
-        /// executor) and cancel-safe: dropping it never loses a report;
-        /// pending input stays queued for the next read. The blocking mode
-        /// set by [`set_blocking_mode`] is ignored.
+        /// The future is runtime-agnostic (plain `Waker` wake-ups, like nusb,
+        /// works under tokio, async-std, smol or a hand-rolled executor) and
+        /// cancel-safe: dropping it never loses a report; pending input stays
+        /// queued for the next read. Drive it blocking with
+        /// [`MaybeFuture::wait`](crate::MaybeFuture::wait).
         ///
-        /// Note that only input reads are asynchronous: writes and feature
-        /// reports are synchronous kernel calls on every platform (there is
-        /// no async OS primitive for them), so those methods stay blocking,
-        /// they complete quickly and hidapi treats them the same way.
-        ///
-        /// [`read_timeout`]: Self::read_timeout
-        /// [`set_blocking_mode`]: Self::set_blocking_mode
-        pub async fn read_async(&self, buf: &mut [u8]) -> HidResult<usize> {
-            self.backend.read_async(buf).await
-        }
-
-        /// Set blocking (default) or non-blocking mode for
-        /// [`read`](Self::read) (`hid_set_nonblocking` equivalent, inverted
-        /// to avoid the double negative).
-        pub fn set_blocking_mode(&self, blocking: bool) -> HidResult<()> {
-            self.backend.set_blocking_mode(blocking)
+        /// Only input reads are asynchronous: writes and feature reports are
+        /// synchronous kernel calls on every platform, so those futures
+        /// complete on first poll.
+        pub fn read<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> impl Future<Output = HidResult<usize>> + 'a {
+            self.backend.read_async(buf)
         }
 
         /// Send a feature report (`hid_send_feature_report`). `data[0]` is
         /// the report ID, 0 if unnumbered.
-        pub fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
-            self.backend.send_feature_report(data)
+        pub fn send_feature_report<'a>(
+            &'a self,
+            data: &'a [u8],
+        ) -> impl Future<Output = HidResult<()>> + 'a {
+            crate::maybe_future::Blocking::new(move || self.backend.send_feature_report(data))
         }
 
         /// Get a feature report (`hid_get_feature_report`). Set `buf[0]` to
         /// the report ID before calling; returns the report (ID included)
         /// and its length.
-        pub fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize> {
-            self.backend.get_feature_report(buf)
+        pub fn get_feature_report<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> impl Future<Output = HidResult<usize>> + 'a {
+            crate::maybe_future::Blocking::new(move || self.backend.get_feature_report(buf))
         }
 
         /// Get an input report synchronously (`hid_get_input_report`). Same
         /// buffer convention as [`get_feature_report`](Self::get_feature_report).
-        pub fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize> {
-            self.backend.get_input_report(buf)
+        pub fn get_input_report<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> impl Future<Output = HidResult<usize>> + 'a {
+            crate::maybe_future::Blocking::new(move || self.backend.get_input_report(buf))
         }
 
         /// Manufacturer string (`hid_get_manufacturer_string`).
-        pub fn get_manufacturer_string(&self) -> HidResult<Option<String>> {
-            self.backend.get_manufacturer_string()
+        pub fn get_manufacturer_string(
+            &self,
+        ) -> impl Future<Output = HidResult<Option<String>>> + '_ {
+            crate::maybe_future::Blocking::new(move || self.backend.get_manufacturer_string())
         }
 
         /// Product string (`hid_get_product_string`).
-        pub fn get_product_string(&self) -> HidResult<Option<String>> {
-            self.backend.get_product_string()
+        pub fn get_product_string(&self) -> impl Future<Output = HidResult<Option<String>>> + '_ {
+            crate::maybe_future::Blocking::new(move || self.backend.get_product_string())
         }
 
         /// Serial number string (`hid_get_serial_number_string`).
-        pub fn get_serial_number_string(&self) -> HidResult<Option<String>> {
-            self.backend.get_serial_number_string()
+        pub fn get_serial_number_string(
+            &self,
+        ) -> impl Future<Output = HidResult<Option<String>>> + '_ {
+            crate::maybe_future::Blocking::new(move || self.backend.get_serial_number_string())
         }
 
         /// A string from the device's string descriptor table
         /// (`hid_get_indexed_string`). Only meaningful for USB devices.
-        pub fn get_indexed_string(&self, index: u32) -> HidResult<Option<String>> {
-            self.backend.get_indexed_string(index)
+        pub fn get_indexed_string(
+            &self,
+            index: u32,
+        ) -> impl Future<Output = HidResult<Option<String>>> + '_ {
+            crate::maybe_future::Blocking::new(move || self.backend.get_indexed_string(index))
         }
 
         /// Raw report descriptor (`hid_get_report_descriptor`). Returns the
         /// number of bytes written into `buf`; 4096 bytes is always enough.
-        pub fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize> {
-            self.backend.get_report_descriptor(buf)
+        pub fn get_report_descriptor<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> impl Future<Output = HidResult<usize>> + 'a {
+            crate::maybe_future::Blocking::new(move || self.backend.get_report_descriptor(buf))
         }
 
         /// Raw report descriptor as a vector (convenience over
         /// [`get_report_descriptor`](Self::get_report_descriptor)).
-        pub fn report_descriptor(&self) -> HidResult<Vec<u8>> {
-            let mut buf = vec![0u8; crate::MAX_REPORT_DESCRIPTOR_SIZE];
-            let len = self.backend.get_report_descriptor(&mut buf)?;
-            buf.truncate(len);
-            Ok(buf)
+        pub fn report_descriptor(&self) -> impl Future<Output = HidResult<Vec<u8>>> + '_ {
+            crate::maybe_future::Blocking::new(move || {
+                let mut buf = vec![0u8; crate::MAX_REPORT_DESCRIPTOR_SIZE];
+                let len = self.backend.get_report_descriptor(&mut buf)?;
+                buf.truncate(len);
+                Ok(buf)
+            })
         }
 
         /// Parsed report descriptor (hidra extension built on
         /// [`crate::descriptor`]).
-        pub fn parsed_report_descriptor(&self) -> HidResult<crate::descriptor::ReportDescriptor> {
-            crate::descriptor::ReportDescriptor::parse(&self.report_descriptor()?)
+        pub async fn parsed_report_descriptor(
+            &self,
+        ) -> HidResult<crate::descriptor::ReportDescriptor> {
+            let bytes = self.report_descriptor().await?;
+            crate::descriptor::ReportDescriptor::parse(&bytes)
         }
 
         /// Metadata for this open device (`hid_get_device_info`).
-        pub fn get_device_info(&self) -> HidResult<DeviceInfo> {
-            self.backend.get_device_info()
+        pub fn get_device_info(&self) -> impl Future<Output = HidResult<DeviceInfo>> + '_ {
+            crate::maybe_future::Blocking::new(move || self.backend.get_device_info())
         }
     }
 
     /// Windows-specific extensions (`hid_winapi_*` equivalents).
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", not(feature = "nusb")))]
     impl HidDevice {
         /// The container ID GUID grouping this interface with its siblings
         /// (`hid_winapi_get_container_id`), as 16 little-endian GUID bytes.
-        pub fn container_id(&self) -> HidResult<[u8; 16]> {
-            self.backend.container_id()
+        pub fn container_id(&self) -> impl Future<Output = HidResult<[u8; 16]>> + '_ {
+            crate::maybe_future::Blocking::new(move || self.backend.container_id())
         }
 
         /// Set the timeout for `write` in milliseconds

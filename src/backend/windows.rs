@@ -693,6 +693,9 @@ pub(crate) struct WinDevice {
     /// Metadata captured at open time (hidapi caches it the same way).
     info: DeviceInfo,
     feature_report_len: u16,
+    // Part of the backend contract; the wrapper now reads input via
+    // `read_async`, so the blocking-mode state is unused on this path.
+    #[allow(dead_code)]
     blocking: AtomicBool,
     write_timeout_ms: AtomicU32,
 }
@@ -854,6 +857,7 @@ impl WinDevice {
         Ok(data.len())
     }
 
+    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
     pub fn read(&self, buf: &mut [u8]) -> HidResult<usize> {
         let timeout = if self.blocking.load(Ordering::Relaxed) {
             -1
@@ -863,6 +867,7 @@ impl WinDevice {
         self.read_timeout(buf, timeout)
     }
 
+    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
     pub fn read_timeout(&self, buf: &mut [u8], timeout_ms: i32) -> HidResult<usize> {
         if buf.is_empty() {
             return Err(HidError::InvalidData {
@@ -1040,6 +1045,7 @@ impl WinDevice {
         Poll::Pending
     }
 
+    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
     pub fn set_blocking_mode(&self, blocking: bool) -> HidResult<()> {
         self.blocking.store(blocking, Ordering::Relaxed);
         Ok(())

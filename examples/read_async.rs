@@ -1,6 +1,6 @@
 //! Read input reports asynchronously.
 //!
-//! `read_async` futures are runtime-agnostic, they work under tokio,
+//! hidra's `read` futures are runtime-agnostic, they work under tokio,
 //! async-std, smol, or (as here) a minimal hand-rolled executor, because
 //! wake-ups use plain `Waker`s backed by OS readiness, like nusb.
 //!
@@ -41,14 +41,14 @@ fn main() -> hidra::HidResult<()> {
         .expect("pid must be hex");
 
     let api = hidra::HidApi::new()?;
-    let device = api.open(vid, pid)?;
-    println!("product: {:?}", device.get_product_string()?);
 
     block_on(async {
+        let device = api.open(vid, pid).await?;
+        println!("product: {:?}", device.get_product_string().await?);
         let mut buf = [0u8; 256];
         loop {
             // Never returns 0: resolves only when a report arrives.
-            let len = device.read_async(&mut buf).await?;
+            let len = device.read(&mut buf).await?;
             println!("{:02x?}", &buf[..len]);
         }
     })

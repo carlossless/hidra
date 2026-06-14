@@ -319,6 +319,9 @@ impl HidrawApi {
 
 pub(crate) struct HidrawDevice {
     fd: OwnedFd,
+    // Part of the backend contract; the wrapper now reads input via
+    // `read_async`, so the blocking-mode state is unused on this path.
+    #[allow(dead_code)]
     blocking: AtomicBool,
     /// Whether the device's report descriptor declares numbered reports.
     /// hidraw expects `write()` data to omit the leading 0 byte for devices
@@ -402,6 +405,7 @@ impl HidrawDevice {
         Ok(res + skipped)
     }
 
+    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
     pub fn read(&self, buf: &mut [u8]) -> HidResult<usize> {
         let timeout = if self.blocking.load(Ordering::Relaxed) {
             -1
@@ -471,6 +475,7 @@ impl HidrawDevice {
         Ok(res as usize)
     }
 
+    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
     pub fn set_blocking_mode(&self, blocking: bool) -> HidResult<()> {
         self.blocking.store(blocking, Ordering::Relaxed);
         Ok(())

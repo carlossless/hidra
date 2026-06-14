@@ -52,20 +52,28 @@
 //!   report (it stays queued for the next read). Wake-ups are
 //!   runtime-agnostic (raw `Waker`s, no executor assumed).
 
-#[cfg(target_os = "linux")]
+// With the `nusb` feature the USB-transport backend replaces the per-OS native
+// backends on every platform; otherwise the native backend for the target OS
+// is selected.
+#[cfg(all(feature = "nusb", not(target_arch = "wasm32")))]
+pub(crate) mod nusb;
+#[cfg(all(feature = "nusb", not(target_arch = "wasm32")))]
+pub(crate) use nusb::{NusbApi as PlatformApi, NusbDevice as PlatformDevice};
+
+#[cfg(all(not(feature = "nusb"), target_os = "linux"))]
 pub(crate) mod reactor;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(not(feature = "nusb"), target_os = "linux"))]
 pub(crate) mod hidraw;
-#[cfg(target_os = "linux")]
+#[cfg(all(not(feature = "nusb"), target_os = "linux"))]
 pub(crate) use hidraw::{HidrawApi as PlatformApi, HidrawDevice as PlatformDevice};
 
-#[cfg(target_os = "windows")]
+#[cfg(all(not(feature = "nusb"), target_os = "windows"))]
 pub(crate) mod windows;
-#[cfg(target_os = "windows")]
+#[cfg(all(not(feature = "nusb"), target_os = "windows"))]
 pub(crate) use windows::{WinApi as PlatformApi, WinDevice as PlatformDevice};
 
-#[cfg(target_os = "macos")]
+#[cfg(all(not(feature = "nusb"), target_os = "macos"))]
 pub(crate) mod macos;
-#[cfg(target_os = "macos")]
+#[cfg(all(not(feature = "nusb"), target_os = "macos"))]
 pub(crate) use macos::{MacApi as PlatformApi, MacDevice as PlatformDevice};

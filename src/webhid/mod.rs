@@ -459,10 +459,20 @@ impl WebHidDevice {
             .await
             .map_err(|e| js_err("receiveFeatureReport", e))?;
         let data = dataview_to_vec(&view);
-        let mut report = Vec::with_capacity(data.len() + 1);
-        report.push(report_id);
-        report.extend_from_slice(&data);
-        Ok(report)
+        // WebHID's receiveFeatureReport is asymmetric with sendFeatureReport:
+        // its DataView already begins with the report ID for numbered reports,
+        // so it matches hidapi's `[report_id, data...]` layout as-is. Only
+        // unnumbered reports (report ID 0) omit the leading byte, so add it
+        // there to keep the convention. Prefixing unconditionally would
+        // duplicate the ID and shift the payload.
+        if report_id != 0 {
+            Ok(data)
+        } else {
+            let mut report = Vec::with_capacity(data.len() + 1);
+            report.push(0);
+            report.extend_from_slice(&data);
+            Ok(report)
+        }
     }
 
     /// Invoke `f` with `(report_id, payload)` for every incoming input

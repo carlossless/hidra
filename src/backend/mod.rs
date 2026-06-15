@@ -52,6 +52,12 @@
 //!   report (it stays queued for the next read). Wake-ups are
 //!   runtime-agnostic (raw `Waker`s, no executor assumed).
 
+// The WebHID backend on wasm. Unlike the native backends below it does not
+// implement the PlatformApi/PlatformDevice contract documented above (the
+// `web` module in lib.rs drives it directly), but it belongs here as a backend.
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod webhid;
+
 // With the `nusb` feature the USB-transport backend replaces the per-OS native
 // backends on every platform; otherwise the native backend for the target OS
 // is selected.

@@ -50,7 +50,8 @@ pub mod report_info;
 pub use device_info::{BusType, DeviceInfo};
 pub use error::{HidError, HidResult};
 
-#[cfg(not(target_arch = "wasm32"))]
+// Houses every backend: the per-OS native ones and nusb (non-wasm), and the
+// WebHID backend (wasm). Its internals are individually cfg-gated.
 mod backend;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -61,14 +62,11 @@ pub use maybe_future::MaybeFuture;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) mod test_util;
 
-#[cfg(target_arch = "wasm32")]
-mod webhid;
-
 /// WebHID-only public surface: the device filter for `Hidra::request_device`,
 /// the listener handle returned by the event hooks, and the buffered input
 /// report stream from `HidDevice::start_reading`.
 #[cfg(target_arch = "wasm32")]
-pub use webhid::{DeviceFilter, EventListenerHandle, InputReportStream};
+pub use backend::webhid::{DeviceFilter, EventListenerHandle, InputReportStream};
 
 /// hidra's version, mirroring `hid_version()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -389,7 +387,7 @@ mod web {
     use core::cell::RefCell;
     use core::future::Future;
 
-    use crate::webhid::{
+    use crate::backend::webhid::{
         CollectionInfo, DeviceFilter, EventListenerHandle, InputReportStream, WebHidApi,
         WebHidDevice,
     };

@@ -4,7 +4,7 @@ A pure-Rust HID library with a unified async API (with blocking `.wait()` on
 native targets, like nusb), a WebHID backend for WebAssembly, and standalone
 HID report-descriptor primitives.
 
-No C library is linked. One `HidApi` / `HidDevice` regardless of backend:
+No C library is linked. One `Hidra` / `HidDevice` regardless of backend:
 
 | Platform | Backend | Notes |
 |----------|---------|-------|
@@ -12,7 +12,7 @@ No C library is linked. One `HidApi` / `HidDevice` regardless of backend:
 | Windows | `hid.dll` + SetupAPI (via `windows-sys` declarations) | |
 | macOS | IOHIDManager (direct framework FFI) | |
 | any platform [nusb](https://docs.rs/nusb) supports | raw USB transfers via nusb | optional `nusb` feature, swaps in a pure-Rust USB transport |
-| WebAssembly | [WebHID](https://wicg.github.io/webhid/) via `web-sys` | same `HidApi`/`HidDevice`, await-only |
+| WebAssembly | [WebHID](https://wicg.github.io/webhid/) via `web-sys` | same `Hidra`/`HidDevice`, await-only |
 
 ## Quick start
 
@@ -22,7 +22,7 @@ and call `.wait()` to run it blocking:
 ```rust
 use hidra::MaybeFuture;
 
-let api = hidra::HidApi::new()?;
+let api = hidra::Hidra::new()?;
 for dev in api.device_list() {
     println!("{:04x}:{:04x} {}", dev.vendor_id(), dev.product_id(),
              dev.product_string().unwrap_or("<unnamed>"));
@@ -38,7 +38,7 @@ See `examples/` for runnable versions (`cargo run --example enumerate`).
 
 ## Async and blocking
 
-Following nusb's design, every `HidApi` / `HidDevice` method returns an
+Following nusb's design, every `Hidra` / `HidDevice` method returns an
 `impl Future`. Drive it either way:
 
 - `.await` it in any async runtime (the futures are runtime-agnostic: plain
@@ -71,10 +71,10 @@ for writes and feature reports, etc.); every method below returns a future
 
 | hidapi | hidra |
 |--------|-------|
-| `hid_init` / `hid_exit` | `HidApi::new()` / drop (no global state) |
-| `hid_enumerate` / `hid_free_enumeration` | `HidApi::device_list()`, `HidApi::enumerate(vid, pid)` |
-| `hid_open` | `HidApi::open(vid, pid)`, `HidApi::open_serial(vid, pid, serial)` |
-| `hid_open_path` | `HidApi::open_path(path)` |
+| `hid_init` / `hid_exit` | `Hidra::new()` / drop (no global state) |
+| `hid_enumerate` / `hid_free_enumeration` | `Hidra::device_list()`, `Hidra::enumerate(vid, pid)` |
+| `hid_open` | `Hidra::open(vid, pid)`, `Hidra::open_serial(vid, pid, serial)` |
+| `hid_open_path` | `Hidra::open_path(path)` |
 | `hid_close` | drop the `HidDevice` |
 | `hid_write` | `HidDevice::write` |
 | `hid_read` / `hid_read_timeout` | `HidDevice::read` (one report; use a runtime timeout combinator for deadlines) |
@@ -86,7 +86,7 @@ for writes and feature reports, etc.); every method below returns a future
 | `hid_get_device_info` | `HidDevice::get_device_info` |
 | `hid_error` | typed `HidError` on every `Result` |
 | `hid_version` / `hid_version_str` | `hidra::version()` / `version_str()` |
-| `hid_darwin_set_open_exclusive` / `..._get_...` | `HidApi::set_open_exclusive` / `open_exclusive` (macOS) |
+| `hid_darwin_set_open_exclusive` / `..._get_...` | `Hidra::set_open_exclusive` / `open_exclusive` (macOS) |
 | `hid_winapi_get_container_id` | `HidDevice::container_id()` (Windows) |
 | `hid_winapi_set_write_timeout` | `HidDevice::set_write_timeout()` (Windows) |
 | `hid_libusb_wrap_sys_device` | not applicable, enable the `nusb` feature |
@@ -99,7 +99,7 @@ report" operation, so blocking versus non-blocking is just `.wait()` versus
 
 Enabling the `nusb` feature swaps the per-OS native backend for a pure-Rust
 USB transport built on [nusb](https://docs.rs/nusb) (no libusb), behind the
-same `HidApi` / `HidDevice` (there is no separate type). It runs on whatever
+same `Hidra` / `HidDevice` (there is no separate type). It runs on whatever
 platforms nusb itself supports:
 
 ```toml
@@ -119,12 +119,12 @@ backend talks to it over raw USB regardless.
 
 ## WebHID (wasm32)
 
-On `wasm32-unknown-unknown` the same `hidra::HidApi` / `hidra::HidDevice` types
+On `wasm32-unknown-unknown` the same `hidra::Hidra` / `hidra::HidDevice` types
 are backed by WebHID. There is no blocking mode, so always `.await` their
 futures (no `.wait()`), and discovery is WebHID-shaped:
 
 ```rust,ignore
-let api = hidra::HidApi::new()?;
+let api = hidra::Hidra::new()?;
 // must be called from a user gesture:
 let devices = api.request_device(&[
     hidra::DeviceFilter::new().vendor_id(0x046d),

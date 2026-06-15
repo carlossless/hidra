@@ -16,7 +16,7 @@ fn main() -> hidra::HidResult<()> {
     let pid = u16::from_str_radix(&args.next().expect("usage: read_input <vid> <pid>"), 16)
         .expect("pid must be hex");
 
-    let api = hidra::HidApi::new()?;
+    let api = hidra::Hidra::new()?;
     let device = api.open(vid, pid).wait()?;
 
     println!("product: {:?}", device.get_product_string().wait()?);

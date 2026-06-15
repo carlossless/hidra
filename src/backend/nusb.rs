@@ -1,4 +1,4 @@
-//! USB-transport backend built on [nusb], selected for [`crate::HidApi`] when
+//! USB-transport backend built on [nusb], selected for [`crate::Hidra`] when
 //! the `nusb` feature is enabled.
 //!
 //! Unlike the per-OS native backends, this one talks to devices with raw USB
@@ -235,7 +235,7 @@ fn transfer_length(max_input_wire: usize, max_packet_size: usize) -> usize {
 // --- backend API ---------------------------------------------------------------
 
 /// Entry point for the USB backend; the platform backend behind
-/// [`crate::HidApi`] when the `nusb` feature is enabled. See the
+/// [`crate::Hidra`] when the `nusb` feature is enabled. See the
 /// [module docs](self) for when to prefer it.
 pub(crate) struct NusbApi {
     _private: (),

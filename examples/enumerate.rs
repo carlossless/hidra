@@ -5,7 +5,7 @@
 //! ```
 
 fn main() -> hidra::HidResult<()> {
-    let api = hidra::HidApi::new()?;
+    let api = hidra::Hidra::new()?;
     for dev in api.device_list() {
         println!(
             "{:04x}:{:04x} bus={} usage={:04x}:{:04x} iface={} path={}",

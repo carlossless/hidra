@@ -13,22 +13,22 @@
 //! | Any (feature `nusb`) | USB interrupt/control transfers via [nusb] |
 //! | WebAssembly | [WebHID](https://wicg.github.io/webhid/) via `web-sys` |
 //!
-//! Following nusb's model, every [`HidApi`] / [`HidDevice`] I/O method returns
+//! Following nusb's model, every [`Hidra`] / [`HidDevice`] I/O method returns
 //! an `impl Future`. On native targets bring `MaybeFuture` into scope to drive
 //! it blocking with `.wait()`, or `.await` it under any async runtime (no
 //! executor dependency, wake-ups are plain `Waker`s like nusb).
 //!
-//! On `wasm32` the same [`HidApi`] / [`HidDevice`] types are backed by WebHID;
+//! On `wasm32` the same [`Hidra`] / [`HidDevice`] types are backed by WebHID;
 //! there is no blocking mode, so always `.await` their futures (no `.wait()`).
-//! Discovery is WebHID-shaped: `HidApi::request_device` shows the browser's
-//! device chooser (filtered with `DeviceFilter`) and `HidApi::get_devices`
+//! Discovery is WebHID-shaped: `Hidra::request_device` shows the browser's
+//! device chooser (filtered with `DeviceFilter`) and `Hidra::get_devices`
 //! lists previously granted devices. [`descriptor`] offers report-descriptor
 //! primitives that work everywhere.
 //!
 //! ```no_run
 //! # #[cfg(not(target_arch = "wasm32"))] fn demo() -> hidra::HidResult<()> {
 //! use hidra::MaybeFuture;
-//! let api = hidra::HidApi::new()?;
+//! let api = hidra::Hidra::new()?;
 //! for dev in api.device_list() {
 //!     println!("{:04x}:{:04x} {}", dev.vendor_id(), dev.product_id(),
 //!              dev.product_string().unwrap_or("<unnamed>"));
@@ -64,7 +64,7 @@ pub(crate) mod test_util;
 #[cfg(target_arch = "wasm32")]
 mod webhid;
 
-/// WebHID-only public surface: the device filter for `HidApi::request_device`,
+/// WebHID-only public surface: the device filter for `Hidra::request_device`,
 /// the listener handle returned by the event hooks, and the buffered input
 /// report stream from `HidDevice::start_reading`.
 #[cfg(target_arch = "wasm32")]
@@ -104,10 +104,10 @@ pub const fn version_str() -> &'static str {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{HidApi, HidDevice};
+pub use native::{HidDevice, Hidra};
 
 #[cfg(target_arch = "wasm32")]
-pub use web::{HidApi, HidDevice};
+pub use web::{HidDevice, Hidra};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
@@ -121,12 +121,12 @@ mod native {
     ///
     /// Unlike hidapi there is no global state: create as many instances as
     /// you like, from any thread.
-    pub struct HidApi {
+    pub struct Hidra {
         backend: PlatformApi,
         device_list: Vec<DeviceInfo>,
     }
 
-    impl HidApi {
+    impl Hidra {
         /// Initialize the backend and enumerate all connected HID devices.
         pub fn new() -> HidResult<Self> {
             let mut api = Self::new_without_enumerate()?;
@@ -137,7 +137,7 @@ mod native {
         /// Initialize the backend without enumerating (cheaper when you only
         /// need [`open_path`](Self::open_path)).
         pub fn new_without_enumerate() -> HidResult<Self> {
-            Ok(HidApi {
+            Ok(Hidra {
                 backend: PlatformApi::new()?,
                 device_list: Vec::new(),
             })
@@ -209,7 +209,7 @@ mod native {
 
     /// macOS-specific options (`hid_darwin_*` equivalents).
     #[cfg(all(target_os = "macos", not(feature = "nusb")))]
-    impl HidApi {
+    impl Hidra {
         /// Whether subsequently opened devices are seized exclusively
         /// (`hid_darwin_set_open_exclusive`). Defaults to shared, matching
         /// hidapi >= 0.12.
@@ -402,22 +402,22 @@ mod web {
     /// enumerate / open-by-vid-pid. Use [`request_device`](Self::request_device)
     /// to show the permission chooser and [`get_devices`](Self::get_devices) to
     /// list previously granted devices.
-    pub struct HidApi {
+    pub struct Hidra {
         backend: WebHidApi,
     }
 
-    // These I/O methods return `impl Future` to mirror the native `HidApi` /
+    // These I/O methods return `impl Future` to mirror the native `Hidra` /
     // `HidDevice` signatures exactly (native backs them with `Blocking`, not an
     // async block), so the `manual_async_fn` suggestion does not apply.
     #[allow(clippy::manual_async_fn)]
-    impl HidApi {
+    impl Hidra {
         /// Bind to `window.navigator.hid`.
         ///
         /// Fails with [`HidError::Initialization`](crate::HidError::Initialization)
         /// when WebHID is unavailable (no window, a non-secure context, or a
         /// browser without WebHID support).
         pub fn new() -> HidResult<Self> {
-            Ok(HidApi {
+            Ok(Hidra {
                 backend: WebHidApi::new()?,
             })
         }

@@ -40,7 +40,7 @@ fn main() -> hidra::HidResult<()> {
     let pid = u16::from_str_radix(&args.next().expect("usage: read_async <vid> <pid>"), 16)
         .expect("pid must be hex");
 
-    let api = hidra::HidApi::new()?;
+    let api = hidra::Hidra::new()?;
 
     block_on(async {
         let device = api.open(vid, pid).await?;

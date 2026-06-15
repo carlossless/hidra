@@ -1,7 +1,7 @@
 //! [`MaybeFuture`]: an action that can be awaited or, on native targets, run
 //! synchronously.
 //!
-//! Every [`HidApi`](crate::HidApi) / [`HidDevice`](crate::HidDevice) method
+//! Every [`Hidra`](crate::Hidra) / [`HidDevice`](crate::HidDevice) method
 //! returns an `impl Future`. Bring [`MaybeFuture`] into scope to also run it
 //! synchronously with `.wait()`:
 //!
@@ -22,7 +22,7 @@ use core::future::{Future, IntoFuture};
 /// Extension trait adding a blocking `.wait()` to every action.
 ///
 /// Blanket-implemented for everything awaitable, so any
-/// [`HidApi`](crate::HidApi) / [`HidDevice`](crate::HidDevice) method can be
+/// [`Hidra`](crate::Hidra) / [`HidDevice`](crate::HidDevice) method can be
 /// driven with `.wait()` on native targets. Not available on `wasm32`, where
 /// blocking the (single) thread is impossible; use `.await` instead.
 #[cfg(not(target_arch = "wasm32"))]

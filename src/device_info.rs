@@ -49,7 +49,7 @@ pub struct DeviceInfo {
 }
 
 impl DeviceInfo {
-    /// Platform-specific device path, usable with `HidApi::open_path`.
+    /// Platform-specific device path, usable with `Hidra::open_path`.
     ///
     /// On Linux this is a `/dev/hidrawN` node, on Windows a device interface
     /// path, on macOS an IORegistry entry path.

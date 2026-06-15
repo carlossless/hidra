@@ -1,6 +1,6 @@
 //! WebAssembly backend: [WebHID](https://wicg.github.io/webhid/) via `web-sys`.
 //!
-//! Internal module: the public `wasm32` surface is [`crate::HidApi`] /
+//! Internal module: the public `wasm32` surface is [`crate::Hidra`] /
 //! [`crate::HidDevice`], which wrap the types here. Unlike the native backends
 //! this API is inherently async (every WebHID operation returns a Promise) and
 //! event-driven (input reports arrive as `inputreport` events instead of being
@@ -16,14 +16,14 @@
 //! WebHID is only available in secure contexts (HTTPS or localhost) on
 //! Chromium-based browsers, and device access is permission-gated: the user
 //! must pick devices from the chooser shown by
-//! [`crate::HidApi::request_device`], which in turn may only be called from a
+//! [`crate::Hidra::request_device`], which in turn may only be called from a
 //! user gesture (e.g. a click handler).
 //!
 //! ```no_run
 //! # #[cfg(target_arch = "wasm32")] async fn demo() -> hidra::HidResult<()> {
-//! use hidra::{DeviceFilter, HidApi};
+//! use hidra::{DeviceFilter, Hidra};
 //!
-//! let api = HidApi::new()?;
+//! let api = Hidra::new()?;
 //! // Must run inside a user gesture:
 //! let devices = api.request_device(&[DeviceFilter::new().vendor_id(0x046d)]).await?;
 //! let device = &devices[0];
@@ -84,7 +84,7 @@ fn dataview_to_vec(view: &js_sys::DataView) -> Vec<u8> {
 /// Keeps an event listener (and the Rust closure backing it) alive;
 /// removes the listener when dropped.
 ///
-/// Returned by [`crate::HidApi::on_connect`], [`crate::HidApi::on_disconnect`]
+/// Returned by [`crate::Hidra::on_connect`], [`crate::Hidra::on_disconnect`]
 /// and [`crate::HidDevice::on_input_report`]. Dropping the handle unregisters
 /// the callback; call [`forget`](Self::forget) to leak it and keep the listener
 /// installed for the lifetime of the page.
@@ -130,7 +130,7 @@ impl Drop for EventListenerHandle {
     }
 }
 
-/// A device filter for [`crate::HidApi::request_device`], mirroring WebHID's
+/// A device filter for [`crate::Hidra::request_device`], mirroring WebHID's
 /// `HIDDeviceFilter` dictionary. Unset fields match anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DeviceFilter {

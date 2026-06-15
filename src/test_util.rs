@@ -1,5 +1,10 @@
 //! Minimal executor for exercising the crate's futures in unit tests
 //! without an async runtime dependency.
+//!
+//! Only some configurations use it (the Linux `reactor` tests and the `nusb`
+//! backend tests), so it is dead code on, for example, a default-feature test
+//! build on macOS or Windows.
+#![allow(dead_code)]
 
 use std::future::Future;
 use std::sync::Arc;

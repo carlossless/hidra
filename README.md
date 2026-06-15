@@ -11,7 +11,7 @@ No C library is linked. One `HidApi` / `HidDevice` regardless of backend:
 | Linux | `hidraw` device nodes, sysfs enumeration | no libudev dependency |
 | Windows | `hid.dll` + SetupAPI (via `windows-sys` declarations) | |
 | macOS | IOHIDManager (direct framework FFI) | |
-| any native OS | raw USB transfers via [nusb](https://docs.rs/nusb) | optional `nusb` feature, swaps in a pure-Rust USB transport |
+| any platform [nusb](https://docs.rs/nusb) supports | raw USB transfers via nusb | optional `nusb` feature, swaps in a pure-Rust USB transport |
 | WebAssembly | [WebHID](https://wicg.github.io/webhid/) via `web-sys` | same `HidApi`/`HidDevice`, await-only |
 
 ## Quick start
@@ -99,7 +99,8 @@ report" operation, so blocking versus non-blocking is just `.wait()` versus
 
 Enabling the `nusb` feature swaps the per-OS native backend for a pure-Rust
 USB transport built on [nusb](https://docs.rs/nusb) (no libusb), behind the
-same `HidApi` / `HidDevice` (there is no separate type):
+same `HidApi` / `HidDevice` (there is no separate type). It runs on whatever
+platforms nusb itself supports:
 
 ```toml
 hidra = { version = "0.1", features = ["nusb"] }
@@ -109,6 +110,12 @@ Use it for raw USB access (kernel-driver detach on Linux, indexed string
 descriptors) instead of the OS HID stack. Like hidapi-libusb it claims the
 interface away from the OS driver and needs appropriate permissions (udev
 rules on Linux).
+
+It is especially useful when a USB device is not exposed as a HID device by
+the OS (so the native HID backend can't see it) but the device's interface is
+still a HID one. For example, an interface with no endpoints is ignored by
+the Linux `usbhid` driver and never appears as a `hidraw` device; the nusb
+backend talks to it over raw USB regardless.
 
 ## WebHID (wasm32)
 

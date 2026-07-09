@@ -1,5 +1,9 @@
 # hidra
 
+[![CI](https://github.com/carlossless/hidra/actions/workflows/ci.yml/badge.svg)](https://github.com/carlossless/hidra/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/hidra.svg)](https://crates.io/crates/hidra)
+[![docs.rs](https://docs.rs/hidra/badge.svg)](https://docs.rs/hidra)
+
 A pure-Rust HID library with a unified async API (with blocking `.wait()` on
 native targets, like nusb), a WebHID backend for WebAssembly, and standalone
 HID report-descriptor primitives.

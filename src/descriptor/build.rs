@@ -45,6 +45,7 @@ fn type_bits(item_type: ItemType) -> u8 {
 }
 
 impl DescriptorBuilder {
+    /// Create an empty builder.
     pub fn new() -> Self {
         Self::default()
     }
@@ -126,61 +127,73 @@ impl DescriptorBuilder {
 
     // --- Global items -----------------------------------------------------
 
+    /// Emit a `Usage Page` global item.
     pub fn usage_page(&mut self, page: u16) -> &mut Self {
         let tag = Self::global(GlobalTag::UsagePage);
         self.item_unsigned(ItemType::Global, tag, page as u32)
     }
 
+    /// Emit a `Logical Minimum` global item.
     pub fn logical_minimum(&mut self, value: i32) -> &mut Self {
         let tag = Self::global(GlobalTag::LogicalMinimum);
         self.item_signed(ItemType::Global, tag, value)
     }
 
+    /// Emit a `Logical Maximum` global item.
     pub fn logical_maximum(&mut self, value: i32) -> &mut Self {
         let tag = Self::global(GlobalTag::LogicalMaximum);
         self.item_signed(ItemType::Global, tag, value)
     }
 
+    /// Emit a `Physical Minimum` global item.
     pub fn physical_minimum(&mut self, value: i32) -> &mut Self {
         let tag = Self::global(GlobalTag::PhysicalMinimum);
         self.item_signed(ItemType::Global, tag, value)
     }
 
+    /// Emit a `Physical Maximum` global item.
     pub fn physical_maximum(&mut self, value: i32) -> &mut Self {
         let tag = Self::global(GlobalTag::PhysicalMaximum);
         self.item_signed(ItemType::Global, tag, value)
     }
 
+    /// Emit a `Unit Exponent` global item.
     pub fn unit_exponent(&mut self, value: i32) -> &mut Self {
         let tag = Self::global(GlobalTag::UnitExponent);
         self.item_signed(ItemType::Global, tag, value)
     }
 
+    /// Emit a `Unit` global item.
     pub fn unit(&mut self, value: u32) -> &mut Self {
         let tag = Self::global(GlobalTag::Unit);
         self.item_unsigned(ItemType::Global, tag, value)
     }
 
+    /// Emit a `Report Size` global item.
     pub fn report_size(&mut self, bits: u32) -> &mut Self {
         let tag = Self::global(GlobalTag::ReportSize);
         self.item_unsigned(ItemType::Global, tag, bits)
     }
 
+    /// Emit a `Report ID` global item.
     pub fn report_id(&mut self, id: u8) -> &mut Self {
         let tag = Self::global(GlobalTag::ReportId);
         self.item_unsigned(ItemType::Global, tag, id as u32)
     }
 
+    /// Emit a `Report Count` global item.
     pub fn report_count(&mut self, count: u32) -> &mut Self {
         let tag = Self::global(GlobalTag::ReportCount);
         self.item_unsigned(ItemType::Global, tag, count)
     }
 
+    /// Emit a `Push` global item.
     pub fn push(&mut self) -> &mut Self {
         let tag = Self::global(GlobalTag::Push);
         self.push_item(ItemType::Global, tag, &[])
     }
 
+    /// Emit a `Pop` global item.
     pub fn pop(&mut self) -> &mut Self {
         let tag = Self::global(GlobalTag::Pop);
         self.push_item(ItemType::Global, tag, &[])
@@ -195,16 +208,19 @@ impl DescriptorBuilder {
         self.item_unsigned(ItemType::Local, tag, usage)
     }
 
+    /// Emit a `Usage Minimum` local item.
     pub fn usage_minimum(&mut self, usage: u32) -> &mut Self {
         let tag = Self::local(LocalTag::UsageMinimum);
         self.item_unsigned(ItemType::Local, tag, usage)
     }
 
+    /// Emit a `Usage Maximum` local item.
     pub fn usage_maximum(&mut self, usage: u32) -> &mut Self {
         let tag = Self::local(LocalTag::UsageMaximum);
         self.item_unsigned(ItemType::Local, tag, usage)
     }
 
+    /// Emit a `String Index` local item.
     pub fn string_index(&mut self, index: u32) -> &mut Self {
         let tag = Self::local(LocalTag::StringIndex);
         self.item_unsigned(ItemType::Local, tag, index)
@@ -212,10 +228,12 @@ impl DescriptorBuilder {
 
     // --- Main items ----------------------------------------------------------
 
+    /// Emit a `Collection` main item of the given kind.
     pub fn collection(&mut self, kind: CollectionKind) -> &mut Self {
         self.item_unsigned(ItemType::Main, 0b1010, kind.value() as u32)
     }
 
+    /// Emit an `End Collection` main item.
     pub fn end_collection(&mut self) -> &mut Self {
         self.push_item(ItemType::Main, 0b1100, &[])
     }
@@ -226,10 +244,14 @@ impl DescriptorBuilder {
         self.main(MainTag::Input, flags)
     }
 
+    /// Emit an `Output` main item; `flags` is a bit-or of [`super::MainFlags`]
+    /// constants.
     pub fn output(&mut self, flags: u32) -> &mut Self {
         self.main(MainTag::Output, flags)
     }
 
+    /// Emit a `Feature` main item; `flags` is a bit-or of [`super::MainFlags`]
+    /// constants.
     pub fn feature(&mut self, flags: u32) -> &mut Self {
         self.main(MainTag::Feature, flags)
     }

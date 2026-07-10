@@ -14,29 +14,49 @@ pub type HidResult<T> = Result<T, HidError>;
 #[non_exhaustive]
 pub enum HidError {
     /// The platform backend failed to initialize (`hid_init` equivalent).
-    Initialization { message: String },
+    Initialization {
+        /// Human-readable description of the failure.
+        message: String,
+    },
     /// No device matched the requested VID/PID/serial or path.
     DeviceNotFound,
     /// The device exists but could not be opened (permissions, exclusive
     /// access by another process, ...).
-    OpenFailed { message: String },
+    OpenFailed {
+        /// Human-readable description of the failure.
+        message: String,
+    },
     /// An operating-system level I/O error.
     #[cfg(not(target_arch = "wasm32"))]
     Io {
+        /// The operation that failed (e.g. the ioctl or syscall name).
         operation: &'static str,
+        /// The underlying OS error.
         source: std::io::Error,
     },
     /// The device was disconnected while in use.
     Disconnected,
     /// Data passed to a send/write call is invalid (e.g. empty report).
-    InvalidData { message: String },
+    InvalidData {
+        /// Human-readable description of what was invalid.
+        message: String,
+    },
     /// A report descriptor (or other HID structure) failed to parse.
-    Parse { message: String },
+    Parse {
+        /// Human-readable description of the parse failure.
+        message: String,
+    },
     /// The operation is not supported by this backend.
-    Unsupported { message: String },
+    Unsupported {
+        /// Human-readable description of what is unsupported.
+        message: String,
+    },
     /// A backend-specific failure that fits no other category
     /// (the catch-all hidapi reports through `hid_error`).
-    Backend { message: String },
+    Backend {
+        /// Backend-provided error text.
+        message: String,
+    },
 }
 
 impl HidError {

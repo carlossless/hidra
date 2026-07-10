@@ -9,51 +9,82 @@ use crate::error::{HidError, HidResult};
 /// `bType` of a short item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemType {
+    /// Main item (Input/Output/Feature/Collection/EndCollection).
     Main,
+    /// Global item (state that persists across items, e.g. usage page).
     Global,
+    /// Local item (state that applies only to the next Main item).
     Local,
+    /// Reserved type, also used for long items.
     Reserved,
 }
 
 /// Tags of Main items (HID 1.11, 6.2.2.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MainTag {
+    /// Input item: a data field reported by the device.
     Input,
+    /// Output item: a data field sent to the device.
     Output,
+    /// Feature item: a data field for configuration, both directions.
     Feature,
+    /// Collection: opens a grouping of items; data is the collection type.
     Collection,
+    /// End Collection: closes the most recently opened collection.
     EndCollection,
 }
 
 /// Tags of Global items (HID 1.11, 6.2.2.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalTag {
+    /// Usage Page: the usage page applied to subsequent usages.
     UsagePage,
+    /// Logical Minimum: minimum value a field can report.
     LogicalMinimum,
+    /// Logical Maximum: maximum value a field can report.
     LogicalMaximum,
+    /// Physical Minimum: logical minimum mapped to physical units.
     PhysicalMinimum,
+    /// Physical Maximum: logical maximum mapped to physical units.
     PhysicalMaximum,
+    /// Unit Exponent: base-10 exponent applied to physical units.
     UnitExponent,
+    /// Unit: encoded physical unit of a field.
     Unit,
+    /// Report Size: size of each field, in bits.
     ReportSize,
+    /// Report ID: identifier prefixed to subsequent reports.
     ReportId,
+    /// Report Count: number of fields in the item.
     ReportCount,
+    /// Push: save the current global item state onto the stack.
     Push,
+    /// Pop: restore the global item state from the stack.
     Pop,
 }
 
 /// Tags of Local items (HID 1.11, 6.2.2.8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalTag {
+    /// Usage: a usage assigned to the next field(s).
     Usage,
+    /// Usage Minimum: start of a range of usages.
     UsageMinimum,
+    /// Usage Maximum: end of a range of usages.
     UsageMaximum,
+    /// Designator Index: physical designator from the physical descriptor.
     DesignatorIndex,
+    /// Designator Minimum: start of a range of designators.
     DesignatorMinimum,
+    /// Designator Maximum: end of a range of designators.
     DesignatorMaximum,
+    /// String Index: index of a string descriptor for the field.
     StringIndex,
+    /// String Minimum: start of a range of string indices.
     StringMinimum,
+    /// String Maximum: end of a range of string indices.
     StringMaximum,
+    /// Delimiter: opens or closes a set of alternative usages.
     Delimiter,
 }
 
@@ -160,6 +191,7 @@ pub struct Items<'a> {
 }
 
 impl<'a> Items<'a> {
+    /// Creates an iterator over the items of a raw report descriptor.
     pub fn new(descriptor: &'a [u8]) -> Self {
         Items {
             rest: descriptor,

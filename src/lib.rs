@@ -42,6 +42,8 @@
 //!
 //! [nusb]: https://docs.rs/nusb
 
+#![deny(missing_docs)]
+
 pub mod descriptor;
 mod device_info;
 mod error;
@@ -71,8 +73,11 @@ pub use backend::webhid::{DeviceFilter, EventListenerHandle, InputReportStream};
 /// hidra's version, mirroring `hid_version()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApiVersion {
+    /// Major version component.
     pub major: u16,
+    /// Minor version component.
     pub minor: u16,
+    /// Patch version component.
     pub patch: u16,
 }
 

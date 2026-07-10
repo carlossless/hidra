@@ -134,9 +134,13 @@ impl Drop for EventListenerHandle {
 /// `HIDDeviceFilter` dictionary. Unset fields match anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DeviceFilter {
+    /// Match only this USB vendor ID.
     pub vendor_id: Option<u16>,
+    /// Match only this USB product ID.
     pub product_id: Option<u16>,
+    /// Match only devices exposing this top-level usage page.
     pub usage_page: Option<u16>,
+    /// Match only devices exposing this top-level usage.
     pub usage: Option<u16>,
 }
 

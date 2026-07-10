@@ -95,9 +95,13 @@ pub struct ReportItemInfo {
     pub report_size: u16,
     /// Number of elements (`Report Count`).
     pub report_count: u16,
+    /// Minimum raw value a field can report (`Logical Minimum`).
     pub logical_minimum: i32,
+    /// Maximum raw value a field can report (`Logical Maximum`).
     pub logical_maximum: i32,
+    /// Raw `Logical Minimum` mapped to physical units (`Physical Minimum`).
     pub physical_minimum: i32,
+    /// Raw `Logical Maximum` mapped to physical units (`Physical Maximum`).
     pub physical_maximum: i32,
     /// `Unit Exponent` (power of ten applied to the unit).
     pub unit_exponent: i8,

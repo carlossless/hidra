@@ -6,8 +6,11 @@ use crate::error::{HidError, HidResult};
 /// Direction/class of a HID report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReportKind {
+    /// Device-to-host report (Input main item).
     Input,
+    /// Host-to-device report (Output main item).
     Output,
+    /// Bidirectional configuration report (Feature main item).
     Feature,
 }
 
@@ -16,14 +19,23 @@ pub enum ReportKind {
 pub struct MainFlags(pub u32);
 
 impl MainFlags {
+    /// Bit 0: Constant (padding) rather than Data.
     pub const CONSTANT: u32 = 1 << 0;
+    /// Bit 1: Variable rather than Array.
     pub const VARIABLE: u32 = 1 << 1;
+    /// Bit 2: Relative rather than Absolute.
     pub const RELATIVE: u32 = 1 << 2;
+    /// Bit 3: Wrap rather than No Wrap (values wrap past their extremes).
     pub const WRAP: u32 = 1 << 3;
+    /// Bit 4: Nonlinear rather than Linear.
     pub const NONLINEAR: u32 = 1 << 4;
+    /// Bit 5: No Preferred State rather than Preferred State.
     pub const NO_PREFERRED: u32 = 1 << 5;
+    /// Bit 6: Null State rather than No Null Position.
     pub const NULL_STATE: u32 = 1 << 6;
+    /// Bit 7: Volatile rather than Non Volatile (Output/Feature only).
     pub const VOLATILE: u32 = 1 << 7;
+    /// Bit 8: Buffered Bytes rather than Bit Field.
     pub const BUFFERED_BYTES: u32 = 1 << 8;
 
     /// Constant (padding) rather than Data.
@@ -38,21 +50,27 @@ impl MainFlags {
     pub fn is_relative(self) -> bool {
         self.0 & Self::RELATIVE != 0
     }
+    /// Wrap rather than No Wrap.
     pub fn is_wrap(self) -> bool {
         self.0 & Self::WRAP != 0
     }
+    /// Nonlinear rather than Linear.
     pub fn is_nonlinear(self) -> bool {
         self.0 & Self::NONLINEAR != 0
     }
+    /// No Preferred State rather than Preferred State.
     pub fn has_no_preferred_state(self) -> bool {
         self.0 & Self::NO_PREFERRED != 0
     }
+    /// Null State rather than No Null Position.
     pub fn has_null_state(self) -> bool {
         self.0 & Self::NULL_STATE != 0
     }
+    /// Volatile rather than Non Volatile.
     pub fn is_volatile(self) -> bool {
         self.0 & Self::VOLATILE != 0
     }
+    /// Buffered Bytes rather than Bit Field.
     pub fn is_buffered_bytes(self) -> bool {
         self.0 & Self::BUFFERED_BYTES != 0
     }
@@ -61,18 +79,28 @@ impl MainFlags {
 /// Collection type (HID 1.11, 6.2.2.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollectionKind {
+    /// Physical collection (0x00): a set of data items from one sensor.
     Physical,
+    /// Application collection (0x01): a top-level functional grouping.
     Application,
+    /// Logical collection (0x02): a related set of data items.
     Logical,
+    /// Report collection (0x03): groups items into a named report.
     Report,
+    /// Named Array collection (0x04): a logical group of array items.
     NamedArray,
+    /// Usage Switch collection (0x05): modifies the meaning of its usages.
     UsageSwitch,
+    /// Usage Modifier collection (0x06): modifies a usage's purpose.
     UsageModifier,
+    /// Reserved collection value (0x07-0x7F).
     Reserved(u8),
+    /// Vendor-defined collection value (0x80-0xFF).
     VendorDefined(u8),
 }
 
 impl CollectionKind {
+    /// Decode a Collection main item's data byte into a `CollectionKind`.
     pub fn from_value(value: u8) -> Self {
         match value {
             0x00 => CollectionKind::Physical,
@@ -87,6 +115,7 @@ impl CollectionKind {
         }
     }
 
+    /// The Collection main item data byte this kind encodes to.
     pub fn value(self) -> u8 {
         match self {
             CollectionKind::Physical => 0x00,
@@ -106,14 +135,17 @@ impl CollectionKind {
 pub struct Usage(pub u32);
 
 impl Usage {
+    /// Build an extended usage from a usage page and usage ID.
     pub fn new(page: u16, id: u16) -> Self {
         Usage(((page as u32) << 16) | id as u32)
     }
 
+    /// The usage page (high 16 bits).
     pub fn page(self) -> u16 {
         (self.0 >> 16) as u16
     }
 
+    /// The usage ID (low 16 bits).
     pub fn id(self) -> u16 {
         self.0 as u16
     }
@@ -122,8 +154,11 @@ impl Usage {
 /// A collection node in the descriptor's collection tree.
 #[derive(Debug, Clone)]
 pub struct Collection {
+    /// The collection's type (Application, Physical, etc.).
     pub kind: CollectionKind,
+    /// The usage associated with the collection (its first Local `Usage`).
     pub usage: Usage,
+    /// Nested collections declared inside this one, in descriptor order.
     pub children: Vec<Collection>,
 }
 
@@ -137,11 +172,17 @@ pub struct Field {
     pub usages: Vec<Usage>,
     /// Usage range from `Usage Minimum`/`Usage Maximum`, if given.
     pub usage_range: Option<(Usage, Usage)>,
+    /// Minimum raw value a field element can report (Logical Minimum).
     pub logical_minimum: i32,
+    /// Maximum raw value a field element can report (Logical Maximum).
     pub logical_maximum: i32,
+    /// Physical Minimum the logical range maps to, if declared.
     pub physical_minimum: Option<i32>,
+    /// Physical Maximum the logical range maps to, if declared.
     pub physical_maximum: Option<i32>,
+    /// Encoded HID unit (Unit global item), if declared.
     pub unit: Option<u32>,
+    /// Base-10 exponent applied to the unit (Unit Exponent), if declared.
     pub unit_exponent: Option<i32>,
     /// Bits per element.
     pub report_size: u32,
@@ -163,9 +204,11 @@ impl Field {
 /// All fields of one report (one direction + report ID).
 #[derive(Debug, Clone)]
 pub struct Report {
+    /// Direction/class of the report (Input/Output/Feature).
     pub kind: ReportKind,
     /// `None` when the device does not use report IDs.
     pub report_id: Option<u8>,
+    /// Fields making up the report payload, in descriptor order.
     pub fields: Vec<Field>,
 }
 

@@ -8,11 +8,16 @@ use core::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum BusType {
+    /// The transport could not be determined.
     #[default]
     Unknown,
+    /// USB.
     Usb,
+    /// Bluetooth or Bluetooth LE.
     Bluetooth,
+    /// I2C.
     I2c,
+    /// SPI.
     Spi,
 }
 
@@ -57,14 +62,17 @@ impl DeviceInfo {
         &self.path
     }
 
+    /// USB vendor ID.
     pub fn vendor_id(&self) -> u16 {
         self.vendor_id
     }
 
+    /// USB product ID.
     pub fn product_id(&self) -> u16 {
         self.product_id
     }
 
+    /// Device serial number, if the device reports one.
     pub fn serial_number(&self) -> Option<&str> {
         self.serial_number.as_deref()
     }
@@ -74,10 +82,12 @@ impl DeviceInfo {
         self.release_number
     }
 
+    /// Manufacturer string, if the device reports one.
     pub fn manufacturer_string(&self) -> Option<&str> {
         self.manufacturer_string.as_deref()
     }
 
+    /// Product string, if the device reports one.
     pub fn product_string(&self) -> Option<&str> {
         self.product_string.as_deref()
     }
@@ -97,6 +107,7 @@ impl DeviceInfo {
         self.interface_number
     }
 
+    /// The transport this device is attached through.
     pub fn bus_type(&self) -> BusType {
         self.bus_type
     }

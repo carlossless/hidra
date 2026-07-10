@@ -36,8 +36,9 @@ use core_foundation_sys::number::{
     kCFNumberSInt32Type, CFNumberGetTypeID, CFNumberGetValue, CFNumberRef,
 };
 use core_foundation_sys::runloop::{
-    kCFRunLoopDefaultMode, kCFRunLoopRunFinished, kCFRunLoopRunStopped, CFRunLoopGetCurrent,
-    CFRunLoopGetMain, CFRunLoopRef, CFRunLoopRunInMode, CFRunLoopStop, CFRunLoopWakeUp,
+    kCFRunLoopDefaultMode, kCFRunLoopRunFinished, kCFRunLoopRunStopped, CFRunLoopAddSource,
+    CFRunLoopGetCurrent, CFRunLoopGetMain, CFRunLoopRef, CFRunLoopRemoveSource, CFRunLoopRunInMode,
+    CFRunLoopSourceContext, CFRunLoopSourceCreate, CFRunLoopStop, CFRunLoopWakeUp,
 };
 use core_foundation_sys::set::{CFSetGetCount, CFSetGetValues, CFSetRef};
 use core_foundation_sys::string::{
@@ -576,6 +577,9 @@ unsafe extern "C" fn removal_callback(
     }
 }
 
+/// No-op `perform` for the keep-alive run-loop source (see [`read_thread`]).
+extern "C" fn keepalive_perform(_info: *const c_void) {}
+
 /// Read-thread body: schedules the device on this thread's run loop and pumps
 /// the private mode until shutdown or disconnection (hidapi's `read_thread`).
 fn read_thread(device: usize, mode: usize, shared: Arc<Shared>) {
@@ -586,6 +590,32 @@ fn read_thread(device: usize, mode: usize, shared: Arc<Shared>) {
     unsafe {
         let run_loop = CFRunLoopGetCurrent();
         IOHIDDeviceScheduleWithRunLoop(device, run_loop, mode);
+
+        // Keep-alive source. `CFRunLoopRunInMode` returns `kCFRunLoopRunFinished`
+        // immediately whenever `mode` has no sources/timers/observers. Right
+        // after a freshly re-enumerated device is scheduled, IOKit may not have
+        // attached the device's input source to this mode yet, leaving it
+        // momentarily empty; without a source of our own the very first
+        // `CFRunLoopRunInMode` returns `Finished` and we would flag a *false*
+        // disconnect on a device that is still present (seen as ~50% of reads
+        // failing right after the device enters ISP mode). Add a never-signalled
+        // source so the mode is never empty — hidapi keeps an equivalent source
+        // alive for the same reason.
+        let mut source_context = CFRunLoopSourceContext {
+            version: 0,
+            info: std::ptr::null_mut(),
+            retain: None,
+            release: None,
+            copyDescription: None,
+            equal: None,
+            hash: None,
+            schedule: None,
+            cancel: None,
+            perform: keepalive_perform,
+        };
+        let keepalive = CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &mut source_context);
+        CFRunLoopAddSource(run_loop, keepalive, mode);
+
         {
             let mut state = shared.lock_state();
             state.run_loop = run_loop as usize;
@@ -599,9 +629,10 @@ fn read_thread(device: usize, mode: usize, shared: Arc<Shared>) {
                     break;
                 }
             }
-            // hidapi pumps 1000-second slices of its private mode; the loop
-            // is interrupted by CFRunLoopStop (close/removal) or by Drop
-            // unscheduling the device, which empties the mode (-> Finished).
+            // hidapi pumps 1000-second slices of its private mode; the loop is
+            // interrupted by CFRunLoopStop on close/removal (-> Stopped). The
+            // keep-alive source added above stops a transiently-empty mode from
+            // returning Finished and being misread as a disconnect.
             let code = CFRunLoopRunInMode(mode, 1000.0, 0);
             if code == kCFRunLoopRunFinished || code == kCFRunLoopRunStopped {
                 let mut state = shared.lock_state();
@@ -613,11 +644,23 @@ fn read_thread(device: usize, mode: usize, shared: Arc<Shared>) {
                 break;
             }
         }
+
+        // Remove and release the keep-alive source now that the loop has ended.
+        CFRunLoopRemoveSource(run_loop, keepalive, mode);
+        CFRelease(keepalive as CFTypeRef);
+
         // Wake any threads blocked in read()/read_timeout() and any pending
         // read_async futures (the run loop may have died without the removal
         // callback firing).
         let wakers = {
             let mut state = shared.lock_state();
+            // This thread owns `run_loop` and is exiting. Clear the stored
+            // pointer so a later `Drop` cannot `CFRunLoopStop` this address
+            // after CoreFoundation has handed the same run-loop pointer to
+            // another device's read thread (they are reused across threads) —
+            // which would stop the wrong device's loop and flag it as falsely
+            // disconnected.
+            state.run_loop = 0;
             shared.cond.notify_all();
             std::mem::take(&mut state.wakers)
         };

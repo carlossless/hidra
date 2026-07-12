@@ -162,7 +162,6 @@ fn read_sysfs_hex(dir: &Path, file: &str) -> Option<u32> {
 struct UsbInfo {
     manufacturer: Option<String>,
     product: Option<String>,
-    serial: Option<String>,
     release_number: u16,
     interface_number: i32,
 }
@@ -182,7 +181,6 @@ fn collect_usb_info(hid_dev_dir: &Path) -> Option<UsbInfo> {
         if dir.join("idVendor").exists() && dir.join("idProduct").exists() {
             info.manufacturer = read_sysfs_string(&dir, "manufacturer");
             info.product = read_sysfs_string(&dir, "product");
-            info.serial = read_sysfs_string(&dir, "serial");
             info.release_number = read_sysfs_hex(&dir, "bcdDevice").unwrap_or(0) as u16;
             return Some(info);
         }
@@ -209,15 +207,19 @@ fn device_infos(hid_dev_dir: &Path, dev_path: &str) -> Option<Vec<DeviceInfo>> {
 
     match bus_type {
         BusType::Usb => {
+            // Serial always comes from the HID uevent's HID_UNIQ (the usbhid
+            // driver fills it from the USB iSerial); only the manufacturer,
+            // product, release and interface come from the USB device node.
+            // This matches hidapi, which never overwrites the serial with the
+            // USB `serial` sysfs attribute.
+            info.serial_number = uevent.serial;
             if let Some(usb) = collect_usb_info(hid_dev_dir) {
                 info.manufacturer_string = usb.manufacturer;
                 info.product_string = usb.product;
-                info.serial_number = usb.serial;
                 info.release_number = usb.release_number;
                 info.interface_number = usb.interface_number;
             } else {
                 info.product_string = uevent.name;
-                info.serial_number = uevent.serial;
             }
         }
         _ => {
@@ -323,10 +325,6 @@ pub(crate) struct HidrawDevice {
     // `read_async`, so the blocking-mode state is unused on this path.
     #[allow(dead_code)]
     blocking: AtomicBool,
-    /// Whether the device's report descriptor declares numbered reports.
-    /// hidraw expects `write()` data to omit the leading 0 byte for devices
-    /// without report IDs.
-    numbered_reports: bool,
     /// Canonical sysfs HID device directory, for metadata lookups.
     sysfs_hid_dir: PathBuf,
     /// `/dev/hidrawN`.
@@ -351,26 +349,11 @@ impl HidrawDevice {
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
         let sysfs_hid_dir = sysfs_dir_for_fd(fd.as_raw_fd())?;
-        let dev = HidrawDevice {
+        Ok(HidrawDevice {
             fd,
             blocking: AtomicBool::new(true),
-            numbered_reports: false,
             sysfs_hid_dir,
             dev_path: path.to_string(),
-        };
-
-        // hidapi probes this once at open time too.
-        let mut desc_buf = [0u8; MAX_REPORT_DESCRIPTOR_SIZE];
-        let numbered = dev
-            .get_report_descriptor(&mut desc_buf)
-            .ok()
-            .and_then(|len| ReportDescriptor::parse(&desc_buf[..len]).ok())
-            .map(|d| d.uses_report_ids())
-            .unwrap_or(false);
-
-        Ok(HidrawDevice {
-            numbered_reports: numbered,
-            ..dev
         })
     }
 
@@ -384,15 +367,13 @@ impl HidrawDevice {
                 message: "write data must contain a report ID byte".into(),
             });
         }
-        // For devices without numbered reports, hidraw wants the bare
-        // payload; the caller passed a leading 0 per the hidapi convention.
-        let (payload, skipped) = if !self.numbered_reports && data[0] == 0 && data.len() > 1 {
-            (&data[1..], 1)
-        } else {
-            (data, 0)
-        };
+        // The kernel always treats `data[0]` as the report number (0 for
+        // devices without numbered reports) and consumes it itself, so the
+        // buffer is passed verbatim, leading 0 included — matching hidapi and
+        // the hidraw contract (Documentation/hid/hidraw.rst). Stripping the 0
+        // would shift the payload and reject minimal 2-byte writes with EINVAL.
         let res = loop {
-            let r = unsafe { libc::write(self.raw_fd(), payload.as_ptr().cast(), payload.len()) };
+            let r = unsafe { libc::write(self.raw_fd(), data.as_ptr().cast(), data.len()) };
             if r >= 0 {
                 break r as usize;
             }
@@ -402,7 +383,7 @@ impl HidrawDevice {
             }
             return Err(HidError::io("hidraw write", err));
         };
-        Ok(res + skipped)
+        Ok(res)
     }
 
     #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
@@ -688,6 +669,34 @@ mod tests {
             assert_eq!(hidiocsfeature(8), 0xC0084806);
             assert_eq!(hidiocgfeature(8), 0xC0084807);
         }
+    }
+
+    #[test]
+    fn write_preserves_leading_report_id_byte() {
+        // hidraw's write() must hand the buffer to the kernel verbatim,
+        // including the leading report-number byte (0 for unnumbered reports).
+        // A pipe stands in for the hidraw fd so we can observe the exact bytes
+        // written. The old code stripped the leading 0 for unnumbered devices,
+        // which shifted the payload and truncated the write.
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read_fd = fds[0];
+        let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let dev = HidrawDevice {
+            fd: write_fd,
+            blocking: AtomicBool::new(true),
+            sysfs_hid_dir: PathBuf::new(),
+            dev_path: String::new(),
+        };
+
+        let n = dev.write(&[0x00, 0xAA, 0xBB]).unwrap();
+        assert_eq!(n, 3, "returned length must count the report-ID byte");
+
+        let mut got = [0u8; 8];
+        let r = unsafe { libc::read(read_fd, got.as_mut_ptr().cast(), got.len()) };
+        unsafe { libc::close(read_fd) };
+        assert_eq!(r, 3, "all three bytes must reach the fd");
+        assert_eq!(&got[..3], &[0x00, 0xAA, 0xBB]);
     }
 
     #[test]

@@ -553,18 +553,19 @@ impl NusbDevice {
             });
         }
         let report_number = data[0];
-        let (payload, skipped) = if report_number == 0 {
-            (&data[1..], 1)
-        } else {
-            (data, 0)
-        };
+        let payload = if report_number == 0 { &data[1..] } else { data };
         match &self.out_endpoint {
             Some(endpoint) => {
                 let mut endpoint = endpoint.lock().unwrap();
                 let completion =
                     endpoint.transfer_blocking(payload.to_vec().into(), CONTROL_TIMEOUT);
                 match completion.status {
-                    Ok(()) => Ok(completion.actual_len + skipped),
+                    // Report the caller's original length (report-ID byte
+                    // included), matching the documented contract, hidapi, and
+                    // the SET_REPORT path below. `actual_len` counts only the
+                    // payload bytes the endpoint transferred, so it would
+                    // under-report on a short transfer.
+                    Ok(()) => Ok(data.len()),
                     Err(e) => Err(transfer_error("interrupt OUT write", e)),
                 }
             }

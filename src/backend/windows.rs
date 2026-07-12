@@ -950,6 +950,20 @@ impl WinDevice {
         copy_len
     }
 
+    /// Adjust a `GET_FEATURE`/`GET_INPUT` DeviceIoControl byte count to
+    /// hidapi's convention. For numbered reports Windows already includes the
+    /// leading report-ID byte in the count; for unnumbered reports the leading
+    /// byte stays 0 and is excluded, so the ID byte is added back only in that
+    /// case. `first_byte` is `buf[0]` after the call.
+    fn get_report_len(first_byte: u8, bytes_returned: usize, buf_len: usize) -> usize {
+        let n = if first_byte == 0 {
+            bytes_returned + 1
+        } else {
+            bytes_returned
+        };
+        n.min(buf_len)
+    }
+
     /// Read one input report without ever resolving with `Ok(0)`: the future
     /// completes once the persistent background `ReadFile` delivers a report,
     /// and fails with [`HidError::Disconnected`] when the device is removed.
@@ -1120,8 +1134,7 @@ impl WinDevice {
         if unsafe { GetOverlappedResult(self.handle.raw(), ol, &mut returned, 1) } == 0 {
             return Err(Self::io_error(operation, unsafe { GetLastError() }));
         }
-        // bytes_returned excludes the leading report ID byte (hidapi adds 1).
-        Ok((returned as usize + 1).min(buf.len()))
+        Ok(Self::get_report_len(buf[0], returned as usize, buf.len()))
     }
 
     pub fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize> {
@@ -1771,6 +1784,20 @@ mod tests {
                 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, // data4 verbatim
             ]
         );
+    }
+
+    #[test]
+    fn get_report_len_matches_hidapi_convention() {
+        // Numbered report (nonzero leading ID): Windows already counts the ID
+        // byte, so the returned length is used as-is.
+        assert_eq!(WinDevice::get_report_len(0x05, 8, 64), 8);
+        // Unnumbered report (leading 0): Windows omits the ID byte from the
+        // count, so add it back — this is the off-by-one the old code applied
+        // unconditionally.
+        assert_eq!(WinDevice::get_report_len(0, 8, 64), 9);
+        // Never exceed the caller's buffer.
+        assert_eq!(WinDevice::get_report_len(0, 64, 64), 64);
+        assert_eq!(WinDevice::get_report_len(0x05, 64, 64), 64);
     }
 
     #[test]

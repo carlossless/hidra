@@ -1,0 +1,31 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>hidra WebHID test</title>
+  </head>
+  <body>
+    <h1>hidra WebHID test</h1>
+    <button id="run">Run</button>
+    <pre id="result">idle</pre>
+    <script type="module">
+      import init, { run_webhid_test } from "./pkg/hidra_web_test.js";
+      await init();
+      const result = document.getElementById("result");
+      // Completion signal the Playwright driver polls on.
+      window.__hidraResult = null;
+      document.getElementById("run").addEventListener("click", async () => {
+        result.textContent = "running";
+        try {
+          const summary = await run_webhid_test();
+          result.textContent = summary;
+          window.__hidraResult = { ok: true, summary };
+        } catch (e) {
+          const msg = typeof e === "string" ? e : e && e.message ? e.message : String(e);
+          result.textContent = "ERROR: " + msg;
+          window.__hidraResult = { ok: false, error: msg };
+        }
+      });
+    </script>
+  </body>
+</html>

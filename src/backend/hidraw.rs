@@ -1,7 +1,7 @@
 //! Linux backend: `/dev/hidraw*` device nodes, enumerated through sysfs.
 //!
-//! Unlike hidapi's hidraw backend this does not link libudev; enumeration
-//! reads `/sys/class/hidraw` directly, which is what libudev does underneath.
+//! This does not link libudev; enumeration reads `/sys/class/hidraw`
+//! directly, which is what libudev does underneath.
 
 use std::fs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -190,7 +190,7 @@ fn collect_usb_info(hid_dev_dir: &Path) -> Option<UsbInfo> {
 }
 
 /// Build the `DeviceInfo` entries for one hidraw node. Devices with several
-/// top-level collections produce one entry per collection, like hidapi.
+/// top-level collections produce one entry per collection.
 fn device_infos(hid_dev_dir: &Path, dev_path: &str) -> Option<Vec<DeviceInfo>> {
     let uevent = fs::read_to_string(hid_dev_dir.join("uevent")).ok()?;
     let uevent = parse_uevent(&uevent)?;
@@ -210,8 +210,8 @@ fn device_infos(hid_dev_dir: &Path, dev_path: &str) -> Option<Vec<DeviceInfo>> {
             // Serial always comes from the HID uevent's HID_UNIQ (the usbhid
             // driver fills it from the USB iSerial); only the manufacturer,
             // product, release and interface come from the USB device node.
-            // This matches hidapi, which never overwrites the serial with the
-            // USB `serial` sysfs attribute.
+            // The serial is never overwritten with the USB `serial` sysfs
+            // attribute.
             info.serial_number = uevent.serial;
             if let Some(usb) = collect_usb_info(hid_dev_dir) {
                 info.manufacturer_string = usb.manufacturer;
@@ -224,7 +224,7 @@ fn device_infos(hid_dev_dir: &Path, dev_path: &str) -> Option<Vec<DeviceInfo>> {
         }
         _ => {
             // Bluetooth, I2C, SPI and virtual devices carry their identity in
-            // the HID uevent, matching hidapi's behavior.
+            // the HID uevent.
             info.product_string = uevent.name;
             info.serial_number = uevent.serial;
         }
@@ -369,8 +369,8 @@ impl HidrawDevice {
         }
         // The kernel always treats `data[0]` as the report number (0 for
         // devices without numbered reports) and consumes it itself, so the
-        // buffer is passed verbatim, leading 0 included — matching hidapi and
-        // the hidraw contract (Documentation/hid/hidraw.rst). Stripping the 0
+        // buffer is passed verbatim, leading 0 included — matching the
+        // hidraw contract (Documentation/hid/hidraw.rst). Stripping the 0
         // would shift the payload and reject minimal 2-byte writes with EINVAL.
         let res = loop {
             let r = unsafe { libc::write(self.raw_fd(), data.as_ptr().cast(), data.len()) };
@@ -539,8 +539,8 @@ impl HidrawDevice {
     }
 
     pub fn get_indexed_string(&self, _index: u32) -> HidResult<Option<String>> {
-        // Same as hidapi's hidraw backend: not available without raw USB
-        // access. The `nusb` feature backend supports it.
+        // Not available without raw USB access; the `nusb` feature backend
+        // supports it.
         Err(HidError::Unsupported {
             message: "indexed strings are not available via hidraw; use the usb backend".into(),
         })
@@ -568,7 +568,7 @@ impl HidrawDevice {
     pub fn get_device_info(&self) -> HidResult<DeviceInfo> {
         let mut infos = device_infos(&self.sysfs_hid_dir, &self.dev_path)
             .ok_or_else(|| HidError::backend("failed to read device metadata from sysfs"))?;
-        // For multi-collection devices hidapi returns the first entry.
+        // For multi-collection devices the first entry is returned.
         Ok(infos.remove(0))
     }
 }

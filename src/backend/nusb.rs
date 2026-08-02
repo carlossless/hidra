@@ -12,7 +12,7 @@
 //! * you want the kernel driver detached from the interface (Linux), e.g. to
 //!   take a vendor interface away from `usbhid`.
 //!
-//! The trade-offs mirror hidapi-libusb exactly: opening a device **claims the
+//! Opening a device **claims the
 //! whole USB interface, stealing it from the OS driver** until the handle is
 //! dropped, and raw USB access needs appropriate permissions, udev rules
 //! granting access to the `/dev/bus/usb` node on Linux, a WinUSB-compatible
@@ -64,13 +64,13 @@ const HID_SET_REPORT: u8 = 0x09;
 const REPORT_TYPE_INPUT: u16 = 1;
 const REPORT_TYPE_OUTPUT: u16 = 2;
 const REPORT_TYPE_FEATURE: u16 = 3;
-/// hidapi uses a fixed 1000 ms timeout for all control transfers and writes.
+/// A fixed 1000 ms timeout is used for all control transfers and writes.
 const CONTROL_TIMEOUT: Duration = Duration::from_millis(1000);
 /// How often the reader thread re-checks the shutdown flag while idle.
 const READER_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// hidapi drops the oldest queued input report beyond 30.
+/// The oldest queued input report beyond 30 is dropped.
 const MAX_QUEUED_REPORTS: usize = 30;
-/// The string-descriptor language hidapi requests.
+/// The string-descriptor language requested.
 const US_ENGLISH: u16 = 0x0409;
 
 // --- path handling -----------------------------------------------------------
@@ -118,7 +118,7 @@ fn device_info(dev: &nusb::DeviceInfo, interface_number: u8) -> DeviceInfo {
     }
 }
 
-/// Append one `DeviceInfo` per top-level usage pair, like hidapi. With no
+/// Append one `DeviceInfo` per top-level usage pair. With no
 /// readable descriptor a single entry with usage 0/0 is emitted.
 fn push_usage_entries(mut info: DeviceInfo, usages: &[(u16, u16)], out: &mut Vec<DeviceInfo>) {
     match usages {
@@ -143,7 +143,7 @@ const DESCRIPTOR_TYPE_HID: u8 = 0x21;
 /// `wDescriptorLength` declared by the HID class descriptor of the given
 /// interface's alternate setting 0.
 ///
-/// hidapi-libusb requests exactly this many bytes, and so do we: some
+/// We request exactly this many bytes: some
 /// devices (seen on a UVC webcam with a vendor HID interface) return
 /// unrelated descriptor data past the real report descriptor when the
 /// request asks for more.
@@ -212,8 +212,8 @@ fn read_report_descriptor_unclaimed(
 }
 
 /// WinUSB only allows control transfers through a claimed interface handle,
-/// so enumeration stays non-invasive and reports usage 0/0, like
-/// hidapi-libusb built without `INVASIVE_GET_USAGE`.
+/// so enumeration stays non-invasive and reports usage 0/0, a
+/// non-invasive enumeration that does not open the device.
 #[cfg(target_os = "windows")]
 fn read_report_descriptor_unclaimed(
     _device: &nusb::Device,
@@ -253,7 +253,7 @@ impl NusbApi {
     /// Usage page/usage require reading each device's report descriptor,
     /// which needs the device opened; this is attempted best-effort and the
     /// fields stay 0/0 when the device cannot be opened (e.g. missing udev
-    /// permissions), matching hidapi-libusb.
+    /// permissions).
     pub fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>> {
         let devices = match nusb::list_devices().wait() {
             Ok(devices) => devices,
@@ -368,7 +368,7 @@ impl Shared {
     fn push_report(&self, report: Vec<u8>) {
         let mut input = self.queue.lock().unwrap();
         if input.reports.len() >= MAX_QUEUED_REPORTS {
-            input.reports.pop_front(); // drop the oldest, like hidapi
+            input.reports.pop_front(); // drop the oldest
         }
         input.reports.push_back(report);
         let wakers = std::mem::take(&mut input.wakers);
@@ -460,7 +460,7 @@ impl NusbDevice {
                 message: format!("claiming interface {interface_number}: {e}"),
             })?;
 
-        // Probe the report descriptor once, like hidapi: it determines report
+        // Probe the report descriptor once: it determines report
         // ID usage / input sizes and backs `get_report_descriptor`.
         let report_descriptor = read_report_descriptor(&interface).unwrap_or_default();
         let parsed = ReportDescriptor::parse(&report_descriptor).ok();
@@ -542,8 +542,8 @@ impl NusbDevice {
         })
     }
 
-    /// Send an output report. `data[0]` is the report ID; like hidapi's
-    /// libusb backend, a 0 ID byte is stripped before transmission on both
+    /// Send an output report. `data[0]` is the report ID; a 0 ID byte is
+    /// stripped before transmission on both
     /// the interrupt and the `SET_REPORT` control path, while a nonzero ID
     /// is sent on the wire. Returns the original length on success.
     pub fn write(&self, data: &[u8]) -> HidResult<usize> {
@@ -561,7 +561,7 @@ impl NusbDevice {
                     endpoint.transfer_blocking(payload.to_vec().into(), CONTROL_TIMEOUT);
                 match completion.status {
                     // Report the caller's original length (report-ID byte
-                    // included), matching the documented contract, hidapi, and
+                    // included), matching the documented contract and
                     // the SET_REPORT path below. `actual_len` counts only the
                     // payload bytes the endpoint transferred, so it would
                     // under-report on a short transfer.
@@ -570,8 +570,7 @@ impl NusbDevice {
                 }
             }
             None => {
-                // No interrupt OUT endpoint: use SET_REPORT(Output), like
-                // hidapi.
+                // No interrupt OUT endpoint: use SET_REPORT(Output).
                 self.interface
                     .control_out(
                         ControlOut {
@@ -604,7 +603,7 @@ impl NusbDevice {
 
     /// Read an input report queued by the reader thread. Negative timeout
     /// blocks forever, `0` polls; returns `Ok(0)` on timeout. Reports pass
-    /// through in USB wire format, which already matches hidapi's
+    /// through in USB wire format, which already matches the
     /// convention: the report ID prefix is present only for devices with
     /// numbered reports.
     #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
@@ -623,7 +622,7 @@ impl NusbDevice {
                 buf[..len].copy_from_slice(&report[..len]);
                 return Ok(len);
             }
-            // Queued reports drain even after a disconnect, like hidapi.
+            // Queued reports drain even after a disconnect.
             if self.shared.disconnected.load(Ordering::SeqCst) {
                 return Err(HidError::Disconnected);
             }
@@ -650,8 +649,7 @@ impl NusbDevice {
         }
     }
 
-    /// Read an input report asynchronously (hidra extension; hidapi has no
-    /// async API).
+    /// Read an input report asynchronously (hidra extension).
     ///
     /// Resolves once a report queued by the reader thread has been copied
     /// into `buf`, returning its length, never `Ok(0)`; use your runtime's
@@ -685,7 +683,7 @@ impl NusbDevice {
     }
 
     /// Send a feature report via `SET_REPORT(Feature)`. `data[0]` is the
-    /// report ID; a 0 ID byte is stripped, like hidapi.
+    /// report ID; a 0 ID byte is stripped.
     pub fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
         if data.is_empty() {
             return Err(HidError::InvalidData {
@@ -713,7 +711,7 @@ impl NusbDevice {
 
     /// `GET_REPORT` shared by feature and input reports. `buf[0]` carries the
     /// report ID on entry; for ID 0 the returned data is written at
-    /// `buf[1..]` so the ID stays in byte 0, exactly like hidapi.
+    /// `buf[1..]` so the ID stays in byte 0.
     fn get_report(
         &self,
         report_type: u16,
@@ -842,7 +840,7 @@ impl Future for ReadAsync<'_> {
 }
 
 /// Reader thread: keeps one interrupt IN transfer pending and queues
-/// completed reports, mirroring hidapi's `read_callback` loop.
+/// completed reports.
 fn reader_loop(mut endpoint: Endpoint<Interrupt, In>, shared: Arc<Shared>, transfer_len: usize) {
     let buf = endpoint.allocate(transfer_len);
     endpoint.submit(buf);
@@ -864,7 +862,7 @@ fn reader_loop(mut endpoint: Endpoint<Interrupt, In>, shared: Arc<Shared>, trans
                 break;
             }
             Err(TransferError::Cancelled) => break,
-            // Transient conditions (stall, fault): resubmit, like hidapi.
+            // Transient conditions (stall, fault): resubmit.
             Err(_) => endpoint.submit(completion.buffer),
         }
     }

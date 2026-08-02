@@ -1,18 +1,18 @@
 //! Windows backend: HID class devices via `hid.dll` and SetupAPI.
 //!
-//! Mirrors hidapi's `windows/hid.c`: enumeration walks the HID device
+//! Windows HID backend: enumeration walks the HID device
 //! interface class with SetupAPI, devices are opened overlapped and all I/O
 //! goes through one persistent background `ReadFile` plus event-driven
 //! `WriteFile`/`DeviceIoControl` calls.
 //!
-//! Known deviations from hidapi, each documented at the relevant method:
+//! Notable design choices, each documented at the relevant method:
 //!
 //! * the bus type is classified from the devnode's enumerator/hardware IDs
 //!   instead of `DEVPKEY_Device_BusTypeGuid`;
 //! * `get_report_descriptor` reconstructs the descriptor from the documented
 //!   HidP API rather than the undocumented preparsed-data layout;
-//! * a timed-out `write` cancels the pending I/O before returning (hidapi
-//!   leaves it running), which is required for memory safety in Rust.
+//! * a timed-out `write` cancels the pending I/O before returning, which is
+//!   required for memory safety in Rust.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -62,7 +62,7 @@ use crate::descriptor::{CollectionKind, DescriptorBuilder, MainFlags};
 use crate::error::{HidError, HidResult};
 use crate::{BusType, DeviceInfo};
 
-/// `hid_winapi_set_write_timeout` default (hidapi uses 1000 ms too).
+/// Default write timeout in milliseconds.
 const DEFAULT_WRITE_TIMEOUT_MS: u32 = 1000;
 
 // DDK ioctls not exported by windows-sys. CTL_CODE(FILE_DEVICE_KEYBOARD=0x0B,
@@ -94,7 +94,8 @@ fn utf16_until_nul(buf: &[u16]) -> Option<String> {
 ///
 /// Composite USB devices carry an `&mi_XX` token per interface. Non-composite
 /// USB devices omit it: Windows only adds `MI_` for multi-interface devices.
-/// hidapi reports `-1` in that case, but Linux and macOS report the real
+/// Some setups would expose no interface number in that case, but Linux and
+/// macOS report the real
 /// interface number (`0`, from `bInterfaceNumber`); we match the latter so a
 /// single-interface USB device reads the same `interface_number` on every
 /// platform. `bus_type` distinguishes a non-composite USB device (→ 0) from a
@@ -128,9 +129,9 @@ fn guid_to_bytes(guid: &GUID) -> [u8; 16] {
 /// Classify the bus from the devnode's enumerator name plus hardware /
 /// compatible IDs.
 ///
-/// hidapi inspects `DEVPKEY_Device_CompatibleIds` of the *parent* devnode;
-/// this heuristic uses the same markers but reads them from the HID devnode
-/// itself, which SetupAPI hands us for free during enumeration:
+/// Rather than inspecting `DEVPKEY_Device_CompatibleIds` of the *parent*
+/// devnode, this heuristic uses the same markers but reads them from the HID
+/// devnode itself, which SetupAPI hands us for free during enumeration:
 ///
 /// * enumerator `USB` (or a `USB` hardware id)        -> USB
 /// * enumerator `BTHENUM` / `BTHLEDEVICE` (or id)     -> Bluetooth (incl. BLE)
@@ -202,7 +203,7 @@ unsafe impl Send for OverlappedIo {}
 
 impl OverlappedIo {
     fn new() -> HidResult<Self> {
-        // Auto-reset, initially non-signaled, unnamed, like hidapi.
+        // Auto-reset, initially non-signaled, unnamed.
         // SAFETY: CreateEventW with null attributes/name is always valid.
         let event = unsafe { CreateEventW(core::ptr::null(), 0, 0, core::ptr::null()) };
         if event.is_null() {
@@ -318,7 +319,7 @@ fn device_instance_id(devinst: u32) -> Option<String> {
 /// live on an ancestor (the USB device is the grandparent of a HID
 /// collection). We therefore classify the devnode and, while the result is
 /// inconclusive, walk up parents via cfgmgr32 and classify their instance IDs.
-/// This matches what hidapi reports for HID-over-USB/Bluetooth devices.
+/// This produces the expected classification for HID-over-USB/Bluetooth devices.
 fn bus_type_for_devnode(list: HDEVINFO, devinfo: &SP_DEVINFO_DATA) -> BusType {
     let enumerator = registry_property(list, devinfo, SPDRP_ENUMERATOR_NAME)
         .and_then(|b| utf16_until_nul(&b))
@@ -405,7 +406,7 @@ fn devnode_for_interface(path: &str) -> HidResult<(DevInfoList, SP_DEVINFO_DATA)
 }
 
 /// Open a device interface path with the requested access rights, always
-/// shared read/write and overlapped, like hidapi's `open_device`.
+/// shared read/write and overlapped.
 fn open_interface(path: &str, access: u32) -> Result<Handle, u32> {
     let wpath = wide(path);
     // SAFETY: wpath is NUL terminated; null security attributes/template.
@@ -426,8 +427,8 @@ fn open_interface(path: &str, access: u32) -> Result<Handle, u32> {
     Ok(Handle(handle))
 }
 
-/// Build a `DeviceInfo` for an open handle, mirroring what hidapi gathers at
-/// enumeration time.
+/// Build a `DeviceInfo` for an open handle, gathering the same metadata as
+/// enumeration.
 fn query_device_info(handle: HANDLE, path: &str, bus_type: BusType) -> DeviceInfo {
     let mut info = DeviceInfo {
         path: path.to_string(),
@@ -526,7 +527,7 @@ impl WinApi {
                 continue;
             };
 
-            // hidapi opens with no access rights (shared) so devices held
+            // Open with no access rights (shared) so devices held
             // exclusively by other processes still enumerate.
             let Ok(handle) = open_interface(&path, 0) else {
                 continue;
@@ -616,7 +617,7 @@ fn interface_detail_path(
 
 // --- device handle ------------------------------------------------------------
 
-/// State of the single background `ReadFile` hidapi keeps per device.
+/// State of the single background `ReadFile` kept per device.
 struct ReadState {
     io: OverlappedIo,
     /// Staging buffer of `InputReportByteLength` bytes; Windows always
@@ -690,7 +691,7 @@ pub(crate) struct WinDevice {
     handle: Handle,
     /// Device interface path used to open the handle.
     path: String,
-    /// Metadata captured at open time (hidapi caches it the same way).
+    /// Metadata captured and cached at open time.
     info: DeviceInfo,
     feature_report_len: u16,
     // Part of the backend contract; the wrapper now reads input via
@@ -702,7 +703,7 @@ pub(crate) struct WinDevice {
 
 impl WinDevice {
     fn open(path: &str) -> HidResult<Self> {
-        // hidapi opens read/write, and on ERROR_ACCESS_DENIED retries with 0
+        // Open read/write, and on ERROR_ACCESS_DENIED retry with 0
         // desired access. Windows refuses GENERIC_READ/WRITE on the system
         // keyboard/mouse top-level collections, but a 0-access handle still
         // serves preparsed data, caps, the (reconstructed) report descriptor
@@ -730,7 +731,7 @@ impl WinDevice {
             }
         };
 
-        // SAFETY: handle is open; hidapi requests 64 queued input reports.
+        // SAFETY: handle is open; request 64 queued input reports.
         if !unsafe { HidD_SetNumInputBuffers(handle.raw(), 64) } {
             return Err(HidError::last_os_error("HidD_SetNumInputBuffers"));
         }
@@ -795,7 +796,7 @@ impl WinDevice {
         let mut st = self.write.lock().unwrap_or_else(|e| e.into_inner());
 
         // Windows expects exactly OutputReportByteLength bytes; shorter
-        // writes are zero-padded like hidapi does. Longer payloads are passed
+        // writes are zero-padded. Longer payloads are passed
         // through and rejected by the driver.
         let (ptr, len) = if data.len() >= st.buf.len() {
             (data.as_ptr(), data.len())
@@ -832,7 +833,7 @@ impl WinDevice {
         // SAFETY: event/ol belong to this in-flight operation.
         let wait = unsafe { WaitForSingleObject(st.io.event.raw(), timeout) };
         if wait != WAIT_OBJECT_0 {
-            // Unlike hidapi we cancel and reap the request before returning,
+            // We cancel and reap the request before returning,
             // so the staging buffer / caller's slice can be safely reused.
             unsafe {
                 CancelIoEx(self.handle.raw(), ol);
@@ -883,7 +884,7 @@ impl WinDevice {
                     let wait = unsafe { WaitForSingleObject(st.io.event.raw(), timeout_ms as u32) };
                     if wait == WAIT_TIMEOUT {
                         // No data yet; leave the overlapped read running
-                        // (hidapi semantics) and report a timeout.
+                        // and report a timeout.
                         return Ok(0);
                     }
                     if wait != WAIT_OBJECT_0 {
@@ -904,7 +905,7 @@ impl WinDevice {
         Ok(Self::copy_report(&st, bytes_read, buf))
     }
 
-    /// Ensure the single background `ReadFile` hidapi keeps per device is in
+    /// Ensure the single background `ReadFile` kept per device is in
     /// flight. `Ok(Some(n))` when the call completed synchronously with `n`
     /// bytes (the read is no longer pending), `Ok(None)` when it is pending
     /// (newly started or left over from an earlier call).
@@ -941,7 +942,7 @@ impl WinDevice {
     fn copy_report(st: &ReadState, bytes_read: u32, buf: &mut [u8]) -> usize {
         let mut report = &st.buf[..(bytes_read as usize).min(st.buf.len())];
         // Windows always prefixes input reports with a report ID byte; for
-        // devices without numbered reports it is 0 and hidapi strips it.
+        // devices without numbered reports it is 0 and is stripped.
         if report.first() == Some(&0) {
             report = &report[1..];
         }
@@ -951,7 +952,7 @@ impl WinDevice {
     }
 
     /// Adjust a `GET_FEATURE`/`GET_INPUT` DeviceIoControl byte count to
-    /// hidapi's convention. For numbered reports Windows already includes the
+    /// the report-ID convention. For numbered reports Windows already includes the
     /// leading report-ID byte in the count; for unnumbered reports the leading
     /// byte stays 0 and is excluded, so the ID byte is added back only in that
     /// case. `first_byte` is `buf[0]` after the call.
@@ -1072,7 +1073,7 @@ impl WinDevice {
             });
         }
         // HidD_SetFeature wants at least FeatureReportByteLength bytes;
-        // zero-pad shorter reports like hidapi.
+        // zero-pad shorter reports.
         let padded;
         let buf: &[u8] = if data.len() >= self.feature_report_len as usize {
             data
@@ -1091,8 +1092,8 @@ impl WinDevice {
         Ok(())
     }
 
-    /// Synchronous `DeviceIoControl` GET_FEATURE / GET_INPUT_REPORT, used by
-    /// hidapi because it reports the actual returned length (unlike the
+    /// Synchronous `DeviceIoControl` GET_FEATURE / GET_INPUT_REPORT, used
+    /// because it reports the actual returned length (unlike the
     /// `HidD_*` wrappers).
     fn ioctl_get_report(
         &self,
@@ -1110,8 +1111,8 @@ impl WinDevice {
         let mut io = OverlappedIo::new()?;
         let ol = io.ol_mut();
         let mut returned = 0u32;
-        // SAFETY: buf is used as both input (report ID) and output, exactly
-        // like hidapi; ol stays alive until the operation is reaped.
+        // SAFETY: buf is used as both input (report ID) and output;
+        // ol stays alive until the operation is reaped.
         let res = unsafe {
             DeviceIoControl(
                 self.handle.raw(),
@@ -1208,14 +1209,13 @@ impl WinDevice {
 
     /// Reconstruct the report descriptor from preparsed data.
     ///
-    /// Windows never exposes the raw descriptor, so, like hidapi's
-    /// `hid_winapi_descriptor_reconstruct.c`, one is rebuilt. Unlike hidapi
-    /// this uses only the documented HidP API (`HidP_GetCaps`,
+    /// Windows never exposes the raw descriptor, so one is rebuilt. This
+    /// uses only the documented HidP API (`HidP_GetCaps`,
     /// `HidP_GetLinkCollectionNodes`, `HidP_GetButtonCaps`,
     /// `HidP_GetValueCaps`), with these limitations:
     ///
-    /// * the output is not byte-identical to the original (hidapi's is not
-    ///   either); it parses back via [`crate::descriptor::ReportDescriptor`]
+    /// * the output is not byte-identical to the original;
+    ///   it parses back via [`crate::descriptor::ReportDescriptor`]
     ///   with correct report IDs, usages and field sizes;
     /// * fields are ordered by report type, then report ID, then HidP
     ///   enumeration order, the documented API does not expose bit offsets,
@@ -1787,7 +1787,7 @@ mod tests {
     }
 
     #[test]
-    fn get_report_len_matches_hidapi_convention() {
+    fn get_report_len_matches_report_id_convention() {
         // Numbered report (nonzero leading ID): Windows already counts the ID
         // byte, so the returned length is used as-is.
         assert_eq!(WinDevice::get_report_len(0x05, 8, 64), 8);

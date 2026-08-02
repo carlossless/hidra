@@ -1,0 +1,13 @@
+[package]
+name = "conformance"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+hidra = { path = "../../.." }
+
+[features]
+# Forwarded by crates that build hidra with the nusb backend so the harness can
+# cfg-out native-only methods (macOS open_exclusive, Windows container_id) it lacks.
+nusb = ["hidra/nusb"]

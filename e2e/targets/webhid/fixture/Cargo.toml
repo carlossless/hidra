@@ -1,0 +1,16 @@
+# Native uhid fixture device for the WebHID Playwright test. Own workspace to stay
+# independent of the parent wasm harness crate.
+[package]
+name = "webhid-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "webhid_uhid_fixture"
+path = "src/main.rs"
+
+[dependencies]
+hidra = { path = "../../../.." }
+
+[workspace]

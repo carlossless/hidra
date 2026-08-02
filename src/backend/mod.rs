@@ -35,7 +35,7 @@
 //! }
 //! ```
 //!
-//! Semantics shared by all backends (hidapi parity):
+//! Semantics shared by all backends:
 //!
 //! * `write` / `send_feature_report`: `data[0]` is the report ID; use 0 when
 //!   the device has no numbered reports. The ID byte counts toward the

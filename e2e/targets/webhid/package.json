@@ -1,0 +1,12 @@
+{
+  "name": "hidra-web-test",
+  "private": true,
+  "type": "module",
+  "description": "Playwright WebHID conformance driver for hidra",
+  "scripts": {
+    "test": "node webhid_run.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0"
+  }
+}

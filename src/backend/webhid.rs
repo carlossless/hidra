@@ -5,13 +5,13 @@
 //! this API is inherently async (every WebHID operation returns a Promise) and
 //! event-driven (input reports arrive as `inputreport` events instead of being
 //! read from a handle). Method names and buffer conventions still mirror
-//! hidapi where they make sense:
+//! the native conventions where they make sense:
 //!
 //! * [`WebHidDevice::write`] / [`WebHidDevice::send_feature_report`] take
-//!   hidapi-style buffers whose first byte is the report ID (0 when the
+//!   report-ID-prefixed buffers whose first byte is the report ID (0 when the
 //!   device has no numbered reports).
 //! * [`WebHidDevice::get_feature_report`] and [`InputReportStream::read`]
-//!   return hidapi-style buffers (report-ID prefixed when numbered).
+//!   return report-ID-prefixed buffers (report-ID prefixed when numbered).
 //!
 //! WebHID is only available in secure contexts (HTTPS or localhost) on
 //! Chromium-based browsers, and device access is permission-gated: the user
@@ -195,7 +195,7 @@ impl DeviceFilter {
 /// Entry point to WebHID (`hid_init` / `hid_enumerate` equivalent, bound to
 /// `navigator.hid`).
 ///
-/// Enumeration differs from native hidapi: the browser only ever exposes
+/// Enumeration differs from a native HID library: the browser only ever exposes
 /// devices the user has granted access to.
 /// [`request_device`](Self::request_device) shows the permission chooser,
 /// [`get_devices`](Self::get_devices) lists previously granted devices.
@@ -285,7 +285,7 @@ impl WebHidApi {
 /// `HIDDevice`).
 ///
 /// Obtained from [`WebHidApi::request_device`] / [`WebHidApi::get_devices`];
-/// unlike native hidapi the handle exists before the device is opened, call
+/// unlike a native HID library the handle exists before the device is opened, call
 /// [`open`](Self::open) before transferring reports.
 #[derive(Debug, Clone)]
 pub struct WebHidDevice {
@@ -324,7 +324,7 @@ impl WebHidDevice {
     }
 
     /// Revoke the user's permission grant for this device
-    /// (`HIDDevice.forget`; no hidapi equivalent). The device disappears
+    /// (`HIDDevice.forget`; no native-library equivalent). The device disappears
     /// from [`WebHidApi::get_devices`] until requested again.
     ///
     /// `forget()` is newer than the rest of WebHID (Chromium 100+) and is
@@ -416,7 +416,7 @@ impl WebHidDevice {
 
     /// Send an output report (`hid_write` equivalent; `HIDDevice.sendReport`).
     ///
-    /// hidapi buffer convention: `data[0]` is the report ID (0 when the
+    /// Report-buffer convention: `data[0]` is the report ID (0 when the
     /// device has no numbered reports) and is not part of the payload.
     /// Returns `data.len()` on success, like `hid_write`.
     pub async fn write(&self, data: &[u8]) -> HidResult<usize> {
@@ -455,7 +455,7 @@ impl WebHidDevice {
     /// Get a feature report (`hid_get_feature_report` equivalent;
     /// `HIDDevice.receiveFeatureReport`).
     ///
-    /// Takes the report ID directly instead of hidapi's `buf[0]`-in/out
+    /// Takes the report ID directly instead of the `buf[0]`-in/out
     /// convention; the returned buffer is prefixed with `report_id` (added
     /// by hidra, not parsed from the browser data) so it matches the buffer
     /// layout `hid_get_feature_report` produces.
@@ -466,7 +466,7 @@ impl WebHidDevice {
         let data = dataview_to_vec(&view);
         // WebHID's receiveFeatureReport is asymmetric with sendFeatureReport:
         // its DataView already begins with the report ID for numbered reports,
-        // so it matches hidapi's `[report_id, data...]` layout as-is. Only
+        // so it matches the `[report_id, data...]` layout as-is. Only
         // unnumbered reports (report ID 0) omit the leading byte, so add it
         // there to keep the convention. Prefixing unconditionally would
         // duplicate the ID and shift the payload.

@@ -1,10 +1,8 @@
-//! Device enumeration metadata, mirroring hidapi's `hid_device_info`.
+//! Device enumeration metadata.
 
 use core::fmt;
 
 /// The underlying transport a HID device is attached through.
-///
-/// Mirrors hidapi's `hid_bus_type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum BusType {
@@ -36,8 +34,8 @@ impl fmt::Display for BusType {
 
 /// Information about a connected HID device, as returned by enumeration.
 ///
-/// Mirrors hidapi's `hid_device_info`. All strings are UTF-8; hidapi's
-/// `wchar_t` strings are converted by the backends.
+/// All strings are UTF-8; the backends convert from each platform's native
+/// string encoding.
 #[derive(Debug, Clone, Default)]
 pub struct DeviceInfo {
     pub(crate) path: String,

@@ -1,14 +1,13 @@
 //! macOS backend: IOHIDManager / IOHIDDevice through hand-written IOKit FFI.
 //!
-//! Mirrors hidapi's `mac/hid.c`:
+//! The macOS IOHIDManager HID backend:
 //!
-//! * Device paths use the modern hidapi form `DevSrvsID:<registry-entry-id>`.
+//! * Device paths use the modern `DevSrvsID:<registry-entry-id>` form.
 //! * Each open device runs a dedicated read thread pumping a private
 //!   CFRunLoop mode; input reports land in a bounded queue (30 entries,
 //!   oldest dropped first).
-//! * Exclusive open (`hid_darwin_set_open_exclusive`) maps to
-//!   `kIOHIDOptionsTypeSeizeDevice`; the default is shared, matching
-//!   hidapi >= 0.12.
+//! * Exclusive open maps to `kIOHIDOptionsTypeSeizeDevice`; the default is
+//!   shared.
 //!
 //! CoreFoundation declarations come from `core-foundation-sys` (which links
 //! the framework); the IOKit symbols below link `IOKit.framework` directly.
@@ -182,11 +181,10 @@ const KEY_TRANSPORT: &str = "Transport"; // kIOHIDTransportKey
 const KEY_MAX_INPUT_REPORT_SIZE: &str = "MaxInputReportSize"; // kIOHIDMaxInputReportSizeKey
 const KEY_REPORT_DESCRIPTOR: &str = "ReportDescriptor"; // kIOHIDReportDescriptorKey
 
-/// Device path prefix, identical to modern hidapi (`DevSrvsID:%llu`).
+/// Device path prefix, the modern `DevSrvsID:%llu` form.
 const PATH_PREFIX: &str = "DevSrvsID:";
 
-/// Unread input reports kept per device before the oldest is dropped,
-/// matching hidapi's queue cap.
+/// Unread input reports kept per device before the oldest is dropped.
 const MAX_QUEUED_REPORTS: usize = 30;
 
 // --- pure helpers --------------------------------------------------------------
@@ -294,12 +292,10 @@ unsafe fn registry_entry_id(device: IOHIDDeviceRef) -> Option<u64> {
 }
 
 /// Build the `DeviceInfo` entries for one IOHIDDevice: the primary usage pair
-/// first, then one entry per additional pair in `kIOHIDDeviceUsagePairsKey`,
-/// exactly like hidapi.
+/// first, then one entry per additional pair in `kIOHIDDeviceUsagePairsKey`.
 /// The USB `bInterfaceNumber` of a HID device, found by searching up the
 /// IOService plane to the owning `IOUSBHostInterface`. Returns `-1` for
-/// devices with no USB interface ancestor (Bluetooth, etc.), matching what
-/// hidapi reports on macOS.
+/// devices with no USB interface ancestor (Bluetooth, etc.).
 unsafe fn usb_interface_number(device: IOHIDDeviceRef) -> i32 {
     let service = IOHIDDeviceGetService(device);
     if service == 0 {
@@ -326,7 +322,7 @@ unsafe fn usb_interface_number(device: IOHIDDeviceRef) -> i32 {
 
 unsafe fn device_infos(device: IOHIDDeviceRef) -> Vec<DeviceInfo> {
     let info = DeviceInfo {
-        // hidapi falls back to an empty path when the registry ID is
+        // Fall back to an empty path when the registry ID is
         // unavailable.
         path: registry_entry_id(device)
             .map(format_dev_srvs_id)
@@ -340,7 +336,7 @@ unsafe fn device_infos(device: IOHIDDeviceRef) -> Vec<DeviceInfo> {
         usage_page: i32_property(device, KEY_PRIMARY_USAGE_PAGE).unwrap_or(0) as u16,
         usage: i32_property(device, KEY_PRIMARY_USAGE).unwrap_or(0) as u16,
         // Found by walking up to the owning USB interface; -1 for non-USB
-        // transports, matching hidapi on macOS.
+        // transports.
         interface_number: usb_interface_number(device),
         bus_type: string_property(device, KEY_TRANSPORT)
             .as_deref()
@@ -415,7 +411,7 @@ impl MacApi {
         // SAFETY: the copied set owns one reference to each IOHIDDeviceRef;
         // the refs are only used before the set is released.
         unsafe {
-            // A fresh manager per call, like hidapi's `hid_enumerate`. Reusing
+            // A fresh manager per enumeration call. Reusing
             // a long-lived manager returns a stale device set: devices that
             // appear after it was created (e.g. a keyboard re-enumerating into
             // its bootloader) never show up in `CopyDevices`.
@@ -429,8 +425,7 @@ impl MacApi {
             IOHIDManagerSetDeviceMatching(manager, std::ptr::null());
             let set = IOHIDManagerCopyDevices(manager);
             if set.is_null() {
-                // No HID devices present (hidapi reports this as an empty
-                // enumeration too).
+                // No HID devices present; report an empty enumeration.
                 CFRelease(manager as CFTypeRef);
                 return Ok(result);
             }
@@ -554,7 +549,7 @@ unsafe extern "C" fn input_report_callback(
 }
 
 /// `IOHIDCallback` for device removal: flags the disconnect, wakes readers
-/// and stops the read thread's run loop, like hidapi.
+/// and stops the read thread's run loop.
 unsafe extern "C" fn removal_callback(
     context: *mut c_void,
     _result: IOReturn,
@@ -581,7 +576,7 @@ unsafe extern "C" fn removal_callback(
 extern "C" fn keepalive_perform(_info: *const c_void) {}
 
 /// Read-thread body: schedules the device on this thread's run loop and pumps
-/// the private mode until shutdown or disconnection (hidapi's `read_thread`).
+/// the private mode until shutdown or disconnection.
 fn read_thread(device: usize, mode: usize, shared: Arc<Shared>) {
     let device = device as IOHIDDeviceRef;
     let mode = mode as CFStringRef;
@@ -595,8 +590,7 @@ fn read_thread(device: usize, mode: usize, shared: Arc<Shared>) {
         // `mode` has no sources. Just after scheduling a freshly re-enumerated
         // device there is a window where its input source is not yet attached to
         // `mode`; a never-signalled source keeps the mode non-empty so that gap
-        // isn't misread as the run loop dying (a false disconnect). hidapi does
-        // the same.
+        // isn't misread as the run loop dying (a false disconnect).
         let mut source_context = CFRunLoopSourceContext {
             version: 0,
             info: std::ptr::null_mut(),
@@ -633,7 +627,7 @@ fn read_thread(device: usize, mode: usize, shared: Arc<Shared>) {
                 let mut state = shared.lock_state();
                 if !state.shutdown {
                     // The run loop died without an orderly close: treat it as
-                    // a disconnect, as hidapi does.
+                    // a disconnect.
                     state.disconnected = true;
                 }
                 break;
@@ -666,7 +660,7 @@ pub(crate) struct MacDevice {
     device: IOHIDDeviceRef,
     /// Options the device was opened with; IOHIDDeviceClose wants them back.
     open_options: IOOptionBits,
-    /// Private run loop mode (hidapi's `HIDAPI_%p`), so input reports are not
+    /// Private run loop mode (`HIDRA_%p`), so input reports are not
     /// dispatched by unrelated default-mode run loop activity.
     run_loop_mode: CFStringRef,
     /// Buffer IOKit writes incoming reports into. Kept as a raw allocation
@@ -684,7 +678,7 @@ pub(crate) struct MacDevice {
 
 // SAFETY: IOHIDDeviceRef supports concurrent use for the calls made here,
 // SetReport/GetReport/GetProperty from user threads while the read thread
-// pumps the run loop, which is exactly hidapi's threading model. All mutable
+// pumps the run loop. All mutable
 // Rust-side state (report queue, flags) is behind a Mutex; the input buffer
 // is only touched by IOKit on the read thread.
 unsafe impl Send for MacDevice {}
@@ -717,15 +711,15 @@ impl MacDevice {
                 });
             }
 
-            // Buffer for the input report callback, sized like hidapi.
+            // Buffer for the input report callback, sized to the max input report.
             let input_buf_len = i32_property(device, KEY_MAX_INPUT_REPORT_SIZE)
                 .filter(|&len| len > 0)
                 .unwrap_or(64) as usize;
             let input_buf = Box::into_raw(vec![0u8; input_buf_len].into_boxed_slice()) as *mut u8;
 
-            // Private per-device run loop mode, like hidapi's "HIDAPI_%p".
+            // Private per-device run loop mode (`HIDRA_%p`); any unique name works.
             let mode_name =
-                CString::new(format!("HIDAPI_{device:p}")).expect("no NUL in pointer format");
+                CString::new(format!("HIDRA_{device:p}")).expect("no NUL in pointer format");
             let run_loop_mode = CFStringCreateWithCString(
                 kCFAllocatorDefault,
                 mode_name.as_ptr(),
@@ -773,7 +767,7 @@ impl MacDevice {
                 }
             };
 
-            // Wait for the read thread to schedule the device (hidapi's
+            // Wait for the read thread to schedule the device (startup
             // barrier).
             {
                 let mut state = shared.lock_state();
@@ -802,8 +796,8 @@ impl MacDevice {
         self.shared.lock_state().disconnected
     }
 
-    /// Common implementation of `write` and `send_feature_report`
-    /// (hidapi's `set_report`): `data[0]` is the report ID and is not sent
+    /// Common implementation of `write` and `send_feature_report`:
+    /// `data[0]` is the report ID and is not sent
     /// as payload when 0, but still counts toward the returned length.
     fn set_report(&self, report_type: IOHIDReportType, data: &[u8]) -> HidResult<usize> {
         if data.is_empty() {
@@ -835,8 +829,8 @@ impl MacDevice {
         Ok(data.len())
     }
 
-    /// Common implementation of `get_feature_report` and `get_input_report`
-    /// (hidapi's `get_report`): `buf[0]` holds the report ID; for ID 0 the
+    /// Common implementation of `get_feature_report` and `get_input_report`:
+    /// `buf[0]` holds the report ID; for ID 0 the
     /// report body is read after it and the ID byte counts toward the length.
     fn get_report(&self, report_type: IOHIDReportType, buf: &mut [u8]) -> HidResult<usize> {
         if buf.is_empty() {
@@ -981,7 +975,7 @@ impl MacDevice {
     }
 
     pub fn get_indexed_string(&self, _index: u32) -> HidResult<Option<String>> {
-        // Same as hidapi's macOS backend: USB string descriptor tables are
+        // On macOS, USB string descriptor tables are
         // not reachable through IOHIDDevice. The `nusb` feature backend
         // supports it.
         Err(HidError::Unsupported {
@@ -1011,14 +1005,14 @@ impl MacDevice {
         // SAFETY: self.device is open for the lifetime of self.
         let mut infos = unsafe { device_infos(self.device) };
         // device_infos always yields the primary-usage entry first, which is
-        // what hidapi returns for an open handle.
+        // what an open handle should return.
         Ok(infos.remove(0))
     }
 }
 
 impl Drop for MacDevice {
     fn drop(&mut self) {
-        // SAFETY: mirrors hidapi's hid_close teardown order. The callbacks
+        // SAFETY: the close teardown order matters. The callbacks
         // are unregistered before `shared` (their context) can go away, the
         // read thread is joined before the device/mode refs are released, and
         // the input buffer is freed only after IOKit can no longer write it.
@@ -1030,7 +1024,7 @@ impl Drop for MacDevice {
             let context = Arc::as_ptr(&self.shared) as *mut c_void;
             if !disconnected {
                 // Disconnect the callbacks and move the device off the read
-                // thread's run loop, like hidapi.
+                // thread's run loop.
                 IOHIDDeviceRegisterInputReportCallback(
                     self.device,
                     self.input_buf,
@@ -1145,7 +1139,7 @@ mod tests {
     #[test]
     fn formats_and_reparses_paths() {
         assert_eq!(format_dev_srvs_id(42), "DevSrvsID:42");
-        // The largest registry entry ID hidapi accounts for (20 digits).
+        // The largest registry entry ID a u64 can hold (20 digits).
         let path = format_dev_srvs_id(u64::MAX);
         assert_eq!(path, "DevSrvsID:18446744073709551615");
         assert_eq!(parse_dev_srvs_id(&path), Some(u64::MAX));

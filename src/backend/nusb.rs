@@ -444,6 +444,8 @@ pub(crate) struct NusbDevice {
     #[allow(dead_code)]
     blocking: AtomicBool,
     shared: Arc<Shared>,
+    /// Interrupt IN reader thread; absent on interfaces with no such endpoint,
+    /// which support only the control-transfer report calls.
     reader: Option<JoinHandle<()>>,
 }
 
@@ -469,8 +471,10 @@ impl NusbDevice {
             .map(|d| d.max_wire_size(ReportKind::Input))
             .unwrap_or(0);
 
-        // Interrupt endpoints from alternate setting 0; IN is mandatory for
-        // HID, OUT is optional.
+        // Interrupt endpoints from alternate setting 0; both are optional. HID
+        // 1.11 §4.4 mandates an interrupt IN endpoint, but control-only devices
+        // that declare bNumEndpoints 0 exist in the wild and are perfectly
+        // usable through GET_REPORT/SET_REPORT on the control pipe.
         let mut in_address = None;
         let mut out_address = None;
         let alt0 = interface
@@ -489,11 +493,13 @@ impl NusbDevice {
                 }
             }
         }
-        let in_address = in_address
-            .ok_or_else(|| HidError::backend("HID interface has no interrupt IN endpoint"))?;
-        let in_endpoint: Endpoint<Interrupt, In> = interface
-            .endpoint(in_address)
-            .map_err(|e| HidError::backend(format!("opening interrupt IN endpoint: {e}")))?;
+        let in_endpoint: Option<Endpoint<Interrupt, In>> = in_address
+            .map(|address| {
+                interface
+                    .endpoint(address)
+                    .map_err(|e| HidError::backend(format!("opening interrupt IN endpoint: {e}")))
+            })
+            .transpose()?;
         let out_endpoint = match out_address {
             Some(address) => Some(Mutex::new(
                 interface.endpoint::<Interrupt, Out>(address).map_err(|e| {
@@ -503,13 +509,18 @@ impl NusbDevice {
             None => None,
         };
 
-        let max_packet_size = in_endpoint.max_packet_size();
-        if max_packet_size == 0 {
-            return Err(HidError::backend(
-                "interrupt IN endpoint declares a zero wMaxPacketSize",
-            ));
-        }
-        let transfer_len = transfer_length(max_input_wire, max_packet_size);
+        let transfer_len = match in_endpoint.as_ref() {
+            Some(endpoint) => {
+                let max_packet_size = endpoint.max_packet_size();
+                if max_packet_size == 0 {
+                    return Err(HidError::backend(
+                        "interrupt IN endpoint declares a zero wMaxPacketSize",
+                    ));
+                }
+                transfer_length(max_input_wire, max_packet_size)
+            }
+            None => 0,
+        };
 
         let mut info = device_info(dev_info, interface_number);
         if let Some((page, usage)) = parsed
@@ -521,12 +532,23 @@ impl NusbDevice {
         }
 
         let shared = Arc::new(Shared::default());
-        let reader = {
-            let shared = Arc::clone(&shared);
-            std::thread::Builder::new()
-                .name("hidra-usb-read".into())
-                .spawn(move || reader_loop(in_endpoint, shared, transfer_len))
-                .map_err(|e| HidError::io("spawning USB reader thread", e))?
+        let reader = match in_endpoint {
+            Some(in_endpoint) => {
+                let shared = Arc::clone(&shared);
+                Some(
+                    std::thread::Builder::new()
+                        .name("hidra-usb-read".into())
+                        .spawn(move || reader_loop(in_endpoint, shared, transfer_len))
+                        .map_err(|e| HidError::io("spawning USB reader thread", e))?,
+                )
+            }
+            None => {
+                // Nothing will ever queue an input report, so mark the queue shut
+                // down at open time: reads then fail like a departed reader thread
+                // instead of blocking forever on `data_available`.
+                shared.shutdown.store(true, Ordering::SeqCst);
+                None
+            }
         };
 
         Ok(NusbDevice {
@@ -538,7 +560,7 @@ impl NusbDevice {
             out_endpoint,
             blocking: AtomicBool::new(true),
             shared,
-            reader: Some(reader),
+            reader,
         })
     }
 
@@ -967,6 +989,17 @@ mod tests {
         assert_eq!(block_on_read(&shared, &mut buf).unwrap(), 1);
         let err = block_on_read(&shared, &mut buf).unwrap_err();
         assert!(matches!(err, HidError::Disconnected));
+    }
+
+    #[test]
+    fn poll_read_fails_fast_when_shut_down_at_open() {
+        // What `open` does for an interface with no interrupt IN endpoint: no
+        // reader thread exists, so reads must error rather than park forever.
+        let shared = Shared::default();
+        shared.shutdown.store(true, Ordering::SeqCst);
+        let mut buf = [0u8; 4];
+        let err = block_on_read(&shared, &mut buf).unwrap_err();
+        assert!(matches!(err, HidError::Backend { .. }));
     }
 
     #[test]

@@ -212,10 +212,69 @@ fn bus_type_from_transport(transport: &str) -> BusType {
 
 // --- CoreFoundation helpers -----------------------------------------------------
 
-/// Create a `CFString` from a Rust string. The caller releases it.
-unsafe fn cfstr(s: &str) -> CFStringRef {
-    let c = CString::new(s).expect("CF key contains NUL");
-    CFStringCreateWithCString(kCFAllocatorDefault, c.as_ptr(), kCFStringEncodingUTF8)
+/// An owned (+1) CoreFoundation reference, released on drop.
+///
+/// Everything this backend creates or copies out of the `IORegistry` comes back
+/// under the CF "Create rule" and has to be released exactly once. Doing that
+/// by hand meant pairing every `cfstr`/`IORegistryEntrySearchCFProperty` with
+/// a `CFRelease` on every path out of the function.
+struct CfRef(CFTypeRef);
+
+impl CfRef {
+    /// Take ownership of a +1 reference, or `None` if it is null.
+    ///
+    /// # Safety
+    /// `value` must be a reference this caller owns; it is released on drop.
+    unsafe fn from_create(value: CFTypeRef) -> Option<Self> {
+        // Not `then_some`: that builds the `CfRef` eagerly and drops it when
+        // the condition is false, which would `CFRelease(NULL)`.
+        if value.is_null() {
+            None
+        } else {
+            Some(CfRef(value))
+        }
+    }
+
+    fn as_type_ref(&self) -> CFTypeRef {
+        self.0
+    }
+}
+
+impl Drop for CfRef {
+    fn drop(&mut self) {
+        // SAFETY: the reference is owned and released only here.
+        unsafe { CFRelease(self.0) };
+    }
+}
+
+/// An owned `CFString` built from a Rust string, for use as a property key.
+struct CfString(CFStringRef);
+
+impl CfString {
+    fn new(s: &str) -> Self {
+        let c = CString::new(s).expect("CF key contains NUL");
+        // SAFETY: `c` is NUL-terminated and outlives the call; the returned
+        // reference is +1 and owned by the CfString.
+        CfString(unsafe {
+            CFStringCreateWithCString(kCFAllocatorDefault, c.as_ptr(), kCFStringEncodingUTF8)
+        })
+    }
+
+    fn as_ref(&self) -> CFStringRef {
+        self.0
+    }
+}
+
+impl Drop for CfString {
+    fn drop(&mut self) {
+        // `CFStringCreateWithCString` returns null on allocation failure, and
+        // `CFRelease(NULL)` traps.
+        if self.0.is_null() {
+            return;
+        }
+        // SAFETY: the reference is owned and released only here.
+        unsafe { CFRelease(self.0 as CFTypeRef) };
+    }
 }
 
 /// Convert a CF object to `String` if it is a `CFString`.
@@ -262,10 +321,7 @@ unsafe fn cfnumber_to_i32(value: CFTypeRef) -> Option<i32> {
 /// Fetch a device property. Per the CF "Get rule" the returned reference is
 /// not owned and must not be released.
 unsafe fn device_property(device: IOHIDDeviceRef, key: &str) -> CFTypeRef {
-    let key = cfstr(key);
-    let value = IOHIDDeviceGetProperty(device, key);
-    CFRelease(key as CFTypeRef);
-    value
+    IOHIDDeviceGetProperty(device, CfString::new(key).as_ref())
 }
 
 unsafe fn string_property(device: IOHIDDeviceRef, key: &str) -> Option<String> {
@@ -299,21 +355,17 @@ unsafe fn usb_interface_number(device: IOHIDDeviceRef) -> i32 {
     }
     // `kIOServicePlane` is the C string "IOService".
     let plane = b"IOService\0";
-    let key = cfstr("bInterfaceNumber");
-    let value = IORegistryEntrySearchCFProperty(
+    // Unlike IOHIDDeviceGetProperty this follows the Create rule.
+    let value = CfRef::from_create(IORegistryEntrySearchCFProperty(
         service,
         plane.as_ptr() as *const c_char,
-        key,
+        CfString::new("bInterfaceNumber").as_ref(),
         kCFAllocatorDefault,
         IO_REGISTRY_ITERATE_PARENTS_RECURSIVELY,
-    );
-    CFRelease(key as CFTypeRef);
-    if value.is_null() {
-        return -1;
-    }
-    let n = cfnumber_to_i32(value).unwrap_or(-1);
-    CFRelease(value);
-    n
+    ));
+    value
+        .and_then(|v| cfnumber_to_i32(v.as_type_ref()))
+        .unwrap_or(-1)
 }
 
 /// Build the `DeviceInfo` entries for one `IOHIDDevice`: the primary usage pair
@@ -349,16 +401,22 @@ unsafe fn device_infos(device: IOHIDDeviceRef) -> Vec<DeviceInfo> {
     let pairs = device_property(device, KEY_DEVICE_USAGE_PAIRS);
     if !pairs.is_null() && CFGetTypeID(pairs) == CFArrayGetTypeID() {
         let pairs = pairs as CFArrayRef;
-        let page_key = cfstr(KEY_DEVICE_USAGE_PAGE);
-        let usage_key = cfstr(KEY_DEVICE_USAGE);
+        let page_key = CfString::new(KEY_DEVICE_USAGE_PAGE);
+        let usage_key = CfString::new(KEY_DEVICE_USAGE);
         for i in 0..CFArrayGetCount(pairs) {
             let dict = CFArrayGetValueAtIndex(pairs, i) as CFTypeRef;
             if dict.is_null() || CFGetTypeID(dict) != CFDictionaryGetTypeID() {
                 continue;
             }
             let dict = dict as CFDictionaryRef;
-            let page = cfnumber_to_i32(CFDictionaryGetValue(dict, page_key as *const c_void));
-            let usage = cfnumber_to_i32(CFDictionaryGetValue(dict, usage_key as *const c_void));
+            let page = cfnumber_to_i32(CFDictionaryGetValue(
+                dict,
+                page_key.as_ref() as *const c_void,
+            ));
+            let usage = cfnumber_to_i32(CFDictionaryGetValue(
+                dict,
+                usage_key.as_ref() as *const c_void,
+            ));
             let (Some(page), Some(usage)) = (page, usage) else {
                 continue;
             };
@@ -367,8 +425,6 @@ unsafe fn device_infos(device: IOHIDDeviceRef) -> Vec<DeviceInfo> {
                 usages.push(pair);
             }
         }
-        CFRelease(page_key as CFTypeRef);
-        CFRelease(usage_key as CFTypeRef);
     }
 
     info.per_usage(&usages)
@@ -541,11 +597,25 @@ unsafe extern "C" fn removal_callback(
 /// No-op `perform` for the keep-alive run-loop source (see [`read_thread`]).
 extern "C" fn keepalive_perform(_info: *const c_void) {}
 
+/// A CoreFoundation reference handed to the read thread.
+///
+/// `IOHIDDeviceRef` and `CFStringRef` are raw pointers, so they are not `Send`
+/// on their own. The device handle owns both and joins the thread in `Drop`
+/// before releasing either, so the thread never observes a dangling reference;
+/// this states that where the invariant lives instead of laundering the
+/// pointers through `usize`.
+#[derive(Clone, Copy)]
+struct SendRef<T>(*mut T);
+
+// SAFETY: see the type docs. The referenced objects outlive the thread, and
+// the IOKit calls the thread makes with them are thread-safe.
+unsafe impl<T> Send for SendRef<T> {}
+
 /// Read-thread body: schedules the device on this thread's run loop and pumps
 /// the private mode until shutdown or disconnection (hidapi's `read_thread`).
-fn read_thread(device: usize, mode: usize, shared: Arc<Shared>) {
-    let device = device as IOHIDDeviceRef;
-    let mode = mode as CFStringRef;
+fn read_thread(device: SendRef<c_void>, mode: SendRef<c_void>, shared: Arc<Shared>) {
+    let device: IOHIDDeviceRef = device.0;
+    let mode = mode.0 as CFStringRef;
     // SAFETY: the device and mode refs outlive the thread (Drop joins it
     // before releasing them); run loop calls target this thread's loop.
     unsafe {
@@ -694,8 +764,8 @@ impl MacDevice {
 
             let thread = thread::Builder::new().name("hidra-hid-read".into()).spawn({
                 let shared = Arc::clone(&shared);
-                let device = device as usize;
-                let mode = run_loop_mode as usize;
+                let device = SendRef(device);
+                let mode = SendRef(run_loop_mode as *mut c_void);
                 move || read_thread(device, mode, shared)
             });
             let thread = match thread {

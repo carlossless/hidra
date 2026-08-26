@@ -45,6 +45,7 @@ use core_foundation_sys::string::{
     CFStringGetLength, CFStringGetMaximumSizeForEncoding, CFStringGetTypeID, CFStringRef,
 };
 
+use super::{HidBackend, HidDeviceBackend};
 use crate::error::{HidError, HidResult};
 use crate::{BusType, DeviceInfo};
 
@@ -393,12 +394,6 @@ pub(crate) struct MacApi {
 // `enumerate` call creates and releases its own IOHIDManager.
 
 impl MacApi {
-    pub(crate) fn new() -> HidResult<Self> {
-        Ok(MacApi {
-            open_exclusive: AtomicBool::new(false),
-        })
-    }
-
     /// `hid_darwin_set_open_exclusive` equivalent.
     pub(crate) fn set_open_exclusive(&self, exclusive: bool) {
         self.open_exclusive.store(exclusive, Ordering::Relaxed);
@@ -408,8 +403,18 @@ impl MacApi {
     pub(crate) fn open_exclusive(&self) -> bool {
         self.open_exclusive.load(Ordering::Relaxed)
     }
+}
 
-    pub(crate) fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>> {
+impl HidBackend for MacApi {
+    type Device = MacDevice;
+
+    fn new() -> HidResult<Self> {
+        Ok(MacApi {
+            open_exclusive: AtomicBool::new(false),
+        })
+    }
+
+    fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>> {
         let mut result = Vec::new();
         // SAFETY: the copied set owns one reference to each IOHIDDeviceRef;
         // the refs are only used before the set is released.
@@ -454,24 +459,7 @@ impl MacApi {
         Ok(result)
     }
 
-    pub(crate) fn open(
-        &self,
-        vendor_id: u16,
-        product_id: u16,
-        serial: Option<&str>,
-    ) -> HidResult<MacDevice> {
-        let candidates = self.enumerate(vendor_id, product_id)?;
-        let info = candidates
-            .into_iter()
-            .find(|info| match serial {
-                Some(s) => info.serial_number.as_deref() == Some(s),
-                None => true,
-            })
-            .ok_or(HidError::DeviceNotFound)?;
-        self.open_path(&info.path)
-    }
-
-    pub(crate) fn open_path(&self, path: &str) -> HidResult<MacDevice> {
+    fn open_path(&self, path: &str) -> HidResult<MacDevice> {
         let entry_id = parse_dev_srvs_id(path).ok_or_else(|| HidError::InvalidData {
             message: format!("not a macOS device path (expected \"DevSrvsID:<id>\"): {path}"),
         })?;
@@ -871,48 +859,50 @@ impl MacDevice {
         }
         Ok(returned)
     }
+}
 
-    pub(crate) fn write(&self, data: &[u8]) -> HidResult<usize> {
+impl HidDeviceBackend for MacDevice {
+    fn write(&self, data: &[u8]) -> HidResult<usize> {
         self.set_report(IOHID_REPORT_TYPE_OUTPUT, data)
     }
 
-    /// Read one input report without ever returning `Ok(0)`: resolves when a
-    /// report is popped from the queue, fails with [`HidError::Disconnected`]
-    /// once the device goes away and the queue is drained. Wake-ups come from
-    /// the `IOKit` callbacks on the read thread (raw [`Waker`]s, no executor
-    /// assumed).
-    pub(crate) fn read_async<'a>(&'a self, buf: &'a mut [u8]) -> ReadAsync<'a> {
+    /// Wake-ups come from the `IOKit` callbacks on the read thread (raw
+    /// [`Waker`]s, no executor assumed).
+    fn read_async<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> impl std::future::Future<Output = HidResult<usize>> + Send + 'a {
         ReadAsync { dev: self, buf }
     }
 
-    pub(crate) fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
+    fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
         self.set_report(IOHID_REPORT_TYPE_FEATURE, data).map(|_| ())
     }
 
-    pub(crate) fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize> {
+    fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize> {
         self.get_report(IOHID_REPORT_TYPE_FEATURE, buf)
     }
 
-    pub(crate) fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize> {
+    fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize> {
         self.get_report(IOHID_REPORT_TYPE_INPUT, buf)
     }
 
-    pub(crate) fn get_manufacturer_string(&self) -> HidResult<Option<String>> {
+    fn get_manufacturer_string(&self) -> HidResult<Option<String>> {
         // SAFETY: self.device is open for the lifetime of self.
         Ok(unsafe { string_property(self.device, KEY_MANUFACTURER) })
     }
 
-    pub(crate) fn get_product_string(&self) -> HidResult<Option<String>> {
+    fn get_product_string(&self) -> HidResult<Option<String>> {
         // SAFETY: self.device is open for the lifetime of self.
         Ok(unsafe { string_property(self.device, KEY_PRODUCT) })
     }
 
-    pub(crate) fn get_serial_number_string(&self) -> HidResult<Option<String>> {
+    fn get_serial_number_string(&self) -> HidResult<Option<String>> {
         // SAFETY: self.device is open for the lifetime of self.
         Ok(unsafe { string_property(self.device, KEY_SERIAL_NUMBER) })
     }
 
-    pub(crate) fn get_indexed_string(&self, _index: u32) -> HidResult<Option<String>> {
+    fn get_indexed_string(&self, _index: u32) -> HidResult<Option<String>> {
         // Same as hidapi's macOS backend: USB string descriptor tables are
         // not reachable through IOHIDDevice. The `nusb` feature backend
         // supports it.
@@ -922,7 +912,7 @@ impl MacDevice {
         })
     }
 
-    pub(crate) fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize> {
+    fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize> {
         // SAFETY: the property reference follows the Get rule (not owned) and
         // its bytes are copied out before any other CF call.
         unsafe {
@@ -939,7 +929,7 @@ impl MacDevice {
         }
     }
 
-    pub(crate) fn get_device_info(&self) -> HidResult<DeviceInfo> {
+    fn get_device_info(&self) -> HidResult<DeviceInfo> {
         // SAFETY: self.device is open for the lifetime of self.
         let mut infos = unsafe { device_infos(self.device) };
         // device_infos always yields the primary-usage entry first, which is

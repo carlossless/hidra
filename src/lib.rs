@@ -110,7 +110,7 @@ pub use web::{HidDevice, Hidra};
 mod native {
     use core::future::Future;
 
-    use crate::backend::{PlatformApi, PlatformDevice};
+    use crate::backend::{HidBackend, HidDeviceBackend, PlatformApi, PlatformDevice};
     use crate::{DeviceInfo, HidResult};
 
     /// Entry point to the library; owns backend state and the cached device
@@ -397,6 +397,21 @@ mod native {
 /// Largest report descriptor a HID device can have
 /// (`HID_API_MAX_REPORT_DESCRIPTOR_SIZE`).
 pub const MAX_REPORT_DESCRIPTOR_SIZE: usize = 4096;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    /// `Hidra` and `HidDevice` are documented as shareable across threads.
+    /// The `HidBackend`/`HidDeviceBackend` bounds make that hold for whichever
+    /// backend is selected; this pins it for the public wrappers too.
+    #[test]
+    fn public_handles_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<super::Hidra>();
+        assert_send_sync::<super::HidDevice>();
+        assert_send_sync::<super::HidError>();
+        assert_send_sync::<super::DeviceInfo>();
+    }
+}
 
 #[cfg(target_arch = "wasm32")]
 mod web {

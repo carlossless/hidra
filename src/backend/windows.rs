@@ -58,6 +58,7 @@ use windows_sys::Win32::System::IO::{
     CancelIoEx, DeviceIoControl, GetOverlappedResult, OVERLAPPED,
 };
 
+use super::{HidBackend, HidDeviceBackend};
 use crate::descriptor::{CollectionKind, DescriptorBuilder, MainFlags};
 use crate::error::{HidError, HidResult};
 use crate::{BusType, DeviceInfo};
@@ -477,12 +478,14 @@ fn query_device_info(handle: HANDLE, path: &str, bus_type: BusType) -> DeviceInf
 
 pub(crate) struct WinApi;
 
-impl WinApi {
-    pub(crate) fn new() -> HidResult<Self> {
+impl HidBackend for WinApi {
+    type Device = WinDevice;
+
+    fn new() -> HidResult<Self> {
         Ok(WinApi)
     }
 
-    pub(crate) fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>> {
+    fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>> {
         let mut hid_guid: GUID = unsafe { core::mem::zeroed() };
         // SAFETY: out-pointer to a GUID.
         unsafe { HidD_GetHidGuid(&mut hid_guid) };
@@ -543,24 +546,7 @@ impl WinApi {
         Ok(result)
     }
 
-    pub(crate) fn open(
-        &self,
-        vendor_id: u16,
-        product_id: u16,
-        serial: Option<&str>,
-    ) -> HidResult<WinDevice> {
-        let candidates = self.enumerate(vendor_id, product_id)?;
-        let info = candidates
-            .into_iter()
-            .find(|info| match serial {
-                Some(s) => info.serial_number.as_deref() == Some(s),
-                None => true,
-            })
-            .ok_or(HidError::DeviceNotFound)?;
-        self.open_path(&info.path)
-    }
-
-    pub(crate) fn open_path(&self, path: &str) -> HidResult<WinDevice> {
+    fn open_path(&self, path: &str) -> HidResult<WinDevice> {
         WinDevice::open(path)
     }
 }
@@ -780,77 +766,6 @@ impl WinDevice {
         HidError::io(operation, std::io::Error::from_raw_os_error(err as i32))
     }
 
-    pub(crate) fn write(&self, data: &[u8]) -> HidResult<usize> {
-        if data.is_empty() {
-            return Err(HidError::InvalidData {
-                message: "write data must contain a report ID byte".into(),
-            });
-        }
-        let mut st = self.write.lock().unwrap_or_else(|e| e.into_inner());
-
-        // Windows expects exactly OutputReportByteLength bytes; shorter
-        // writes are zero-padded like hidapi does. Longer payloads are passed
-        // through and rejected by the driver.
-        let (ptr, len) = if data.len() >= st.buf.len() {
-            (data.as_ptr(), data.len())
-        } else {
-            let n = data.len();
-            st.buf[..n].copy_from_slice(data);
-            st.buf[n..].fill(0);
-            (st.buf.as_ptr(), st.buf.len())
-        };
-
-        // SAFETY: event is owned; the OVERLAPPED is reused after each
-        // operation fully completes or is cancelled below.
-        unsafe { ResetEvent(st.io.event.raw()) };
-        let ol = st.io.ol_mut();
-        // SAFETY: ptr/len describe memory that outlives the operation (we do
-        // not return until it completed or was cancelled and reaped).
-        let res = unsafe {
-            WriteFile(
-                self.handle.raw(),
-                ptr,
-                len as u32,
-                core::ptr::null_mut(),
-                ol,
-            )
-        };
-        if res == 0 {
-            let err = unsafe { GetLastError() };
-            if err != ERROR_IO_PENDING {
-                return Err(Self::io_error("hid write", err));
-            }
-        }
-
-        let timeout = self.write_timeout_ms.load(Ordering::Relaxed);
-        // SAFETY: event/ol belong to this in-flight operation.
-        let wait = unsafe { WaitForSingleObject(st.io.event.raw(), timeout) };
-        if wait != WAIT_OBJECT_0 {
-            // Unlike hidapi we cancel and reap the request before returning,
-            // so the staging buffer / caller's slice can be safely reused.
-            unsafe {
-                CancelIoEx(self.handle.raw(), ol);
-                let mut n = 0u32;
-                GetOverlappedResult(self.handle.raw(), ol, &mut n, 1);
-            }
-            return if wait == WAIT_TIMEOUT {
-                Err(HidError::backend(format!(
-                    "hid write timed out after {timeout} ms"
-                )))
-            } else {
-                Err(HidError::last_os_error("WaitForSingleObject on write"))
-            };
-        }
-
-        let mut written = 0u32;
-        // SAFETY: the operation has signaled; no further wait needed.
-        if unsafe { GetOverlappedResult(self.handle.raw(), ol, &mut written, 0) } == 0 {
-            return Err(Self::io_error("hid write", unsafe { GetLastError() }));
-        }
-        // Report the caller's length, not the zero-padded one.
-        Ok(data.len())
-    }
-
     /// Ensure the single background `ReadFile` hidapi keeps per device is in
     /// flight. `Ok(Some(n))` when the call completed synchronously with `n`
     /// bytes (the read is no longer pending), `Ok(None)` when it is pending
@@ -909,15 +824,6 @@ impl WinDevice {
             bytes_returned
         };
         n.min(buf_len)
-    }
-
-    /// Read one input report without ever resolving with `Ok(0)`: the future
-    /// completes once the persistent background `ReadFile` delivers a report,
-    /// and fails with [`HidError::Disconnected`] when the device is removed.
-    /// Wake-ups come from a one-shot thread-pool wait on the read event
-    /// (`RegisterWaitForSingleObject`, raw [`Waker`]s, no executor assumed).
-    pub(crate) fn read_async<'a>(&'a self, buf: &'a mut [u8]) -> ReadAsync<'a> {
-        ReadAsync { dev: self, buf }
     }
 
     /// `Future::poll` body of [`ReadAsync`].
@@ -1006,32 +912,6 @@ impl WinDevice {
         Poll::Pending
     }
 
-    pub(crate) fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
-        if data.is_empty() {
-            return Err(HidError::InvalidData {
-                message: "feature report must contain a report ID byte".into(),
-            });
-        }
-        // HidD_SetFeature wants at least FeatureReportByteLength bytes;
-        // zero-pad shorter reports like hidapi.
-        let padded;
-        let buf: &[u8] = if data.len() >= self.feature_report_len as usize {
-            data
-        } else {
-            let mut v = vec![0u8; self.feature_report_len as usize];
-            v[..data.len()].copy_from_slice(data);
-            padded = v;
-            &padded
-        };
-        // SAFETY: buf is a live slice of at least the required length.
-        let ok =
-            unsafe { HidD_SetFeature(self.handle.raw(), buf.as_ptr().cast(), buf.len() as u32) };
-        if !ok {
-            return Err(Self::io_error("HidD_SetFeature", unsafe { GetLastError() }));
-        }
-        Ok(())
-    }
-
     /// Synchronous `DeviceIoControl` `GET_FEATURE` / `GET_INPUT_REPORT`, used by
     /// hidapi because it reports the actual returned length (unlike the
     /// `HidD_*` wrappers).
@@ -1078,11 +958,194 @@ impl WinDevice {
         Ok(Self::get_report_len(buf[0], returned as usize, buf.len()))
     }
 
-    pub(crate) fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize> {
+    fn reconstruct_descriptor(&self) -> HidResult<Vec<u8>> {
+        let pp = PreparsedData::get(self.handle.raw())?;
+        let caps = pp.caps()?;
+
+        // Link collection tree; node 0 is the top-level collection.
+        let count = caps.NumberLinkCollectionNodes as usize;
+        if count == 0 {
+            return Err(HidError::backend("device reports no link collections"));
+        }
+        let mut nodes = vec![HIDP_LINK_COLLECTION_NODE::default(); count];
+        let mut len = count as u32;
+        // SAFETY: nodes has room for `len` entries.
+        let status = unsafe { HidP_GetLinkCollectionNodes(nodes.as_mut_ptr(), &mut len, pp.0) };
+        if status != HIDP_STATUS_SUCCESS {
+            return Err(HidError::backend("HidP_GetLinkCollectionNodes failed"));
+        }
+        nodes.truncate(len as usize);
+
+        let mut fields = collect_fields(&pp, &caps);
+        synthesize_padding(&caps, &mut fields);
+
+        // Group fields by owning collection, ordered by report type, report
+        // ID, then HidP enumeration order.
+        let mut by_node: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+        for (i, f) in fields.iter().enumerate() {
+            if let Some(v) = by_node.get_mut(f.link as usize) {
+                v.push(i);
+            }
+        }
+        for v in &mut by_node {
+            v.sort_by_key(|&i| (fields[i].kind, fields[i].report_id, fields[i].order));
+        }
+
+        let mut b = DescriptorBuilder::new();
+        emit_collection(&mut b, &nodes, &by_node, &fields, 0, 0)?;
+        Ok(b.build())
+    }
+
+    /// `hid_winapi_get_container_id`: the `DEVPKEY_Device_ContainerId` GUID
+    /// of the devnode behind this interface, as 16 bytes in the GUID's
+    /// in-memory (little-endian fields) layout.
+    pub(crate) fn container_id(&self) -> HidResult<[u8; 16]> {
+        let (list, devinfo) = devnode_for_interface(&self.path)?;
+        let mut guid: GUID = unsafe { core::mem::zeroed() };
+        let mut prop_type: DEVPROPTYPE = 0;
+        // SAFETY: out-buffer is a GUID, matching DEVPROP_TYPE_GUID.
+        let ok = unsafe {
+            SetupDiGetDevicePropertyW(
+                list.0,
+                &devinfo,
+                &DEVPKEY_Device_ContainerId,
+                &mut prop_type,
+                (&mut guid as *mut GUID).cast(),
+                core::mem::size_of::<GUID>() as u32,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        if ok == 0 {
+            return Err(HidError::last_os_error("SetupDiGetDevicePropertyW"));
+        }
+        if prop_type != DEVPROP_TYPE_GUID {
+            return Err(HidError::backend("container id property is not a GUID"));
+        }
+        Ok(guid_to_bytes(&guid))
+    }
+
+    /// `hid_winapi_set_write_timeout`.
+    pub(crate) fn set_write_timeout(&self, timeout_ms: u32) {
+        self.write_timeout_ms.store(timeout_ms, Ordering::Relaxed);
+    }
+}
+
+impl HidDeviceBackend for WinDevice {
+    fn write(&self, data: &[u8]) -> HidResult<usize> {
+        if data.is_empty() {
+            return Err(HidError::InvalidData {
+                message: "write data must contain a report ID byte".into(),
+            });
+        }
+        let mut st = self.write.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Windows expects exactly OutputReportByteLength bytes; shorter
+        // writes are zero-padded like hidapi does. Longer payloads are passed
+        // through and rejected by the driver.
+        let (ptr, len) = if data.len() >= st.buf.len() {
+            (data.as_ptr(), data.len())
+        } else {
+            let n = data.len();
+            st.buf[..n].copy_from_slice(data);
+            st.buf[n..].fill(0);
+            (st.buf.as_ptr(), st.buf.len())
+        };
+
+        // SAFETY: event is owned; the OVERLAPPED is reused after each
+        // operation fully completes or is cancelled below.
+        unsafe { ResetEvent(st.io.event.raw()) };
+        let ol = st.io.ol_mut();
+        // SAFETY: ptr/len describe memory that outlives the operation (we do
+        // not return until it completed or was cancelled and reaped).
+        let res = unsafe {
+            WriteFile(
+                self.handle.raw(),
+                ptr,
+                len as u32,
+                core::ptr::null_mut(),
+                ol,
+            )
+        };
+        if res == 0 {
+            let err = unsafe { GetLastError() };
+            if err != ERROR_IO_PENDING {
+                return Err(Self::io_error("hid write", err));
+            }
+        }
+
+        let timeout = self.write_timeout_ms.load(Ordering::Relaxed);
+        // SAFETY: event/ol belong to this in-flight operation.
+        let wait = unsafe { WaitForSingleObject(st.io.event.raw(), timeout) };
+        if wait != WAIT_OBJECT_0 {
+            // Unlike hidapi we cancel and reap the request before returning,
+            // so the staging buffer / caller's slice can be safely reused.
+            unsafe {
+                CancelIoEx(self.handle.raw(), ol);
+                let mut n = 0u32;
+                GetOverlappedResult(self.handle.raw(), ol, &mut n, 1);
+            }
+            return if wait == WAIT_TIMEOUT {
+                Err(HidError::backend(format!(
+                    "hid write timed out after {timeout} ms"
+                )))
+            } else {
+                Err(HidError::last_os_error("WaitForSingleObject on write"))
+            };
+        }
+
+        let mut written = 0u32;
+        // SAFETY: the operation has signaled; no further wait needed.
+        if unsafe { GetOverlappedResult(self.handle.raw(), ol, &mut written, 0) } == 0 {
+            return Err(Self::io_error("hid write", unsafe { GetLastError() }));
+        }
+        // Report the caller's length, not the zero-padded one.
+        Ok(data.len())
+    }
+
+    /// Read one input report without ever resolving with `Ok(0)`: the future
+    /// completes once the persistent background `ReadFile` delivers a report,
+    /// and fails with [`HidError::Disconnected`] when the device is removed.
+    /// Wake-ups come from a one-shot thread-pool wait on the read event
+    /// (`RegisterWaitForSingleObject`, raw [`Waker`]s, no executor assumed).
+    fn read_async<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> impl Future<Output = HidResult<usize>> + Send + 'a {
+        ReadAsync { dev: self, buf }
+    }
+
+    fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
+        if data.is_empty() {
+            return Err(HidError::InvalidData {
+                message: "feature report must contain a report ID byte".into(),
+            });
+        }
+        // HidD_SetFeature wants at least FeatureReportByteLength bytes;
+        // zero-pad shorter reports like hidapi.
+        let padded;
+        let buf: &[u8] = if data.len() >= self.feature_report_len as usize {
+            data
+        } else {
+            let mut v = vec![0u8; self.feature_report_len as usize];
+            v[..data.len()].copy_from_slice(data);
+            padded = v;
+            &padded
+        };
+        // SAFETY: buf is a live slice of at least the required length.
+        let ok =
+            unsafe { HidD_SetFeature(self.handle.raw(), buf.as_ptr().cast(), buf.len() as u32) };
+        if !ok {
+            return Err(Self::io_error("HidD_SetFeature", unsafe { GetLastError() }));
+        }
+        Ok(())
+    }
+
+    fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize> {
         self.ioctl_get_report(IOCTL_HID_GET_FEATURE, buf, "IOCTL_HID_GET_FEATURE")
     }
 
-    pub(crate) fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize> {
+    fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize> {
         match self.ioctl_get_report(
             IOCTL_HID_GET_INPUT_REPORT,
             buf,
@@ -1116,19 +1179,19 @@ impl WinDevice {
         }
     }
 
-    pub(crate) fn get_manufacturer_string(&self) -> HidResult<Option<String>> {
+    fn get_manufacturer_string(&self) -> HidResult<Option<String>> {
         Ok(self.info.manufacturer_string.clone())
     }
 
-    pub(crate) fn get_product_string(&self) -> HidResult<Option<String>> {
+    fn get_product_string(&self) -> HidResult<Option<String>> {
         Ok(self.info.product_string.clone())
     }
 
-    pub(crate) fn get_serial_number_string(&self) -> HidResult<Option<String>> {
+    fn get_serial_number_string(&self) -> HidResult<Option<String>> {
         Ok(self.info.serial_number.clone())
     }
 
-    pub(crate) fn get_indexed_string(&self, index: u32) -> HidResult<Option<String>> {
+    fn get_indexed_string(&self, index: u32) -> HidResult<Option<String>> {
         let mut buf = [0u16; MAX_STRING_WCHARS];
         // SAFETY: buffer length is in bytes, per the HidD_* contract.
         let ok = unsafe {
@@ -1168,87 +1231,15 @@ impl WinDevice {
     /// * array (non-variable) button fields are approximated: the documented
     ///   API does not expose their report size, so 8 bits (16 when the usage
     ///   range exceeds 255) per element is assumed, the keyboard layout.
-    pub(crate) fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize> {
+    fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize> {
         let bytes = self.reconstruct_descriptor()?;
         let len = bytes.len().min(buf.len());
         buf[..len].copy_from_slice(&bytes[..len]);
         Ok(len)
     }
 
-    fn reconstruct_descriptor(&self) -> HidResult<Vec<u8>> {
-        let pp = PreparsedData::get(self.handle.raw())?;
-        let caps = pp.caps()?;
-
-        // Link collection tree; node 0 is the top-level collection.
-        let count = caps.NumberLinkCollectionNodes as usize;
-        if count == 0 {
-            return Err(HidError::backend("device reports no link collections"));
-        }
-        let mut nodes = vec![HIDP_LINK_COLLECTION_NODE::default(); count];
-        let mut len = count as u32;
-        // SAFETY: nodes has room for `len` entries.
-        let status = unsafe { HidP_GetLinkCollectionNodes(nodes.as_mut_ptr(), &mut len, pp.0) };
-        if status != HIDP_STATUS_SUCCESS {
-            return Err(HidError::backend("HidP_GetLinkCollectionNodes failed"));
-        }
-        nodes.truncate(len as usize);
-
-        let mut fields = collect_fields(&pp, &caps);
-        synthesize_padding(&caps, &mut fields);
-
-        // Group fields by owning collection, ordered by report type, report
-        // ID, then HidP enumeration order.
-        let mut by_node: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
-        for (i, f) in fields.iter().enumerate() {
-            if let Some(v) = by_node.get_mut(f.link as usize) {
-                v.push(i);
-            }
-        }
-        for v in &mut by_node {
-            v.sort_by_key(|&i| (fields[i].kind, fields[i].report_id, fields[i].order));
-        }
-
-        let mut b = DescriptorBuilder::new();
-        emit_collection(&mut b, &nodes, &by_node, &fields, 0, 0)?;
-        Ok(b.build())
-    }
-
-    pub(crate) fn get_device_info(&self) -> HidResult<DeviceInfo> {
+    fn get_device_info(&self) -> HidResult<DeviceInfo> {
         Ok(self.info.clone())
-    }
-
-    /// `hid_winapi_get_container_id`: the `DEVPKEY_Device_ContainerId` GUID
-    /// of the devnode behind this interface, as 16 bytes in the GUID's
-    /// in-memory (little-endian fields) layout.
-    pub(crate) fn container_id(&self) -> HidResult<[u8; 16]> {
-        let (list, devinfo) = devnode_for_interface(&self.path)?;
-        let mut guid: GUID = unsafe { core::mem::zeroed() };
-        let mut prop_type: DEVPROPTYPE = 0;
-        // SAFETY: out-buffer is a GUID, matching DEVPROP_TYPE_GUID.
-        let ok = unsafe {
-            SetupDiGetDevicePropertyW(
-                list.0,
-                &devinfo,
-                &DEVPKEY_Device_ContainerId,
-                &mut prop_type,
-                (&mut guid as *mut GUID).cast(),
-                core::mem::size_of::<GUID>() as u32,
-                core::ptr::null_mut(),
-                0,
-            )
-        };
-        if ok == 0 {
-            return Err(HidError::last_os_error("SetupDiGetDevicePropertyW"));
-        }
-        if prop_type != DEVPROP_TYPE_GUID {
-            return Err(HidError::backend("container id property is not a GUID"));
-        }
-        Ok(guid_to_bytes(&guid))
-    }
-
-    /// `hid_winapi_set_write_timeout`.
-    pub(crate) fn set_write_timeout(&self, timeout_ms: u32) {
-        self.write_timeout_ms.store(timeout_ms, Ordering::Relaxed);
     }
 }
 

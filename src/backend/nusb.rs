@@ -46,6 +46,7 @@ use nusb::transfer::{
 };
 use nusb::{Endpoint, Interface, MaybeFuture};
 
+use super::{HidBackend, HidDeviceBackend};
 use crate::descriptor::{ReportDescriptor, ReportKind};
 use crate::error::{HidError, HidResult};
 use crate::{BusType, DeviceInfo, MAX_REPORT_DESCRIPTOR_SIZE};
@@ -241,9 +242,11 @@ pub(crate) struct NusbApi {
     _private: (),
 }
 
-impl NusbApi {
+impl HidBackend for NusbApi {
+    type Device = NusbDevice;
+
     /// Initialize the backend.
-    pub(crate) fn new() -> HidResult<Self> {
+    fn new() -> HidResult<Self> {
         Ok(NusbApi { _private: () })
     }
 
@@ -254,7 +257,7 @@ impl NusbApi {
     /// which needs the device opened; this is attempted best-effort and the
     /// fields stay 0/0 when the device cannot be opened (e.g. missing udev
     /// permissions), matching hidapi-libusb.
-    pub(crate) fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>> {
+    fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>> {
         let devices = match nusb::list_devices().wait() {
             Ok(devices) => devices,
             // A missing /sys/bus/usb (containers, build sandboxes) means no
@@ -300,28 +303,9 @@ impl NusbApi {
         Ok(result)
     }
 
-    /// Open the first interface matching `vendor_id`/`product_id` and,
-    /// optionally, the serial number.
-    pub(crate) fn open(
-        &self,
-        vendor_id: u16,
-        product_id: u16,
-        serial: Option<&str>,
-    ) -> HidResult<NusbDevice> {
-        let candidates = self.enumerate(vendor_id, product_id)?;
-        let info = candidates
-            .into_iter()
-            .find(|info| match serial {
-                Some(s) => info.serial_number.as_deref() == Some(s),
-                None => true,
-            })
-            .ok_or(HidError::DeviceNotFound)?;
-        self.open_path(&info.path)
-    }
-
     /// Open a device by `usb:<bus>:<device-address>:<interface>` path, as
-    /// reported by [`enumerate`](Self::enumerate).
-    pub(crate) fn open_path(&self, path: &str) -> HidResult<NusbDevice> {
+    /// reported by [`HidBackend::enumerate`].
+    fn open_path(&self, path: &str) -> HidResult<NusbDevice> {
         let (bus_id, device_address, interface_number) =
             parse_path(path).ok_or_else(|| HidError::InvalidData {
                 message: format!("invalid USB device path: {path}"),
@@ -555,11 +539,50 @@ impl NusbDevice {
         })
     }
 
+    /// `GET_REPORT` shared by feature and input reports. `buf[0]` carries the
+    /// report ID on entry; for ID 0 the returned data is written at
+    /// `buf[1..]` so the ID stays in byte 0, exactly like hidapi.
+    fn get_report(
+        &self,
+        report_type: u16,
+        buf: &mut [u8],
+        operation: &'static str,
+    ) -> HidResult<usize> {
+        if buf.is_empty() {
+            return Err(HidError::InvalidData {
+                message: "buffer must contain a report ID byte".into(),
+            });
+        }
+        let report_number = buf[0];
+        let offset = usize::from(report_number == 0);
+        let length = (buf.len() - offset).min(usize::from(u16::MAX)) as u16;
+        let data = self
+            .interface
+            .control_in(
+                ControlIn {
+                    control_type: ControlType::Class,
+                    recipient: Recipient::Interface,
+                    request: HID_GET_REPORT,
+                    value: (report_type << 8) | u16::from(report_number),
+                    index: u16::from(self.interface_number),
+                    length,
+                },
+                CONTROL_TIMEOUT,
+            )
+            .wait()
+            .map_err(|e| transfer_error(operation, e))?;
+        let len = data.len().min(buf.len() - offset);
+        buf[offset..offset + len].copy_from_slice(&data[..len]);
+        Ok(len + offset)
+    }
+}
+
+impl HidDeviceBackend for NusbDevice {
     /// Send an output report. `data[0]` is the report ID; like hidapi's
     /// libusb backend, a 0 ID byte is stripped before transmission on both
     /// the interrupt and the `SET_REPORT` control path, while a nonzero ID
     /// is sent on the wire. Returns the original length on success.
-    pub(crate) fn write(&self, data: &[u8]) -> HidResult<usize> {
+    fn write(&self, data: &[u8]) -> HidResult<usize> {
         if data.is_empty() {
             return Err(HidError::InvalidData {
                 message: "write data must contain a report ID byte".into(),
@@ -617,7 +640,7 @@ impl NusbDevice {
     /// works under tokio, async-std, smol or a hand-rolled executor) and
     /// cancel-safe: reports are only dequeued inside `poll`, so dropping it
     /// never loses input; pending reports stay queued for the next read.
-    pub(crate) fn read_async<'a>(
+    fn read_async<'a>(
         &'a self,
         buf: &'a mut [u8],
     ) -> impl Future<Output = HidResult<usize>> + Send + 'a {
@@ -629,7 +652,7 @@ impl NusbDevice {
 
     /// Send a feature report via `SET_REPORT(Feature)`. `data[0]` is the
     /// report ID; a 0 ID byte is stripped, like hidapi.
-    pub(crate) fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
+    fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
         if data.is_empty() {
             return Err(HidError::InvalidData {
                 message: "feature report must contain a report ID byte".into(),
@@ -654,70 +677,33 @@ impl NusbDevice {
         Ok(())
     }
 
-    /// `GET_REPORT` shared by feature and input reports. `buf[0]` carries the
-    /// report ID on entry; for ID 0 the returned data is written at
-    /// `buf[1..]` so the ID stays in byte 0, exactly like hidapi.
-    fn get_report(
-        &self,
-        report_type: u16,
-        buf: &mut [u8],
-        operation: &'static str,
-    ) -> HidResult<usize> {
-        if buf.is_empty() {
-            return Err(HidError::InvalidData {
-                message: "buffer must contain a report ID byte".into(),
-            });
-        }
-        let report_number = buf[0];
-        let offset = usize::from(report_number == 0);
-        let length = (buf.len() - offset).min(usize::from(u16::MAX)) as u16;
-        let data = self
-            .interface
-            .control_in(
-                ControlIn {
-                    control_type: ControlType::Class,
-                    recipient: Recipient::Interface,
-                    request: HID_GET_REPORT,
-                    value: (report_type << 8) | u16::from(report_number),
-                    index: u16::from(self.interface_number),
-                    length,
-                },
-                CONTROL_TIMEOUT,
-            )
-            .wait()
-            .map_err(|e| transfer_error(operation, e))?;
-        let len = data.len().min(buf.len() - offset);
-        buf[offset..offset + len].copy_from_slice(&data[..len]);
-        Ok(len + offset)
-    }
-
     /// Get a feature report via `GET_REPORT(Feature)`. Set `buf[0]` to the
     /// report ID before calling.
-    pub(crate) fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize> {
+    fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize> {
         self.get_report(REPORT_TYPE_FEATURE, buf, "GET_REPORT (feature)")
     }
 
     /// Get an input report synchronously via `GET_REPORT(Input)`. Same
     /// buffer convention as [`get_feature_report`](Self::get_feature_report).
-    pub(crate) fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize> {
+    fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize> {
         self.get_report(REPORT_TYPE_INPUT, buf, "GET_REPORT (input)")
     }
 
-    pub(crate) fn get_manufacturer_string(&self) -> HidResult<Option<String>> {
+    fn get_manufacturer_string(&self) -> HidResult<Option<String>> {
         Ok(self.info.manufacturer_string.clone())
     }
 
-    pub(crate) fn get_product_string(&self) -> HidResult<Option<String>> {
+    fn get_product_string(&self) -> HidResult<Option<String>> {
         Ok(self.info.product_string.clone())
     }
 
-    pub(crate) fn get_serial_number_string(&self) -> HidResult<Option<String>> {
+    fn get_serial_number_string(&self) -> HidResult<Option<String>> {
         Ok(self.info.serial_number.clone())
     }
 
     /// Read a string descriptor by index (US English), which only this
     /// backend supports, the native hidraw backend cannot.
-    pub(crate) fn get_indexed_string(&self, index: u32) -> HidResult<Option<String>> {
+    fn get_indexed_string(&self, index: u32) -> HidResult<Option<String>> {
         let index = u8::try_from(index)
             .ok()
             .and_then(NonZeroU8::new)
@@ -738,7 +724,7 @@ impl NusbDevice {
     }
 
     /// Raw report descriptor, served from the copy read at open time.
-    pub(crate) fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize> {
+    fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize> {
         if self.report_descriptor.is_empty() {
             return Err(HidError::backend(
                 "the HID report descriptor could not be read when the device was opened",
@@ -750,7 +736,7 @@ impl NusbDevice {
     }
 
     /// Enumeration-style metadata for this interface, captured at open time.
-    pub(crate) fn get_device_info(&self) -> HidResult<DeviceInfo> {
+    fn get_device_info(&self) -> HidResult<DeviceInfo> {
         Ok(self.info.clone())
     }
 }

@@ -194,9 +194,9 @@ impl ReportItemInfo {
             | nibble(self.unit_factor_luminous_intensity_exponent) << 24
     }
 
-    /// [`MainFlags`] bits for the Input/Output/Feature item this describes.
-    pub fn main_flags(&self) -> u32 {
-        let mut flags = 0;
+    /// [`MainFlags`] for the Input/Output/Feature item this describes.
+    pub fn main_flags(&self) -> MainFlags {
+        let mut flags = MainFlags::NONE;
         if self.is_constant {
             flags |= MainFlags::CONSTANT;
         }

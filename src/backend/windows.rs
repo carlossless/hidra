@@ -1307,8 +1307,8 @@ enum FieldData {
         range: Option<(u16, u16)>,
         usage: u16,
         report_count: u16,
-        /// Raw main-item data (`BitField`) as declared by the device.
-        flags: u32,
+        /// Main-item flags (`BitField`) as declared by the device.
+        flags: MainFlags,
     },
     Value {
         usage_page: u16,
@@ -1322,7 +1322,7 @@ enum FieldData {
         physical_max: i32,
         unit: u32,
         unit_exp: i32,
-        flags: u32,
+        flags: MainFlags,
     },
     /// Synthesized constant padding (see `get_report_descriptor` docs).
     Padding { bits: u32 },
@@ -1348,7 +1348,7 @@ impl FieldData {
                 flags,
                 ..
             } => {
-                if flags & MainFlags::VARIABLE != 0 {
+                if flags.is_variable() {
                     let count = match range {
                         Some((lo, hi)) => u32::from(hi.saturating_sub(lo)) + 1,
                         None => report_count.max(1) as u32,
@@ -1435,7 +1435,7 @@ fn collect_fields(pp: &PreparsedData, caps: &HIDP_CAPS) -> Vec<Field> {
                             range,
                             usage,
                             report_count: c.ReportCount,
-                            flags: c.BitField as u32,
+                            flags: MainFlags(c.BitField as u32),
                         },
                     });
                 }
@@ -1481,7 +1481,7 @@ fn collect_fields(pp: &PreparsedData, caps: &HIDP_CAPS) -> Vec<Field> {
                             physical_max: c.PhysicalMax,
                             unit: c.Units,
                             unit_exp: c.UnitsExp as i32,
-                            flags: c.BitField as u32,
+                            flags: MainFlags(c.BitField as u32),
                         },
                     });
                 }
@@ -1615,7 +1615,7 @@ fn emit_field(b: &mut DescriptorBuilder, field: &Field) {
     // zero-length payloads), so nothing leaks between fields.
     match field.data {
         FieldData::Button { range, flags, .. } => {
-            if flags & MainFlags::VARIABLE != 0 {
+            if flags.is_variable() {
                 b.logical_minimum(0);
                 b.logical_maximum(1);
             } else {
@@ -1652,7 +1652,7 @@ fn emit_field(b: &mut DescriptorBuilder, field: &Field) {
     emit_main(b, field.kind, flags);
 }
 
-fn emit_main(b: &mut DescriptorBuilder, kind: u8, flags: u32) {
+fn emit_main(b: &mut DescriptorBuilder, kind: u8, flags: MainFlags) {
     match kind {
         KIND_INPUT => b.input(flags),
         KIND_OUTPUT => b.output(flags),

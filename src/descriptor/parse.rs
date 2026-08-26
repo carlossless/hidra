@@ -4,7 +4,10 @@ use super::items::{GlobalTag, Items, LocalTag, MainTag};
 use crate::error::{HidError, HidResult};
 
 /// Direction/class of a HID report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Ordered Input < Output < Feature, the order the HID spec lists them in and
+/// the order a reconstructed descriptor emits them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReportKind {
     /// Device-to-host report (Input main item).
     Input,

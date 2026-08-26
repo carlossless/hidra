@@ -59,7 +59,7 @@ use windows_sys::Win32::System::IO::{
 };
 
 use super::{HidBackend, HidDeviceBackend};
-use crate::descriptor::{CollectionKind, DescriptorBuilder, MainFlags};
+use crate::descriptor::{CollectionKind, DescriptorBuilder, MainFlags, ReportKind};
 use crate::error::{HidError, HidResult};
 use crate::{BusType, DeviceInfo};
 
@@ -1295,26 +1295,26 @@ impl Future for ReadAsync<'_> {
 
 // --- descriptor reconstruction --------------------------------------------------
 
-/// Report types in emission order; doubles as the sort key.
-const KIND_INPUT: u8 = 0;
-const KIND_OUTPUT: u8 = 1;
-const KIND_FEATURE: u8 = 2;
+/// What every enumerated field carries, whatever its kind.
+#[derive(Clone, Copy)]
+struct Common {
+    usage_page: u16,
+    /// `Some((min, max))` for usage ranges, otherwise `usage` applies.
+    range: Option<(u16, u16)>,
+    usage: u16,
+    report_count: u16,
+    /// Main-item flags (`BitField`) as declared by the device.
+    flags: MainFlags,
+}
 
-enum FieldData {
-    Button {
-        usage_page: u16,
-        /// `Some((min, max))` for usage ranges, otherwise `usage` applies.
-        range: Option<(u16, u16)>,
-        usage: u16,
-        report_count: u16,
-        /// Main-item flags (`BitField`) as declared by the device.
-        flags: MainFlags,
-    },
+/// The part of a field that depends on which `HidP` cap it came from.
+#[derive(Clone, Copy)]
+enum FieldKind {
+    /// From `HidP_GetButtonCaps`: one bit per usage when variable, an array
+    /// selector otherwise.
+    Button,
+    /// From `HidP_GetValueCaps`: a sized value with logical/physical ranges.
     Value {
-        usage_page: u16,
-        range: Option<(u16, u16)>,
-        usage: u16,
-        report_count: u16,
         bit_size: u16,
         logical_min: i32,
         logical_max: i32,
@@ -1322,32 +1322,34 @@ enum FieldData {
         physical_max: i32,
         unit: u32,
         unit_exp: i32,
-        flags: MainFlags,
     },
-    /// Synthesized constant padding (see `get_report_descriptor` docs).
+    /// Synthesized constant padding (see `get_report_descriptor` docs). Its
+    /// `Common` is a placeholder: padding emits no usage items.
     Padding { bits: u32 },
 }
 
 struct Field {
-    kind: u8,
+    kind: ReportKind,
     report_id: u8,
     /// Owning link collection index.
     link: u16,
     /// `HidP` enumeration order, used as the in-report tiebreaker.
     order: usize,
-    data: FieldData,
+    common: Common,
+    data: FieldKind,
 }
 
-impl FieldData {
+impl Field {
     /// `(report_size, report_count)` as they will be emitted.
     fn layout(&self) -> (u32, u32) {
-        match *self {
-            FieldData::Button {
-                range,
-                report_count,
-                flags,
-                ..
-            } => {
+        let Common {
+            range,
+            report_count,
+            flags,
+            ..
+        } = self.common;
+        match self.data {
+            FieldKind::Button => {
                 if flags.is_variable() {
                     let count = match range {
                         Some((lo, hi)) => u32::from(hi.saturating_sub(lo)) + 1,
@@ -1360,132 +1362,143 @@ impl FieldData {
                     (if max > 255 { 16 } else { 8 }, report_count.max(1) as u32)
                 }
             }
-            FieldData::Value {
-                range,
-                report_count,
-                bit_size,
-                ..
-            } => {
+            FieldKind::Value { bit_size, .. } => {
                 let mut count = report_count.max(1) as u32;
                 if let Some((lo, hi)) = range {
                     count = count.max(u32::from(hi.saturating_sub(lo)) + 1);
                 }
                 (bit_size as u32, count)
             }
-            FieldData::Padding { bits } => (bits, 1),
+            FieldKind::Padding { bits } => (bits, 1),
         }
     }
 }
 
+/// The `IsRange`/`IsAlias` handling and usage extraction shared by
+/// `HIDP_BUTTON_CAPS` and `HIDP_VALUE_CAPS`, which declare the same leading
+/// fields but are distinct types.
+macro_rules! caps_common {
+    ($c:expr) => {{
+        let c = $c;
+        // SAFETY: IsRange selects the active union arm.
+        let (range, usage) = unsafe {
+            if c.IsRange {
+                (
+                    Some((c.Anonymous.Range.UsageMin, c.Anonymous.Range.UsageMax)),
+                    0,
+                )
+            } else {
+                (None, c.Anonymous.NotRange.Usage)
+            }
+        };
+        Common {
+            usage_page: c.UsagePage,
+            range,
+            usage,
+            report_count: c.ReportCount,
+            flags: MainFlags(c.BitField as u32),
+        }
+    }};
+}
+
+/// Fetch one cap array through its `HidP_Get*Caps` entry point.
+///
+/// Returns an empty vector when the device declares none or the call fails;
+/// a report type whose caps cannot be read simply contributes no fields.
+macro_rules! read_caps {
+    ($get:ident, $ty:ty, $report_type:expr, $declared:expr, $pp:expr) => {{
+        let declared = $declared;
+        if declared == 0 {
+            Vec::new()
+        } else {
+            let mut caps = vec![<$ty>::default(); declared as usize];
+            let mut len = declared;
+            // SAFETY: caps has room for `len` entries.
+            let status = unsafe { $get($report_type, caps.as_mut_ptr(), &mut len, $pp) };
+            if status == HIDP_STATUS_SUCCESS {
+                caps.truncate(len as usize);
+                caps
+            } else {
+                Vec::new()
+            }
+        }
+    }};
+}
+
 /// Pull every button/value cap for all three report types.
 fn collect_fields(pp: &PreparsedData, caps: &HIDP_CAPS) -> Vec<Field> {
-    let kinds: [(u8, HIDP_REPORT_TYPE, u16, u16); 3] = [
+    let per_kind: [(ReportKind, HIDP_REPORT_TYPE, u16, u16); 3] = [
         (
-            KIND_INPUT,
+            ReportKind::Input,
             HidP_Input,
             caps.NumberInputButtonCaps,
             caps.NumberInputValueCaps,
         ),
         (
-            KIND_OUTPUT,
+            ReportKind::Output,
             HidP_Output,
             caps.NumberOutputButtonCaps,
             caps.NumberOutputValueCaps,
         ),
         (
-            KIND_FEATURE,
+            ReportKind::Feature,
             HidP_Feature,
             caps.NumberFeatureButtonCaps,
             caps.NumberFeatureValueCaps,
         ),
     ];
+
     let mut fields = Vec::new();
-    for (kind, report_type, n_buttons, n_values) in kinds {
-        if n_buttons > 0 {
-            let mut buttons = vec![HIDP_BUTTON_CAPS::default(); n_buttons as usize];
-            let mut len = n_buttons;
-            // SAFETY: buttons has room for `len` entries.
-            let status =
-                unsafe { HidP_GetButtonCaps(report_type, buttons.as_mut_ptr(), &mut len, pp.0) };
-            if status == HIDP_STATUS_SUCCESS {
-                buttons.truncate(len as usize);
-                for c in &buttons {
-                    if c.IsAlias {
-                        // Aliased usages share a field with the primary one.
-                        continue;
-                    }
-                    // SAFETY: IsRange selects the active union arm.
-                    let (range, usage) = unsafe {
-                        if c.IsRange {
-                            (
-                                Some((c.Anonymous.Range.UsageMin, c.Anonymous.Range.UsageMax)),
-                                0,
-                            )
-                        } else {
-                            (None, c.Anonymous.NotRange.Usage)
-                        }
-                    };
-                    fields.push(Field {
-                        kind,
-                        report_id: c.ReportID,
-                        link: c.LinkCollection,
-                        order: fields.len(),
-                        data: FieldData::Button {
-                            usage_page: c.UsagePage,
-                            range,
-                            usage,
-                            report_count: c.ReportCount,
-                            flags: MainFlags(c.BitField as u32),
-                        },
-                    });
-                }
+    for (kind, report_type, n_buttons, n_values) in per_kind {
+        let buttons = read_caps!(
+            HidP_GetButtonCaps,
+            HIDP_BUTTON_CAPS,
+            report_type,
+            n_buttons,
+            pp.0
+        );
+        for c in &buttons {
+            // Aliased usages share a field with the primary one.
+            if c.IsAlias {
+                continue;
             }
+            fields.push(Field {
+                kind,
+                report_id: c.ReportID,
+                link: c.LinkCollection,
+                order: fields.len(),
+                common: caps_common!(c),
+                data: FieldKind::Button,
+            });
         }
-        if n_values > 0 {
-            let mut values = vec![HIDP_VALUE_CAPS::default(); n_values as usize];
-            let mut len = n_values;
-            // SAFETY: values has room for `len` entries.
-            let status =
-                unsafe { HidP_GetValueCaps(report_type, values.as_mut_ptr(), &mut len, pp.0) };
-            if status == HIDP_STATUS_SUCCESS {
-                values.truncate(len as usize);
-                for c in &values {
-                    if c.IsAlias {
-                        continue;
-                    }
-                    // SAFETY: IsRange selects the active union arm.
-                    let (range, usage) = unsafe {
-                        if c.IsRange {
-                            (
-                                Some((c.Anonymous.Range.UsageMin, c.Anonymous.Range.UsageMax)),
-                                0,
-                            )
-                        } else {
-                            (None, c.Anonymous.NotRange.Usage)
-                        }
-                    };
-                    fields.push(Field {
-                        kind,
-                        report_id: c.ReportID,
-                        link: c.LinkCollection,
-                        order: fields.len(),
-                        data: FieldData::Value {
-                            usage_page: c.UsagePage,
-                            range,
-                            usage,
-                            report_count: c.ReportCount,
-                            bit_size: c.BitSize,
-                            logical_min: c.LogicalMin,
-                            logical_max: c.LogicalMax,
-                            physical_min: c.PhysicalMin,
-                            physical_max: c.PhysicalMax,
-                            unit: c.Units,
-                            unit_exp: c.UnitsExp as i32,
-                            flags: MainFlags(c.BitField as u32),
-                        },
-                    });
-                }
+
+        let values = read_caps!(
+            HidP_GetValueCaps,
+            HIDP_VALUE_CAPS,
+            report_type,
+            n_values,
+            pp.0
+        );
+        for c in &values {
+            if c.IsAlias {
+                continue;
             }
+            fields.push(Field {
+                kind,
+                report_id: c.ReportID,
+                link: c.LinkCollection,
+                order: fields.len(),
+                common: caps_common!(c),
+                data: FieldKind::Value {
+                    bit_size: c.BitSize,
+                    logical_min: c.LogicalMin,
+                    logical_max: c.LogicalMax,
+                    physical_min: c.PhysicalMin,
+                    physical_max: c.PhysicalMax,
+                    unit: c.Units,
+                    unit_exp: c.UnitsExp as i32,
+                },
+            });
         }
     }
     fields
@@ -1496,9 +1509,9 @@ fn collect_fields(pp: &PreparsedData, caps: &HIDP_CAPS) -> Vec<Field> {
 /// not part of the descriptor-declared bits).
 fn synthesize_padding(caps: &HIDP_CAPS, fields: &mut Vec<Field>) {
     for (kind, report_len) in [
-        (KIND_INPUT, caps.InputReportByteLength),
-        (KIND_OUTPUT, caps.OutputReportByteLength),
-        (KIND_FEATURE, caps.FeatureReportByteLength),
+        (ReportKind::Input, caps.InputReportByteLength),
+        (ReportKind::Output, caps.OutputReportByteLength),
+        (ReportKind::Feature, caps.FeatureReportByteLength),
     ] {
         if report_len < 2 {
             continue;
@@ -1507,7 +1520,7 @@ fn synthesize_padding(caps: &HIDP_CAPS, fields: &mut Vec<Field>) {
         let mut bits = 0u64;
         for f in fields.iter().filter(|f| f.kind == kind) {
             ids.insert(f.report_id);
-            let (size, count) = f.data.layout();
+            let (size, count) = f.layout();
             bits += u64::from(size) * u64::from(count);
         }
         if ids.len() != 1 {
@@ -1521,7 +1534,14 @@ fn synthesize_padding(caps: &HIDP_CAPS, fields: &mut Vec<Field>) {
                 report_id: *ids.first().expect("one id"),
                 link: 0,
                 order: usize::MAX, // sorts after all real fields
-                data: FieldData::Padding {
+                common: Common {
+                    usage_page: 0,
+                    range: None,
+                    usage: 0,
+                    report_count: 1,
+                    flags: MainFlags::CONSTANT,
+                },
+                data: FieldKind::Padding {
                     bits: (declared - bits) as u32,
                 },
             });
@@ -1569,33 +1589,25 @@ fn emit_collection(
 }
 
 fn emit_field(b: &mut DescriptorBuilder, field: &Field) {
-    if let FieldData::Padding { bits } = field.data {
+    let (size, count) = field.layout();
+
+    if let FieldKind::Padding { .. } = field.data {
         if field.report_id != 0 {
             b.report_id(field.report_id);
         }
-        b.report_size(bits);
-        b.report_count(1);
+        b.report_size(size);
+        b.report_count(count);
         emit_main(b, field.kind, MainFlags::CONSTANT);
         return;
     }
 
-    let (usage_page, range, usage, flags) = match field.data {
-        FieldData::Button {
-            usage_page,
-            range,
-            usage,
-            flags,
-            ..
-        }
-        | FieldData::Value {
-            usage_page,
-            range,
-            usage,
-            flags,
-            ..
-        } => (usage_page, range, usage, flags),
-        FieldData::Padding { .. } => unreachable!(),
-    };
+    let Common {
+        usage_page,
+        range,
+        usage,
+        flags,
+        ..
+    } = field.common;
 
     b.usage_page(usage_page);
     if field.report_id != 0 {
@@ -1614,12 +1626,11 @@ fn emit_field(b: &mut DescriptorBuilder, field: &Field) {
     // Globals are re-emitted for every field (zero values encode as
     // zero-length payloads), so nothing leaks between fields.
     match field.data {
-        FieldData::Button { range, flags, .. } => {
+        FieldKind::Button => {
+            b.logical_minimum(0);
             if flags.is_variable() {
-                b.logical_minimum(0);
                 b.logical_maximum(1);
             } else {
-                b.logical_minimum(0);
                 b.logical_maximum(range.map(|(_, hi)| hi).unwrap_or(1) as i32);
             }
             b.physical_minimum(0);
@@ -1627,7 +1638,7 @@ fn emit_field(b: &mut DescriptorBuilder, field: &Field) {
             b.unit_exponent(0);
             b.unit(0);
         }
-        FieldData::Value {
+        FieldKind::Value {
             logical_min,
             logical_max,
             physical_min,
@@ -1643,20 +1654,19 @@ fn emit_field(b: &mut DescriptorBuilder, field: &Field) {
             b.unit_exponent(unit_exp);
             b.unit(unit);
         }
-        FieldData::Padding { .. } => unreachable!(),
+        FieldKind::Padding { .. } => {}
     }
 
-    let (size, count) = field.data.layout();
     b.report_size(size);
     b.report_count(count);
     emit_main(b, field.kind, flags);
 }
 
-fn emit_main(b: &mut DescriptorBuilder, kind: u8, flags: MainFlags) {
+fn emit_main(b: &mut DescriptorBuilder, kind: ReportKind, flags: MainFlags) {
     match kind {
-        KIND_INPUT => b.input(flags),
-        KIND_OUTPUT => b.output(flags),
-        _ => b.feature(flags),
+        ReportKind::Input => b.input(flags),
+        ReportKind::Output => b.output(flags),
+        ReportKind::Feature => b.feature(flags),
     };
 }
 
@@ -1742,15 +1752,18 @@ mod tests {
             ..Default::default()
         };
         let mut fields = vec![Field {
-            kind: KIND_INPUT,
+            kind: ReportKind::Input,
             report_id: 0,
             link: 0,
             order: 0,
-            data: FieldData::Value {
+            common: Common {
                 usage_page: 1,
                 range: None,
                 usage: 0x30,
                 report_count: 2,
+                flags: MainFlags::VARIABLE,
+            },
+            data: FieldKind::Value {
                 bit_size: 8,
                 logical_min: 0,
                 logical_max: 255,
@@ -1758,13 +1771,12 @@ mod tests {
                 physical_max: 0,
                 unit: 0,
                 unit_exp: 0,
-                flags: MainFlags::VARIABLE,
             },
         }];
         synthesize_padding(&caps, &mut fields);
         assert_eq!(fields.len(), 2);
         match fields[1].data {
-            FieldData::Padding { bits } => assert_eq!(bits, 64 - 16),
+            FieldKind::Padding { bits } => assert_eq!(bits, 64 - 16),
             _ => panic!("expected padding"),
         }
     }

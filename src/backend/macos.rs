@@ -13,12 +13,10 @@
 //! CoreFoundation declarations come from `core-foundation-sys` (which links
 //! the framework); the `IOKit` symbols below link `IOKit.framework` directly.
 
-use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::task::Waker;
 use std::thread;
 
 use core_foundation_sys::array::{
@@ -45,6 +43,7 @@ use core_foundation_sys::string::{
     CFStringGetLength, CFStringGetMaximumSizeForEncoding, CFStringGetTypeID, CFStringRef,
 };
 
+use super::queue::ReportQueue;
 use super::{HidBackend, HidDeviceBackend};
 use crate::error::{HidError, HidResult};
 use crate::{BusType, DeviceInfo};
@@ -184,10 +183,6 @@ const KEY_REPORT_DESCRIPTOR: &str = "ReportDescriptor"; // kIOHIDReportDescripto
 
 /// Device path prefix, identical to modern hidapi (`DevSrvsID:%llu`).
 const PATH_PREFIX: &str = "DevSrvsID:";
-
-/// Unread input reports kept per device before the oldest is dropped,
-/// matching hidapi's queue cap.
-const MAX_QUEUED_REPORTS: usize = 30;
 
 // --- pure helpers --------------------------------------------------------------
 
@@ -478,35 +473,36 @@ impl HidBackend for MacApi {
 /// callbacks.
 #[derive(Default)]
 struct Shared {
-    state: Mutex<State>,
-    /// Signals `State::ready`; only [`MacDevice::open`]'s startup barrier
-    /// waits on it. Input reports and disconnects reach readers through
-    /// `State::wakers`, never through this.
+    /// Input reports plus the disconnect/shutdown flags and parked readers.
+    queue: ReportQueue,
+    /// Read-thread lifecycle, which the queue does not model.
+    thread: Mutex<ThreadState>,
+    /// Signals `ThreadState::ready`; only [`MacDevice::open`]'s startup
+    /// barrier waits on it. Input reports and disconnects reach readers
+    /// through the queue's wakers, never through this.
     ready_cond: Condvar,
 }
 
 #[derive(Default)]
-struct State {
-    /// Queued input reports, oldest first.
-    reports: VecDeque<Vec<u8>>,
-    /// Set by the removal callback (or when the run loop dies unexpectedly).
-    disconnected: bool,
-    /// Set by `Drop` to make the read thread exit.
-    shutdown: bool,
+struct ThreadState {
     /// `CFRunLoopRef` of the read thread (as usize), 0 until the thread is up.
     run_loop: usize,
     /// The read thread finished scheduling the device.
     ready: bool,
-    /// Wakers of pending `read_async` futures; drained (and woken) by the
-    /// `IOKit` callbacks whenever a report arrives or the device goes away.
-    wakers: Vec<Waker>,
 }
 
 impl Shared {
-    /// Lock the state, recovering from poisoning: none of the critical
-    /// sections can leave the queue in an inconsistent state.
-    fn lock_state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    fn new() -> Self {
+        Shared {
+            queue: ReportQueue::new("device read thread is shut down"),
+            ..Default::default()
+        }
+    }
+
+    /// Lock the thread state, recovering from poisoning: neither field can be
+    /// left inconsistent by the two short critical sections that touch them.
+    fn lock_thread(&self) -> MutexGuard<'_, ThreadState> {
+        self.thread.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -528,18 +524,7 @@ unsafe extern "C" fn input_report_callback(
     // stays valid until the callback is unregistered (MacDevice::drop).
     let shared = &*(context as *const Shared);
     let data = std::slice::from_raw_parts(report, report_length as usize).to_vec();
-    let wakers = {
-        let mut state = shared.lock_state();
-        state.reports.push_back(data);
-        if state.reports.len() > MAX_QUEUED_REPORTS {
-            state.reports.pop_front();
-        }
-        std::mem::take(&mut state.wakers)
-    };
-    // Wake outside the lock so no executor code ever runs while it is held.
-    for waker in wakers {
-        waker.wake();
-    }
+    shared.queue.push(data);
 }
 
 /// `IOHIDCallback` for device removal: flags the disconnect, wakes readers
@@ -551,17 +536,10 @@ unsafe extern "C" fn removal_callback(
 ) {
     // SAFETY: see input_report_callback.
     let shared = &*(context as *const Shared);
-    let wakers = {
-        let mut state = shared.lock_state();
-        state.disconnected = true;
-        if state.run_loop != 0 {
-            CFRunLoopStop(state.run_loop as CFRunLoopRef);
-        }
-        std::mem::take(&mut state.wakers)
-    };
-    // Wake outside the lock so no executor code ever runs while it is held.
-    for waker in wakers {
-        waker.wake();
+    shared.queue.set_disconnected();
+    let thread = shared.lock_thread();
+    if thread.run_loop != 0 {
+        CFRunLoopStop(thread.run_loop as CFRunLoopRef);
     }
 }
 
@@ -601,28 +579,24 @@ fn read_thread(device: usize, mode: usize, shared: Arc<Shared>) {
         CFRunLoopAddSource(run_loop, keepalive, mode);
 
         {
-            let mut state = shared.lock_state();
-            state.run_loop = run_loop as usize;
-            state.ready = true;
+            let mut thread = shared.lock_thread();
+            thread.run_loop = run_loop as usize;
+            thread.ready = true;
             shared.ready_cond.notify_all();
         }
         loop {
-            {
-                let state = shared.lock_state();
-                if state.shutdown || state.disconnected {
-                    break;
-                }
+            if shared.queue.is_shutdown() || shared.queue.is_disconnected() {
+                break;
             }
             // Pump the private mode in long slices; the loop is broken by
             // CFRunLoopStop on close/removal (-> Stopped). The keep-alive source
             // above prevents a transiently-empty mode from returning Finished.
             let code = CFRunLoopRunInMode(mode, 1000.0, 0);
             if code == kCFRunLoopRunFinished || code == kCFRunLoopRunStopped {
-                let mut state = shared.lock_state();
-                if !state.shutdown {
+                if !shared.queue.is_shutdown() {
                     // The run loop died without an orderly close: treat it as
                     // a disconnect, as hidapi does.
-                    state.disconnected = true;
+                    shared.queue.set_disconnected();
                 }
                 break;
             }
@@ -632,19 +606,13 @@ fn read_thread(device: usize, mode: usize, shared: Arc<Shared>) {
         CFRunLoopRemoveSource(run_loop, keepalive, mode);
         CFRelease(keepalive as CFTypeRef);
 
+        // This thread's run loop is ending; clear the stored pointer so a
+        // later `Drop` doesn't `CFRunLoopStop` an address CoreFoundation may
+        // have already reused for another device's read thread.
+        shared.lock_thread().run_loop = 0;
         // Wake any pending read_async futures: the run loop may have died
         // without the removal callback firing.
-        let wakers = {
-            let mut state = shared.lock_state();
-            // This thread's run loop is ending; clear the stored pointer so a
-            // later `Drop` doesn't `CFRunLoopStop` an address CoreFoundation may
-            // have already reused for another device's read thread.
-            state.run_loop = 0;
-            std::mem::take(&mut state.wakers)
-        };
-        for waker in wakers {
-            waker.wake();
-        }
+        shared.queue.wake_parked();
     }
 }
 
@@ -716,7 +684,7 @@ impl MacDevice {
                 kCFStringEncodingUTF8,
             );
 
-            let shared = Arc::new(Shared::default());
+            let shared = Arc::new(Shared::new());
             // Valid for the callbacks' whole lifetime: Drop unregisters them
             // before `shared` is dropped.
             let context = Arc::as_ptr(&shared) as *mut c_void;
@@ -760,11 +728,11 @@ impl MacDevice {
             // Wait for the read thread to schedule the device (hidapi's
             // barrier).
             {
-                let mut state = shared.lock_state();
-                while !state.ready {
-                    state = shared
+                let mut thread = shared.lock_thread();
+                while !thread.ready {
+                    thread = shared
                         .ready_cond
-                        .wait(state)
+                        .wait(thread)
                         .unwrap_or_else(PoisonError::into_inner);
                 }
             }
@@ -782,7 +750,7 @@ impl MacDevice {
     }
 
     fn disconnected(&self) -> bool {
-        self.shared.lock_state().disconnected
+        self.shared.queue.is_disconnected()
     }
 
     /// Common implementation of `write` and `send_feature_report`
@@ -945,10 +913,8 @@ impl Drop for MacDevice {
         // read thread is joined before the device/mode refs are released, and
         // the input buffer is freed only after IOKit can no longer write it.
         unsafe {
-            let (disconnected, run_loop) = {
-                let state = self.shared.lock_state();
-                (state.disconnected, state.run_loop)
-            };
+            let disconnected = self.shared.queue.is_disconnected();
+            let run_loop = self.shared.lock_thread().run_loop;
             let context = Arc::as_ptr(&self.shared) as *mut c_void;
             if !disconnected {
                 // Disconnect the callbacks and move the device off the read
@@ -974,10 +940,7 @@ impl Drop for MacDevice {
                     );
                 }
             }
-            {
-                let mut state = self.shared.lock_state();
-                state.shutdown = true;
-            }
+            self.shared.queue.set_shutdown();
             if run_loop != 0 {
                 CFRunLoopStop(run_loop as CFRunLoopRef);
                 CFRunLoopWakeUp(run_loop as CFRunLoopRef);
@@ -1003,7 +966,7 @@ impl Drop for MacDevice {
 /// Cancel-safe: a report is only popped from the queue inside `poll`, so
 /// dropping the future before completion loses nothing, the report stays
 /// queued for the next read. A waker left behind by a dropped future causes
-/// at most one spurious wake-up; the callbacks drain the whole waker list on
+/// at most one spurious wake-up; the queue drains its whole waker list on
 /// every wake, so stale entries never accumulate.
 pub(crate) struct ReadAsync<'a> {
     dev: &'a MacDevice,
@@ -1018,33 +981,7 @@ impl std::future::Future for ReadAsync<'_> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let this = self.get_mut();
-        if this.buf.is_empty() {
-            return std::task::Poll::Ready(Err(HidError::InvalidData {
-                message: "read buffer must not be empty".into(),
-            }));
-        }
-        let mut state = this.dev.shared.lock_state();
-        if let Some(report) = state.reports.pop_front() {
-            let len = report.len().min(this.buf.len());
-            this.buf[..len].copy_from_slice(&report[..len]);
-            return std::task::Poll::Ready(Ok(len));
-        }
-        // Queue drained: a disconnect now means no data will ever come.
-        if state.disconnected {
-            return std::task::Poll::Ready(Err(HidError::Disconnected));
-        }
-        if state.shutdown {
-            return std::task::Poll::Ready(Err(HidError::backend(
-                "device read thread is shut down",
-            )));
-        }
-        // Registering under the same lock the callbacks take closes the gap
-        // between the checks above and the registration: no report or
-        // disconnect can slip in unobserved.
-        if !state.wakers.iter().any(|w| w.will_wake(cx.waker())) {
-            state.wakers.push(cx.waker().clone());
-        }
-        std::task::Poll::Pending
+        this.dev.shared.queue.poll_read(this.buf, cx)
     }
 }
 

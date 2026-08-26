@@ -111,6 +111,14 @@ pub(crate) trait HidDeviceBackend: Send + Sync {
     fn get_device_info(&self) -> HidResult<DeviceInfo>;
 }
 
+// Shared by the backends whose input reports arrive on a producer thread
+// (macOS and nusb); see the module docs for why Windows and hidraw do not.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "nusb", target_os = "macos")
+))]
+pub(crate) mod queue;
+
 // The WebHID backend on wasm. It does not implement the traits above (WebHID
 // is async and permission-gated, so the `web` module in lib.rs drives it
 // directly), but it belongs here as a backend.

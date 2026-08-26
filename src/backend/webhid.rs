@@ -535,12 +535,16 @@ impl WebHidDevice {
             } else {
                 data
             };
-            let mut state = shared.borrow_mut();
-            if state.queue.len() >= INPUT_QUEUE_CAPACITY {
-                state.queue.pop_front();
-            }
-            state.queue.push_back(report);
-            if let Some(waker) = state.waker.take() {
+            let wakers = {
+                let mut state = shared.borrow_mut();
+                if state.queue.len() >= INPUT_QUEUE_CAPACITY {
+                    state.queue.pop_front();
+                }
+                state.queue.push_back(report);
+                core::mem::take(&mut state.wakers)
+            };
+            // Wake outside the borrow: a woken task may poll straight back in.
+            for waker in wakers {
                 waker.wake();
             }
         }) as Box<dyn FnMut(web_sys::Event)>);
@@ -584,10 +588,18 @@ impl WebHidDevice {
 
 // --- input report stream ------------------------------------------------------
 
+/// The wasm counterpart of the native [`ReportQueue`](super::queue::ReportQueue).
+/// It cannot share that type: `WebHID` is single-threaded, so this is an
+/// `Rc<RefCell<..>>` rather than an `Arc<Mutex<..>>`, and there is no producer
+/// thread to disconnect or shut down, only an event listener that the stream
+/// owns and drops.
 #[derive(Default)]
 struct StreamState {
     queue: VecDeque<Vec<u8>>,
-    waker: Option<Waker>,
+    /// Tasks parked on an empty queue, deduplicated via [`Waker::will_wake`]
+    /// and drained on every push, matching the native queue. A single
+    /// `Option<Waker>` would silently drop one of two concurrent readers.
+    wakers: Vec<Waker>,
 }
 
 /// A buffered reader over `inputreport` events, created by
@@ -613,10 +625,7 @@ impl core::fmt::Debug for InputReportStream {
 impl InputReportStream {
     /// Wait for the next input report (`hid_read` in blocking mode).
     pub async fn read(&mut self) -> HidResult<Vec<u8>> {
-        ReadFuture {
-            state: self.state.clone(),
-        }
-        .await
+        self.next_report().await
     }
 
     /// Pop a buffered report without waiting (`hid_read` in non-blocking
@@ -649,7 +658,9 @@ impl Future for ReadFuture {
         match state.queue.pop_front() {
             Some(report) => Poll::Ready(Ok(report)),
             None => {
-                state.waker = Some(cx.waker().clone());
+                if !state.wakers.iter().any(|w| w.will_wake(cx.waker())) {
+                    state.wakers.push(cx.waker().clone());
+                }
                 Poll::Pending
             }
         }

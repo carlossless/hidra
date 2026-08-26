@@ -30,13 +30,11 @@
 //!
 //! [nusb]: https://docs.rs/nusb
 
-use std::collections::VecDeque;
 use std::future::Future;
 use std::num::NonZeroU8;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -46,6 +44,7 @@ use nusb::transfer::{
 };
 use nusb::{Endpoint, Interface, MaybeFuture};
 
+use super::queue::ReportQueue;
 use super::{HidBackend, HidDeviceBackend};
 use crate::descriptor::{ReportDescriptor, ReportKind};
 use crate::error::{HidError, HidResult};
@@ -69,8 +68,6 @@ const REPORT_TYPE_FEATURE: u16 = 3;
 const CONTROL_TIMEOUT: Duration = Duration::from_millis(1000);
 /// How often the reader thread re-checks the shutdown flag while idle.
 const READER_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// hidapi drops the oldest queued input report beyond 30.
-const MAX_QUEUED_REPORTS: usize = 30;
 /// The string-descriptor language hidapi requests.
 const US_ENGLISH: u16 = 0x0409;
 
@@ -322,86 +319,6 @@ impl HidBackend for NusbApi {
 
 // --- device handle ---------------------------------------------------------------
 
-/// Input state guarded by the [`Shared`] mutex.
-#[derive(Default)]
-struct InputQueue {
-    /// Completed input reports, oldest first, capped at
-    /// [`MAX_QUEUED_REPORTS`].
-    reports: VecDeque<Vec<u8>>,
-    /// Tasks parked in [`Shared::poll_read`] on an empty queue, deduplicated
-    /// via [`Waker::will_wake`]. Drained (and woken, after the lock is
-    /// released) whenever a report is queued or the reader exits.
-    wakers: Vec<Waker>,
-}
-
-/// State shared between the device handle and its reader thread.
-#[derive(Default)]
-struct Shared {
-    queue: Mutex<InputQueue>,
-    /// Reader thread has exited (or must exit).
-    shutdown: AtomicBool,
-    /// The device is gone; reads fail once the queue drains.
-    disconnected: AtomicBool,
-}
-
-impl Shared {
-    /// Queue a completed report, dropping the oldest beyond the cap, and
-    /// wake every parked reader.
-    fn push_report(&self, report: Vec<u8>) {
-        let mut input = self.queue.lock().unwrap();
-        if input.reports.len() >= MAX_QUEUED_REPORTS {
-            input.reports.pop_front(); // drop the oldest, like hidapi
-        }
-        input.reports.push_back(report);
-        let wakers = std::mem::take(&mut input.wakers);
-        drop(input);
-        for waker in wakers {
-            waker.wake();
-        }
-    }
-
-    /// Wake every parked reader without queueing data; called after the
-    /// disconnect/shutdown flags change so waiters re-check them.
-    fn wake_readers(&self) {
-        let wakers = std::mem::take(&mut self.queue.lock().unwrap().wakers);
-        for waker in wakers {
-            waker.wake();
-        }
-    }
-
-    /// Pop-or-park core of [`NusbDevice::read_async`]: copy one queued
-    /// report into `buf`, fail once the device is gone and the queue has
-    /// drained, or park the task's waker on the queue.
-    ///
-    /// The flag checks and the waker registration happen under the queue
-    /// lock, and the reader thread sets the flags before taking that lock,
-    /// so a parked waker is never missed.
-    fn poll_read(&self, buf: &mut [u8], cx: &mut Context<'_>) -> Poll<HidResult<usize>> {
-        if buf.is_empty() {
-            return Poll::Ready(Err(HidError::InvalidData {
-                message: "read buffer must not be empty".into(),
-            }));
-        }
-        let mut input = self.queue.lock().unwrap();
-        if let Some(report) = input.reports.pop_front() {
-            let len = report.len().min(buf.len());
-            buf[..len].copy_from_slice(&report[..len]);
-            return Poll::Ready(Ok(len));
-        }
-        // Queued reports drain even after a disconnect, like hidapi.
-        if self.disconnected.load(Ordering::SeqCst) {
-            return Poll::Ready(Err(HidError::Disconnected));
-        }
-        if self.shutdown.load(Ordering::SeqCst) {
-            return Poll::Ready(Err(HidError::backend("USB reader thread terminated")));
-        }
-        if !input.wakers.iter().any(|w| w.will_wake(cx.waker())) {
-            input.wakers.push(cx.waker().clone());
-        }
-        Poll::Pending
-    }
-}
-
 /// An open USB HID interface; the platform device behind
 /// [`crate::HidDevice`] when the `nusb` feature is enabled.
 ///
@@ -419,7 +336,7 @@ pub(crate) struct NusbDevice {
     report_descriptor: Vec<u8>,
     /// Interrupt OUT endpoint; writes fall back to `SET_REPORT` without one.
     out_endpoint: Option<Mutex<Endpoint<Interrupt, Out>>>,
-    shared: Arc<Shared>,
+    queue: Arc<ReportQueue>,
     /// Interrupt IN reader thread; absent on interfaces with no such endpoint,
     /// which support only the control-transfer report calls.
     reader: Option<JoinHandle<()>>,
@@ -507,14 +424,14 @@ impl NusbDevice {
             info.usage = usage;
         }
 
-        let shared = Arc::new(Shared::default());
+        let queue = Arc::new(ReportQueue::new("USB reader thread terminated"));
         let reader = match in_endpoint {
             Some(in_endpoint) => {
-                let shared = Arc::clone(&shared);
+                let queue = Arc::clone(&queue);
                 Some(
                     std::thread::Builder::new()
                         .name("hidra-usb-read".into())
-                        .spawn(move || reader_loop(in_endpoint, shared, transfer_len))
+                        .spawn(move || reader_loop(in_endpoint, queue, transfer_len))
                         .map_err(|e| HidError::io("spawning USB reader thread", e))?,
                 )
             }
@@ -522,7 +439,7 @@ impl NusbDevice {
                 // Nothing will ever queue an input report, so mark the queue shut
                 // down at open time: reads then fail like a departed reader
                 // thread instead of parking forever.
-                shared.shutdown.store(true, Ordering::SeqCst);
+                queue.set_shutdown();
                 None
             }
         };
@@ -534,7 +451,7 @@ impl NusbDevice {
             info,
             report_descriptor,
             out_endpoint,
-            shared,
+            queue,
             reader,
         })
     }
@@ -645,7 +562,7 @@ impl HidDeviceBackend for NusbDevice {
         buf: &'a mut [u8],
     ) -> impl Future<Output = HidResult<usize>> + Send + 'a {
         ReadAsync {
-            shared: &self.shared,
+            queue: &self.queue,
             buf,
         }
     }
@@ -743,8 +660,7 @@ impl HidDeviceBackend for NusbDevice {
 
 impl Drop for NusbDevice {
     fn drop(&mut self) {
-        self.shared.shutdown.store(true, Ordering::SeqCst);
-        self.shared.wake_readers();
+        self.queue.set_shutdown();
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
@@ -757,7 +673,7 @@ impl Drop for NusbDevice {
 /// [`Future::poll`], so dropping the future before completion leaves any
 /// pending report queued for the next read.
 struct ReadAsync<'a> {
-    shared: &'a Shared,
+    queue: &'a ReportQueue,
     buf: &'a mut [u8],
 }
 
@@ -766,16 +682,20 @@ impl Future for ReadAsync<'_> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        this.shared.poll_read(this.buf, cx)
+        this.queue.poll_read(this.buf, cx)
     }
 }
 
 /// Reader thread: keeps one interrupt IN transfer pending and queues
 /// completed reports, mirroring hidapi's `read_callback` loop.
-fn reader_loop(mut endpoint: Endpoint<Interrupt, In>, shared: Arc<Shared>, transfer_len: usize) {
+fn reader_loop(
+    mut endpoint: Endpoint<Interrupt, In>,
+    queue: Arc<ReportQueue>,
+    transfer_len: usize,
+) {
     let buf = endpoint.allocate(transfer_len);
     endpoint.submit(buf);
-    while !shared.shutdown.load(Ordering::SeqCst) {
+    while !queue.is_shutdown() {
         let Some(completion) = endpoint.wait_next_complete(READER_POLL_INTERVAL) else {
             continue; // idle; re-check the shutdown flag
         };
@@ -783,13 +703,12 @@ fn reader_loop(mut endpoint: Endpoint<Interrupt, In>, shared: Arc<Shared>, trans
             Ok(()) => {
                 let len = completion.actual_len.min(completion.buffer.len());
                 if len > 0 {
-                    shared.push_report(completion.buffer[..len].to_vec());
+                    queue.push(completion.buffer[..len].to_vec());
                 }
                 endpoint.submit(completion.buffer);
             }
             Err(TransferError::Disconnected) => {
-                shared.disconnected.store(true, Ordering::SeqCst);
-                shared.wake_readers();
+                queue.set_disconnected();
                 break;
             }
             Err(TransferError::Cancelled) => break,
@@ -807,8 +726,7 @@ fn reader_loop(mut endpoint: Endpoint<Interrupt, In>, shared: Arc<Shared>, trans
             break;
         }
     }
-    shared.shutdown.store(true, Ordering::SeqCst);
-    shared.wake_readers();
+    queue.set_shutdown();
 }
 
 #[cfg(test)]
@@ -857,119 +775,6 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<NusbApi>();
         assert_send_sync::<NusbDevice>();
-    }
-
-    /// Drive `Shared::poll_read` as a future, as `read_async` does.
-    fn block_on_read(shared: &Shared, buf: &mut [u8]) -> HidResult<usize> {
-        crate::maybe_future::block_on(std::future::poll_fn(|cx| shared.poll_read(buf, cx)))
-    }
-
-    #[test]
-    fn poll_read_pops_queued_reports_with_truncation() {
-        let shared = Shared::default();
-        shared.push_report(vec![1, 2, 3, 4]);
-        shared.push_report(vec![5]);
-        let mut buf = [0u8; 3];
-        // Same truncation semantics as the sync path: excess bytes are lost.
-        assert_eq!(block_on_read(&shared, &mut buf).unwrap(), 3);
-        assert_eq!(buf, [1, 2, 3]);
-        assert_eq!(block_on_read(&shared, &mut buf).unwrap(), 1);
-        assert_eq!(buf[0], 5);
-    }
-
-    #[test]
-    fn poll_read_rejects_empty_buffer() {
-        let shared = Shared::default();
-        shared.push_report(vec![1]);
-        let err = block_on_read(&shared, &mut []).unwrap_err();
-        assert!(matches!(err, HidError::InvalidData { .. }));
-        // The queued report must not have been consumed.
-        assert_eq!(shared.queue.lock().unwrap().reports.len(), 1);
-    }
-
-    #[test]
-    fn poll_read_drains_queue_before_reporting_disconnect() {
-        let shared = Shared::default();
-        shared.push_report(vec![9]);
-        shared.disconnected.store(true, Ordering::SeqCst);
-        let mut buf = [0u8; 4];
-        assert_eq!(block_on_read(&shared, &mut buf).unwrap(), 1);
-        let err = block_on_read(&shared, &mut buf).unwrap_err();
-        assert!(matches!(err, HidError::Disconnected));
-    }
-
-    #[test]
-    fn poll_read_fails_fast_when_shut_down_at_open() {
-        // What `open` does for an interface with no interrupt IN endpoint: no
-        // reader thread exists, so reads must error rather than park forever.
-        let shared = Shared::default();
-        shared.shutdown.store(true, Ordering::SeqCst);
-        let mut buf = [0u8; 4];
-        let err = block_on_read(&shared, &mut buf).unwrap_err();
-        assert!(matches!(err, HidError::Backend { .. }));
-    }
-
-    #[test]
-    fn poll_read_parks_until_a_report_is_pushed() {
-        let shared = Arc::new(Shared::default());
-        let pusher = {
-            let shared = Arc::clone(&shared);
-            std::thread::spawn(move || {
-                // Give the main thread a chance to park its waker first.
-                while shared.queue.lock().unwrap().wakers.is_empty() {
-                    std::thread::yield_now();
-                }
-                shared.push_report(vec![7, 8]);
-            })
-        };
-        let mut buf = [0u8; 4];
-        assert_eq!(block_on_read(&shared, &mut buf).unwrap(), 2);
-        assert_eq!(buf[..2], [7, 8]);
-        pusher.join().unwrap();
-    }
-
-    #[test]
-    fn poll_read_parks_until_disconnect_is_flagged() {
-        let shared = Arc::new(Shared::default());
-        let disconnector = {
-            let shared = Arc::clone(&shared);
-            std::thread::spawn(move || {
-                while shared.queue.lock().unwrap().wakers.is_empty() {
-                    std::thread::yield_now();
-                }
-                // Same order as the reader thread: flag first, then wake.
-                shared.disconnected.store(true, Ordering::SeqCst);
-                shared.wake_readers();
-            })
-        };
-        let mut buf = [0u8; 4];
-        let err = block_on_read(&shared, &mut buf).unwrap_err();
-        assert!(matches!(err, HidError::Disconnected));
-        disconnector.join().unwrap();
-    }
-
-    #[test]
-    fn poll_read_dedups_wakers_of_the_same_task() {
-        struct CountingWaker(std::sync::atomic::AtomicUsize);
-        impl std::task::Wake for CountingWaker {
-            fn wake(self: Arc<Self>) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        let shared = Shared::default();
-        let counter = Arc::new(CountingWaker(std::sync::atomic::AtomicUsize::new(0)));
-        let waker = Waker::from(Arc::clone(&counter));
-        let mut cx = Context::from_waker(&waker);
-        let mut buf = [0u8; 4];
-        // Re-polling the same task must not pile up waker clones.
-        assert!(shared.poll_read(&mut buf, &mut cx).is_pending());
-        assert!(shared.poll_read(&mut buf, &mut cx).is_pending());
-        assert_eq!(shared.queue.lock().unwrap().wakers.len(), 1);
-        // A pushed report drains the parked waker and wakes it exactly once.
-        shared.push_report(vec![1]);
-        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
-        assert!(shared.queue.lock().unwrap().wakers.is_empty());
     }
 
     #[test]

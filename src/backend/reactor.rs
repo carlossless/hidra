@@ -50,6 +50,16 @@ impl Reactor {
         self.nudge();
     }
 
+    /// Forget any interest in `fd`, without waking what was parked on it.
+    ///
+    /// Called when a device is closing: registrations are keyed by fd number,
+    /// so a stale entry would otherwise still be in the interest set when the
+    /// kernel hands that number to the next `open`.
+    pub(crate) fn deregister(&self, fd: RawFd) {
+        self.interests.lock().unwrap().remove(&fd);
+        self.nudge();
+    }
+
     /// Interrupt the poll loop so it picks up interest-set changes.
     fn nudge(&self) {
         let one: u64 = 1;

@@ -45,7 +45,7 @@ use nusb::transfer::{
 use nusb::{Endpoint, Interface, MaybeFuture};
 
 use super::queue::ReportQueue;
-use super::{HidBackend, HidDeviceBackend};
+use super::{payload_after_report_id, HidBackend, HidDeviceBackend};
 use crate::descriptor::{ReportDescriptor, ReportKind};
 use crate::error::{HidError, HidResult};
 use crate::{BusType, DeviceInfo, MAX_REPORT_DESCRIPTOR_SIZE};
@@ -64,8 +64,9 @@ const HID_SET_REPORT: u8 = 0x09;
 const REPORT_TYPE_INPUT: u16 = 1;
 const REPORT_TYPE_OUTPUT: u16 = 2;
 const REPORT_TYPE_FEATURE: u16 = 3;
-/// hidapi uses a fixed 1000 ms timeout for all control transfers and writes.
-const CONTROL_TIMEOUT: Duration = Duration::from_millis(1000);
+/// hidapi uses a fixed 1000 ms timeout for every transfer it issues, control
+/// and interrupt OUT alike.
+const TRANSFER_TIMEOUT: Duration = Duration::from_millis(1000);
 /// How often the reader thread re-checks the shutdown flag while idle.
 const READER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// The string-descriptor language hidapi requests.
@@ -157,7 +158,7 @@ fn read_report_descriptor(interface: &Interface) -> Option<Vec<u8>> {
     let mut data = interface
         .control_in(
             report_descriptor_request(interface_number, length),
-            CONTROL_TIMEOUT,
+            TRANSFER_TIMEOUT,
         )
         .wait()
         .ok()
@@ -181,7 +182,7 @@ fn read_report_descriptor_unclaimed(
     let mut data = device
         .control_in(
             report_descriptor_request(interface_number, length),
-            CONTROL_TIMEOUT,
+            TRANSFER_TIMEOUT,
         )
         .wait()
         .ok()
@@ -216,16 +217,14 @@ fn transfer_length(max_input_wire: usize, max_packet_size: usize) -> usize {
 /// Entry point for the USB backend; the platform backend behind
 /// [`crate::Hidra`] when the `nusb` feature is enabled. See the
 /// [module docs](self) for when to prefer it.
-pub(crate) struct NusbApi {
-    _private: (),
-}
+pub(crate) struct NusbApi;
 
 impl HidBackend for NusbApi {
     type Device = NusbDevice;
 
     /// Initialize the backend.
     fn new() -> HidResult<Self> {
-        Ok(NusbApi { _private: () })
+        Ok(NusbApi)
     }
 
     /// Enumerate connected USB HID interfaces. `vendor_id`/`product_id` of 0
@@ -466,7 +465,7 @@ impl NusbDevice {
                     index: u16::from(self.interface_number),
                     length,
                 },
-                CONTROL_TIMEOUT,
+                TRANSFER_TIMEOUT,
             )
             .wait()
             .map_err(|e| transfer_error(operation, e))?;
@@ -488,12 +487,12 @@ impl HidDeviceBackend for NusbDevice {
             });
         }
         let report_number = data[0];
-        let payload = if report_number == 0 { &data[1..] } else { data };
+        let payload = payload_after_report_id(data);
         match &self.out_endpoint {
             Some(endpoint) => {
                 let mut endpoint = endpoint.lock().unwrap();
                 let completion =
-                    endpoint.transfer_blocking(payload.to_vec().into(), CONTROL_TIMEOUT);
+                    endpoint.transfer_blocking(payload.to_vec().into(), TRANSFER_TIMEOUT);
                 match completion.status {
                     // Report the caller's original length (report-ID byte
                     // included), matching the documented contract, hidapi, and
@@ -517,7 +516,7 @@ impl HidDeviceBackend for NusbDevice {
                             index: u16::from(self.interface_number),
                             data: payload,
                         },
-                        CONTROL_TIMEOUT,
+                        TRANSFER_TIMEOUT,
                     )
                     .wait()
                     .map_err(|e| transfer_error("SET_REPORT (output)", e))?;
@@ -558,7 +557,7 @@ impl HidDeviceBackend for NusbDevice {
             });
         }
         let report_number = data[0];
-        let payload = if report_number == 0 { &data[1..] } else { data };
+        let payload = payload_after_report_id(data);
         self.interface
             .control_out(
                 ControlOut {
@@ -569,7 +568,7 @@ impl HidDeviceBackend for NusbDevice {
                     index: u16::from(self.interface_number),
                     data: payload,
                 },
-                CONTROL_TIMEOUT,
+                TRANSFER_TIMEOUT,
             )
             .wait()
             .map_err(|e| transfer_error("SET_REPORT (feature)", e))?;
@@ -611,7 +610,7 @@ impl HidDeviceBackend for NusbDevice {
             })?;
         let s = self
             .device
-            .get_string_descriptor(index, US_ENGLISH, CONTROL_TIMEOUT)
+            .get_string_descriptor(index, US_ENGLISH, TRANSFER_TIMEOUT)
             .wait()
             .map_err(|e| match e {
                 nusb::GetDescriptorError::Transfer(TransferError::Disconnected) => {

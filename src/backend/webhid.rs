@@ -34,7 +34,7 @@
 //! # let _ = len; Ok(()) }
 //! ```
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
@@ -305,12 +305,22 @@ impl WebHidApi {
 #[derive(Debug, Clone)]
 pub(crate) struct WebHidDevice {
     device: web_sys::HidDevice,
+    /// `HIDDevice.collections` converted to Rust types, built on first use.
+    ///
+    /// The conversion walks the whole collection tree across the wasm-bindgen
+    /// boundary, and the tree is fixed for the life of the device (it is the
+    /// browser's parse of the report descriptor). `device_info`,
+    /// `start_reading` and `report_descriptor` each need it.
+    collections: Rc<OnceCell<Vec<CollectionInfo>>>,
 }
 
 impl WebHidDevice {
     /// Wrap a `web_sys::HidDevice` obtained elsewhere (e.g. from JS glue).
     pub(crate) fn from_raw(device: web_sys::HidDevice) -> Self {
-        WebHidDevice { device }
+        WebHidDevice {
+            device,
+            collections: Rc::new(OnceCell::new()),
+        }
     }
 
     /// The underlying `HIDDevice` object.
@@ -407,7 +417,7 @@ impl WebHidDevice {
         let product_id = self.product_id();
         let product = self.product_name();
         let (usage_page, usage) = self
-            .collections()
+            .collections_cached()
             .first()
             .map(|c| (c.usage_page, c.usage))
             .unwrap_or((0, 0));
@@ -521,7 +531,7 @@ impl WebHidDevice {
     pub(crate) fn start_reading(&self) -> InputReportStream {
         // Match the native read() convention: prefix the report ID byte only
         // when the device declares numbered reports.
-        let numbered = uses_report_ids(&self.collections());
+        let numbered = uses_report_ids(self.collections_cached());
         let state = Rc::new(RefCell::new(StreamState::default()));
         let shared = state.clone();
         let closure = Closure::wrap(Box::new(move |ev: web_sys::Event| {
@@ -558,11 +568,17 @@ impl WebHidDevice {
     /// The collection tree the browser parsed from the device's report
     /// descriptor (`HIDDevice.collections`), converted to plain Rust types.
     pub(crate) fn collections(&self) -> Vec<CollectionInfo> {
-        self.device
-            .collections()
-            .iter()
-            .map(|c| convert_collection(&c))
-            .collect()
+        self.collections_cached().clone()
+    }
+
+    fn collections_cached(&self) -> &Vec<CollectionInfo> {
+        self.collections.get_or_init(|| {
+            self.device
+                .collections()
+                .iter()
+                .map(|c| convert_collection(&c))
+                .collect()
+        })
     }
 
     /// Reconstruct the report descriptor from
@@ -574,7 +590,7 @@ impl WebHidDevice {
     /// [`reconstruct_descriptor`]: report IDs, sizes, flags and usages are
     /// preserved, exact byte layout is not.
     pub(crate) fn report_descriptor(&self) -> HidResult<Vec<u8>> {
-        Ok(reconstruct_descriptor(&self.collections()))
+        Ok(reconstruct_descriptor(self.collections_cached()))
     }
 
     /// Parsed report descriptor (hidra extension, matching the native

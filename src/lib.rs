@@ -419,9 +419,9 @@ mod web {
     use core::future::Future;
 
     use crate::backend::webhid::{
-        CollectionInfo, DeviceFilter, EventListenerHandle, InputReportStream, WebHidApi,
-        WebHidDevice,
+        DeviceFilter, EventListenerHandle, InputReportStream, WebHidApi, WebHidDevice,
     };
+    use crate::report_info::CollectionInfo;
     use crate::{DeviceInfo, HidResult};
 
     /// Entry point to the library, backed by `WebHID` (`navigator.hid`).

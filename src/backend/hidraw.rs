@@ -291,10 +291,14 @@ impl HidBackend for HidrawApi {
 
 pub(crate) struct HidrawDevice {
     fd: OwnedFd,
-    /// Canonical sysfs HID device directory, for metadata lookups.
-    sysfs_hid_dir: PathBuf,
-    /// `/dev/hidrawN`.
-    dev_path: String,
+    /// Metadata read from sysfs at open time.
+    ///
+    /// hidapi caches this the same way, as do the Windows and nusb backends.
+    /// Reading it per call meant `get_manufacturer_string`, `get_product_string`
+    /// and `get_serial_number_string` each re-walked sysfs *and* re-parsed the
+    /// whole report descriptor for one field. `None` when sysfs had nothing to
+    /// say, which `get_device_info` reports as it always did.
+    info: Option<DeviceInfo>,
 }
 
 impl HidrawDevice {
@@ -315,11 +319,10 @@ impl HidrawDevice {
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
         let sysfs_hid_dir = sysfs_dir_for_fd(fd.as_raw_fd())?;
-        Ok(HidrawDevice {
-            fd,
-            sysfs_hid_dir,
-            dev_path: path.to_string(),
-        })
+        // For multi-collection devices hidapi returns the first entry.
+        let info = device_infos(&sysfs_hid_dir, path)
+            .and_then(|mut i| (!i.is_empty()).then(|| i.remove(0)));
+        Ok(HidrawDevice { fd, info })
     }
 
     fn raw_fd(&self) -> RawFd {
@@ -511,10 +514,18 @@ impl HidDeviceBackend for HidrawDevice {
     }
 
     fn get_device_info(&self) -> HidResult<DeviceInfo> {
-        let mut infos = device_infos(&self.sysfs_hid_dir, &self.dev_path)
-            .ok_or_else(|| HidError::backend("failed to read device metadata from sysfs"))?;
-        // For multi-collection devices hidapi returns the first entry.
-        Ok(infos.remove(0))
+        self.info
+            .clone()
+            .ok_or_else(|| HidError::backend("failed to read device metadata from sysfs"))
+    }
+}
+
+impl Drop for HidrawDevice {
+    fn drop(&mut self) {
+        // Drop any reactor interest before `fd` closes. Interests are keyed by
+        // fd number, so leaving one behind would let a later `open` that
+        // recycles the number inherit this device's parked wakers.
+        super::reactor::Reactor::global().deregister(self.fd.as_raw_fd());
     }
 }
 
@@ -629,8 +640,7 @@ mod tests {
         let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
         let dev = HidrawDevice {
             fd: write_fd,
-            sysfs_hid_dir: PathBuf::new(),
-            dev_path: String::new(),
+            info: None,
         };
 
         let n = dev.write(&[0x00, 0xAA, 0xBB]).unwrap();

@@ -111,6 +111,25 @@ pub(crate) trait HidDeviceBackend: Send + Sync {
     fn get_device_info(&self) -> HidResult<DeviceInfo>;
 }
 
+/// Strip the leading report-ID byte when it is 0.
+///
+/// hidapi's convention is that `data[0]` is always the report ID, but a device
+/// without numbered reports never sees that byte on the wire: a 0 is a
+/// placeholder the transport drops, while a nonzero ID is transmitted as the
+/// first payload byte. The USB and `IOKit` backends both need this; hidraw
+/// does not, because the kernel consumes the byte itself.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "nusb", target_os = "macos")
+))]
+pub(crate) fn payload_after_report_id(data: &[u8]) -> &[u8] {
+    if data.first() == Some(&0) {
+        &data[1..]
+    } else {
+        data
+    }
+}
+
 // Shared by the backends whose input reports arrive on a producer thread
 // (macOS and nusb); see the module docs for why Windows and hidraw do not.
 #[cfg(all(

@@ -44,7 +44,7 @@ use core_foundation_sys::string::{
 };
 
 use super::queue::ReportQueue;
-use super::{HidBackend, HidDeviceBackend};
+use super::{payload_after_report_id, HidBackend, HidDeviceBackend};
 use crate::error::{HidError, HidResult};
 use crate::{BusType, DeviceInfo};
 
@@ -831,7 +831,7 @@ impl MacDevice {
             return Err(HidError::Disconnected);
         }
         let report_id = data[0];
-        let payload = if report_id == 0 { &data[1..] } else { data };
+        let payload = payload_after_report_id(data);
         // SAFETY: payload outlives the synchronous call.
         let ret = unsafe {
             IOHIDDeviceSetReport(

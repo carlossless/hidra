@@ -343,7 +343,8 @@ unsafe fn device_infos(device: IOHIDDeviceRef) -> Vec<DeviceInfo> {
             .unwrap_or(BusType::Unknown),
     };
 
-    let mut entries = vec![info.clone()];
+    // The primary pair leads, then every other pair the device declares.
+    let mut usages = vec![(info.usage_page, info.usage)];
 
     let pairs = device_property(device, KEY_DEVICE_USAGE_PAIRS);
     if !pairs.is_null() && CFGetTypeID(pairs) == CFArrayGetTypeID() {
@@ -361,20 +362,16 @@ unsafe fn device_infos(device: IOHIDDeviceRef) -> Vec<DeviceInfo> {
             let (Some(page), Some(usage)) = (page, usage) else {
                 continue;
             };
-            let (page, usage) = (page as u16, usage as u16);
-            if page == info.usage_page && usage == info.usage {
-                continue; // primary pair, already added
+            let pair = (page as u16, usage as u16);
+            if !usages.contains(&pair) {
+                usages.push(pair);
             }
-            let mut entry = info.clone();
-            entry.usage_page = page;
-            entry.usage = usage;
-            entries.push(entry);
         }
         CFRelease(page_key as CFTypeRef);
         CFRelease(usage_key as CFTypeRef);
     }
 
-    entries
+    info.per_usage(&usages)
 }
 
 // --- backend API -----------------------------------------------------------------
@@ -440,13 +437,11 @@ impl HidBackend for MacApi {
                 if device.is_null() {
                     continue;
                 }
-                for info in device_infos(device as IOHIDDeviceRef) {
-                    let vid_ok = vendor_id == 0 || info.vendor_id == vendor_id;
-                    let pid_ok = product_id == 0 || info.product_id == product_id;
-                    if vid_ok && pid_ok {
-                        result.push(info);
-                    }
-                }
+                result.extend(
+                    device_infos(device as IOHIDDeviceRef)
+                        .into_iter()
+                        .filter(|info| info.matches(vendor_id, product_id)),
+                );
             }
             CFRelease(set as CFTypeRef);
             CFRelease(manager as CFTypeRef);

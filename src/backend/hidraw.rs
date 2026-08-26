@@ -238,22 +238,7 @@ fn device_infos(hid_dev_dir: &Path, dev_path: &str) -> Option<Vec<DeviceInfo>> {
         .map(|d| d.top_level_usages())
         .unwrap_or_default();
 
-    let mut entries = Vec::with_capacity(usages.len().max(1));
-    match usages.as_slice() {
-        [] => entries.push(info),
-        [first @ .., last] => {
-            for &(page, usage) in first {
-                let mut e = info.clone();
-                e.usage_page = page;
-                e.usage = usage;
-                entries.push(e);
-            }
-            info.usage_page = last.0;
-            info.usage = last.1;
-            entries.push(info);
-        }
-    }
-    Some(entries)
+    Some(info.per_usage(&usages))
 }
 
 // --- backend API -------------------------------------------------------------
@@ -288,13 +273,11 @@ impl HidBackend for HidrawApi {
             let Some(infos) = device_infos(&hid_dev_dir, &dev_path) else {
                 continue;
             };
-            for info in infos {
-                let vid_ok = vendor_id == 0 || info.vendor_id == vendor_id;
-                let pid_ok = product_id == 0 || info.product_id == product_id;
-                if vid_ok && pid_ok {
-                    result.push(info);
-                }
-            }
+            result.extend(
+                infos
+                    .into_iter()
+                    .filter(|info| info.matches(vendor_id, product_id)),
+            );
         }
         Ok(result)
     }

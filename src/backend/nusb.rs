@@ -116,25 +116,6 @@ fn device_info(dev: &nusb::DeviceInfo, interface_number: u8) -> DeviceInfo {
     }
 }
 
-/// Append one `DeviceInfo` per top-level usage pair, like hidapi. With no
-/// readable descriptor a single entry with usage 0/0 is emitted.
-fn push_usage_entries(mut info: DeviceInfo, usages: &[(u16, u16)], out: &mut Vec<DeviceInfo>) {
-    match usages {
-        [] => out.push(info),
-        [first @ .., last] => {
-            for &(page, usage) in first {
-                let mut e = info.clone();
-                e.usage_page = page;
-                e.usage = usage;
-                out.push(e);
-            }
-            info.usage_page = last.0;
-            info.usage = last.1;
-            out.push(info);
-        }
-    }
-}
-
 /// `bDescriptorType` of the HID class descriptor inside an interface.
 const DESCRIPTOR_TYPE_HID: u8 = 0x21;
 
@@ -271,30 +252,31 @@ impl HidBackend for NusbApi {
         };
         let mut result = Vec::new();
         for dev in devices {
-            let vid_ok = vendor_id == 0 || dev.vendor_id() == vendor_id;
-            let pid_ok = product_id == 0 || dev.product_id() == product_id;
-            if !vid_ok || !pid_ok {
-                continue;
-            }
-            let hid_interfaces: Vec<u8> = dev
+            // `device_info` reads cached descriptors only, so the filter runs
+            // before anything is opened: a device nobody asked for is never
+            // touched.
+            let wanted: Vec<(u8, DeviceInfo)> = dev
                 .interfaces()
                 .filter(|i| i.class() == USB_CLASS_HID)
-                .map(|i| i.interface_number())
+                .map(|i| {
+                    let number = i.interface_number();
+                    (number, device_info(&dev, number))
+                })
+                .filter(|(_, info)| info.matches(vendor_id, product_id))
                 .collect();
-            if hid_interfaces.is_empty() {
+            if wanted.is_empty() {
                 continue;
             }
             // Opening does not claim any interface, so this is non-invasive.
             let opened = dev.open().wait().ok();
-            for interface_number in hid_interfaces {
-                let info = device_info(&dev, interface_number);
+            for (interface_number, info) in wanted {
                 let usages = opened
                     .as_ref()
                     .and_then(|d| read_report_descriptor_unclaimed(d, interface_number))
                     .and_then(|bytes| ReportDescriptor::parse(&bytes).ok())
                     .map(|d| d.top_level_usages())
                     .unwrap_or_default();
-                push_usage_entries(info, &usages, &mut result);
+                result.extend(info.per_usage(&usages));
             }
         }
         Ok(result)

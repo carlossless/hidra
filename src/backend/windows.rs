@@ -537,9 +537,7 @@ impl HidBackend for WinApi {
             let bus_type = bus_type_for_devnode(list.0, &devinfo);
             let info = query_device_info(handle.raw(), &path, bus_type);
 
-            let vid_ok = vendor_id == 0 || info.vendor_id == vendor_id;
-            let pid_ok = product_id == 0 || info.product_id == product_id;
-            if vid_ok && pid_ok {
+            if info.matches(vendor_id, product_id) {
                 result.push(info);
             }
         }

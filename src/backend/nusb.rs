@@ -678,7 +678,7 @@ fn reader_loop(
     endpoint.submit(buf);
     while !queue.is_shutdown() {
         let Some(completion) = endpoint.wait_next_complete(READER_POLL_INTERVAL) else {
-            continue; // idle; re-check the shutdown flag
+            continue;
         };
         match completion.status {
             Ok(()) => {

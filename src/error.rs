@@ -103,7 +103,8 @@ impl HidError {
         HidError::Io { operation, source }
     }
 
-    // Not every backend needs this helper.
+    /// `HidError::io` with the current `errno` / `GetLastError`.
+    // Used by the hidraw and Windows backends; dead on macOS and under nusb.
     #[allow(dead_code)]
     pub(crate) fn last_os_error(operation: &'static str) -> Self {
         HidError::Io {

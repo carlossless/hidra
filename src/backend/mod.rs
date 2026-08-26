@@ -1,60 +1,146 @@
 //! Platform backend selection.
 //!
-//! Each native backend exposes two types with an identical inherent-method
-//! surface (a compile-time "trait"):
-//!
-//! ```text
-//! pub(crate) struct PlatformApi;
-//! impl PlatformApi {
-//!     pub fn new() -> HidResult<Self>;
-//!     /// vendor_id/product_id of 0 act as wildcards.
-//!     pub fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>>;
-//!     pub fn open(&self, vendor_id: u16, product_id: u16, serial: Option<&str>)
-//!         -> HidResult<PlatformDevice>;
-//!     pub fn open_path(&self, path: &str) -> HidResult<PlatformDevice>;
-//! }
-//!
-//! pub(crate) struct PlatformDevice;
-//! impl PlatformDevice {
-//!     pub fn write(&self, data: &[u8]) -> HidResult<usize>;
-//!     pub fn read(&self, buf: &mut [u8]) -> HidResult<usize>;
-//!     pub fn read_timeout(&self, buf: &mut [u8], timeout_ms: i32) -> HidResult<usize>;
-//!     /// Returns a Send future resolving with one input report; never 0.
-//!     pub fn read_async<'a>(&'a self, buf: &'a mut [u8])
-//!         -> impl Future<Output = HidResult<usize>> + Send + 'a;
-//!     pub fn set_blocking_mode(&self, blocking: bool) -> HidResult<()>;
-//!     pub fn send_feature_report(&self, data: &[u8]) -> HidResult<()>;
-//!     pub fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize>;
-//!     pub fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize>;
-//!     pub fn get_manufacturer_string(&self) -> HidResult<Option<String>>;
-//!     pub fn get_product_string(&self) -> HidResult<Option<String>>;
-//!     pub fn get_serial_number_string(&self) -> HidResult<Option<String>>;
-//!     pub fn get_indexed_string(&self, index: u32) -> HidResult<Option<String>>;
-//!     pub fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize>;
-//!     pub fn get_device_info(&self) -> HidResult<DeviceInfo>;
-//! }
-//! ```
-//!
-//! Semantics shared by all backends (hidapi parity):
-//!
-//! * `write` / `send_feature_report`: `data[0]` is the report ID; use 0 when
-//!   the device has no numbered reports. The ID byte counts toward the
-//!   returned length.
-//! * `read` / `read_timeout`: input reports are prefixed with their report ID
-//!   only when the device uses numbered reports. `timeout_ms < 0` blocks
-//!   forever, `0` polls.
-//! * `get_feature_report` / `get_input_report`: `buf[0]` must contain the
-//!   report ID on entry; on return the buffer starts with that ID.
-//! * In non-blocking mode, `read` returns `Ok(0)` when no report is queued.
-//! * `read_async` ignores the blocking mode, never resolves with `Ok(0)`,
-//!   fails with `HidError::Disconnected` on removal, and must be
-//!   cancel-safe: dropping the future may not lose an already-delivered
-//!   report (it stays queued for the next read). Wake-ups are
-//!   runtime-agnostic (raw `Waker`s, no executor assumed).
+//! Every native backend implements [`HidBackend`] and [`HidDeviceBackend`];
+//! `PlatformApi` / `PlatformDevice` alias whichever pair the target and
+//! feature flags select, and the `native` module in `lib.rs` is written
+//! against the traits alone.
 
-// The WebHID backend on wasm. Unlike the native backends below it does not
-// implement the PlatformApi/PlatformDevice contract documented above (the
-// `web` module in lib.rs drives it directly), but it belongs here as a backend.
+#[cfg(not(target_arch = "wasm32"))]
+use core::future::Future;
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::{DeviceInfo, HidError, HidResult};
+
+/// Enumerating and opening HID devices on one platform.
+///
+/// `Send + Sync` is required rather than incidental: [`crate::Hidra`] is
+/// documented as usable from any thread, and the bound makes that a compile
+/// error to break instead of a doc comment to disbelieve.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) trait HidBackend: Sized + Send + Sync {
+    /// The open-device handle this backend produces.
+    type Device: HidDeviceBackend;
+
+    /// Initialize the backend.
+    fn new() -> HidResult<Self>;
+
+    /// List connected devices. A `vendor_id` or `product_id` of 0 is a
+    /// wildcard. Devices with several top-level collections yield one entry
+    /// per collection, like hidapi.
+    fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>>;
+
+    /// Open a device by its platform path, as reported by [`DeviceInfo::path`].
+    fn open_path(&self, path: &str) -> HidResult<Self::Device>;
+
+    /// Open the first device matching `vendor_id`/`product_id` and, when
+    /// given, `serial`.
+    ///
+    /// Every backend resolves this the same way, so it is provided here;
+    /// a backend with a cheaper lookup may still override it.
+    fn open(
+        &self,
+        vendor_id: u16,
+        product_id: u16,
+        serial: Option<&str>,
+    ) -> HidResult<Self::Device> {
+        let info = self
+            .enumerate(vendor_id, product_id)?
+            .into_iter()
+            .find(|info| match serial {
+                Some(serial) => info.serial_number.as_deref() == Some(serial),
+                None => true,
+            })
+            .ok_or(HidError::DeviceNotFound)?;
+        self.open_path(&info.path)
+    }
+}
+
+/// One open HID device.
+///
+/// Buffer conventions are hidapi's, and identical across backends:
+///
+/// * `write` / `send_feature_report`: `data[0]` is the report ID; use 0 when
+///   the device has no numbered reports. The ID byte counts toward the
+///   returned length.
+/// * `get_feature_report` / `get_input_report`: `buf[0]` must contain the
+///   report ID on entry; on return the buffer starts with that ID.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) trait HidDeviceBackend: Send + Sync {
+    /// Send an output report.
+    fn write(&self, data: &[u8]) -> HidResult<usize>;
+
+    /// Resolve with one input report copied into `buf`, prefixed with its
+    /// report ID only when the device uses numbered reports.
+    ///
+    /// Never resolves with `Ok(0)`, and fails with [`HidError::Disconnected`]
+    /// once the device is gone and any queued reports have drained.
+    /// Implementations must be cancel-safe: dropping the future may not lose
+    /// an already-delivered report, it stays queued for the next read.
+    /// Wake-ups are runtime-agnostic (raw `Waker`s, no executor assumed).
+    fn read_async<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> impl Future<Output = HidResult<usize>> + Send + 'a;
+
+    /// Send a feature report.
+    fn send_feature_report(&self, data: &[u8]) -> HidResult<()>;
+
+    /// Read a feature report.
+    fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize>;
+
+    /// Read an input report synchronously.
+    fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize>;
+
+    /// Manufacturer string, if the device reports one.
+    fn get_manufacturer_string(&self) -> HidResult<Option<String>>;
+
+    /// Product string, if the device reports one.
+    fn get_product_string(&self) -> HidResult<Option<String>>;
+
+    /// Serial number string, if the device reports one.
+    fn get_serial_number_string(&self) -> HidResult<Option<String>>;
+
+    /// A string from the device's string descriptor table. Backends with no
+    /// raw USB access return [`HidError::Unsupported`].
+    fn get_indexed_string(&self, index: u32) -> HidResult<Option<String>>;
+
+    /// Raw report descriptor; returns the number of bytes written to `buf`.
+    fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize>;
+
+    /// Enumeration-style metadata for this open device.
+    fn get_device_info(&self) -> HidResult<DeviceInfo>;
+}
+
+/// Strip the leading report-ID byte when it is 0.
+///
+/// hidapi's convention is that `data[0]` is always the report ID, but a device
+/// without numbered reports never sees that byte on the wire: a 0 is a
+/// placeholder the transport drops, while a nonzero ID is transmitted as the
+/// first payload byte. The USB and `IOKit` backends both need this; hidraw
+/// does not, because the kernel consumes the byte itself.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "nusb", target_os = "macos")
+))]
+pub(crate) fn payload_after_report_id(data: &[u8]) -> &[u8] {
+    if data.first() == Some(&0) {
+        &data[1..]
+    } else {
+        data
+    }
+}
+
+// Shared by the backends whose input reports arrive on a producer thread
+// (macOS and nusb); see the module docs for why Windows and hidraw do not.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "nusb", target_os = "macos")
+))]
+pub(crate) mod queue;
+
+// The WebHID backend on wasm. It does not implement the traits above (WebHID
+// is async and permission-gated, so the `web` module in lib.rs drives it
+// directly), but it belongs here as a backend.
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod webhid;
 

@@ -60,6 +60,26 @@ jobs:
       - name: Clippy
         run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
 
+  msrv:
+    name: msrv (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          # Keep in sync with `rust-version` in Cargo.toml. Default features
+          # only: the optional `nusb` backend has a higher floor of its own.
+          toolchain: "1.77"
+      - uses: Swatinem/rust-cache@v2
+      # The committed lockfile is v4, which 1.77's cargo cannot read; resolve
+      # afresh with the current cargo, then compile with 1.77.
+      - run: cargo +stable generate-lockfile
+      - run: cargo check --all-targets
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest

@@ -40,9 +40,9 @@ impl<T: IntoFuture> MaybeFuture for T {}
 /// thread between wake-ups, so it drives both the immediately-ready futures
 /// the native backends return for synchronous operations and the genuinely
 /// async input-read futures (woken by the platform reactor) without any async
-/// runtime.
+/// runtime. Also used by the unit tests, which have no runtime dependency.
 #[cfg(not(target_arch = "wasm32"))]
-fn block_on<F: Future>(fut: F) -> F::Output {
+pub(crate) fn block_on<F: Future>(fut: F) -> F::Output {
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake, Waker};
     use std::thread::{self, Thread};

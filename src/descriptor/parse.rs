@@ -4,7 +4,10 @@ use super::items::{GlobalTag, Items, LocalTag, MainTag};
 use crate::error::{HidError, HidResult};
 
 /// Direction/class of a HID report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Ordered Input < Output < Feature, the order the HID spec lists them in and
+/// the order a reconstructed descriptor emits them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReportKind {
     /// Device-to-host report (Input main item).
     Input,
@@ -15,64 +18,101 @@ pub enum ReportKind {
 }
 
 /// Flags carried by Input/Output/Feature main items (HID 1.11, 6.2.2.5).
+///
+/// The constants are `MainFlags` values, not bare integers, so they compose
+/// with `|` and are checked by [`contains`](Self::contains):
+///
+/// ```
+/// use hidra::descriptor::MainFlags;
+/// let flags = MainFlags::VARIABLE | MainFlags::RELATIVE;
+/// assert!(flags.is_variable() && flags.is_relative());
+/// assert!(!flags.is_constant());
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MainFlags(pub u32);
 
 impl MainFlags {
     /// Bit 0: Constant (padding) rather than Data.
-    pub const CONSTANT: u32 = 1 << 0;
+    pub const CONSTANT: Self = MainFlags(1 << 0);
     /// Bit 1: Variable rather than Array.
-    pub const VARIABLE: u32 = 1 << 1;
+    pub const VARIABLE: Self = MainFlags(1 << 1);
     /// Bit 2: Relative rather than Absolute.
-    pub const RELATIVE: u32 = 1 << 2;
+    pub const RELATIVE: Self = MainFlags(1 << 2);
     /// Bit 3: Wrap rather than No Wrap (values wrap past their extremes).
-    pub const WRAP: u32 = 1 << 3;
+    pub const WRAP: Self = MainFlags(1 << 3);
     /// Bit 4: Nonlinear rather than Linear.
-    pub const NONLINEAR: u32 = 1 << 4;
+    pub const NONLINEAR: Self = MainFlags(1 << 4);
     /// Bit 5: No Preferred State rather than Preferred State.
-    pub const NO_PREFERRED: u32 = 1 << 5;
+    pub const NO_PREFERRED: Self = MainFlags(1 << 5);
     /// Bit 6: Null State rather than No Null Position.
-    pub const NULL_STATE: u32 = 1 << 6;
+    pub const NULL_STATE: Self = MainFlags(1 << 6);
     /// Bit 7: Volatile rather than Non Volatile (Output/Feature only).
-    pub const VOLATILE: u32 = 1 << 7;
+    pub const VOLATILE: Self = MainFlags(1 << 7);
     /// Bit 8: Buffered Bytes rather than Bit Field.
-    pub const BUFFERED_BYTES: u32 = 1 << 8;
+    pub const BUFFERED_BYTES: Self = MainFlags(1 << 8);
+
+    /// No flags set: Data, Array, Absolute, Linear, Preferred State.
+    pub const NONE: Self = MainFlags(0);
+
+    /// The raw main-item data value.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Whether every flag in `other` is set here.
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
 
     /// Constant (padding) rather than Data.
-    pub fn is_constant(self) -> bool {
-        self.0 & Self::CONSTANT != 0
+    pub const fn is_constant(self) -> bool {
+        self.contains(Self::CONSTANT)
     }
     /// Variable rather than Array.
-    pub fn is_variable(self) -> bool {
-        self.0 & Self::VARIABLE != 0
+    pub const fn is_variable(self) -> bool {
+        self.contains(Self::VARIABLE)
     }
     /// Relative rather than Absolute.
-    pub fn is_relative(self) -> bool {
-        self.0 & Self::RELATIVE != 0
+    pub const fn is_relative(self) -> bool {
+        self.contains(Self::RELATIVE)
     }
     /// Wrap rather than No Wrap.
-    pub fn is_wrap(self) -> bool {
-        self.0 & Self::WRAP != 0
+    pub const fn is_wrap(self) -> bool {
+        self.contains(Self::WRAP)
     }
     /// Nonlinear rather than Linear.
-    pub fn is_nonlinear(self) -> bool {
-        self.0 & Self::NONLINEAR != 0
+    pub const fn is_nonlinear(self) -> bool {
+        self.contains(Self::NONLINEAR)
     }
     /// No Preferred State rather than Preferred State.
-    pub fn has_no_preferred_state(self) -> bool {
-        self.0 & Self::NO_PREFERRED != 0
+    pub const fn has_no_preferred_state(self) -> bool {
+        self.contains(Self::NO_PREFERRED)
     }
     /// Null State rather than No Null Position.
-    pub fn has_null_state(self) -> bool {
-        self.0 & Self::NULL_STATE != 0
+    pub const fn has_null_state(self) -> bool {
+        self.contains(Self::NULL_STATE)
     }
     /// Volatile rather than Non Volatile.
-    pub fn is_volatile(self) -> bool {
-        self.0 & Self::VOLATILE != 0
+    pub const fn is_volatile(self) -> bool {
+        self.contains(Self::VOLATILE)
     }
     /// Buffered Bytes rather than Bit Field.
-    pub fn is_buffered_bytes(self) -> bool {
-        self.0 & Self::BUFFERED_BYTES != 0
+    pub const fn is_buffered_bytes(self) -> bool {
+        self.contains(Self::BUFFERED_BYTES)
+    }
+}
+
+impl core::ops::BitOr for MainFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        MainFlags(self.0 | rhs.0)
+    }
+}
+
+impl core::ops::BitOrAssign for MainFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
     }
 }
 

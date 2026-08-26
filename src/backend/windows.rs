@@ -1,7 +1,7 @@
-//! Windows backend: HID class devices via `hid.dll` and SetupAPI.
+//! Windows backend: HID class devices via `hid.dll` and `SetupAPI`.
 //!
 //! Mirrors hidapi's `windows/hid.c`: enumeration walks the HID device
-//! interface class with SetupAPI, devices are opened overlapped and all I/O
+//! interface class with `SetupAPI`, devices are opened overlapped and all I/O
 //! goes through one persistent background `ReadFile` plus event-driven
 //! `WriteFile`/`DeviceIoControl` calls.
 //!
@@ -10,7 +10,7 @@
 //! * the bus type is classified from the devnode's enumerator/hardware IDs
 //!   instead of `DEVPKEY_Device_BusTypeGuid`;
 //! * `get_report_descriptor` reconstructs the descriptor from the documented
-//!   HidP API rather than the undocumented preparsed-data layout;
+//!   `HidP` API rather than the undocumented preparsed-data layout;
 //! * a timed-out `write` cancels the pending I/O before returning (hidapi
 //!   leaves it running), which is required for memory safety in Rust.
 
@@ -58,7 +58,8 @@ use windows_sys::Win32::System::IO::{
     CancelIoEx, DeviceIoControl, GetOverlappedResult, OVERLAPPED,
 };
 
-use crate::descriptor::{CollectionKind, DescriptorBuilder, MainFlags};
+use super::{HidBackend, HidDeviceBackend};
+use crate::descriptor::{CollectionKind, DescriptorBuilder, MainFlags, ReportKind};
 use crate::error::{HidError, HidResult};
 use crate::{BusType, DeviceInfo};
 
@@ -130,7 +131,7 @@ fn guid_to_bytes(guid: &GUID) -> [u8; 16] {
 ///
 /// hidapi inspects `DEVPKEY_Device_CompatibleIds` of the *parent* devnode;
 /// this heuristic uses the same markers but reads them from the HID devnode
-/// itself, which SetupAPI hands us for free during enumeration:
+/// itself, which `SetupAPI` hands us for free during enumeration:
 ///
 /// * enumerator `USB` (or a `USB` hardware id)        -> USB
 /// * enumerator `BTHENUM` / `BTHLEDEVICE` (or id)     -> Bluetooth (incl. BLE)
@@ -221,7 +222,7 @@ impl OverlappedIo {
     }
 }
 
-/// SetupAPI device information set, destroyed on drop.
+/// `SetupAPI` device information set, destroyed on drop.
 struct DevInfoList(HDEVINFO);
 
 impl Drop for DevInfoList {
@@ -477,12 +478,14 @@ fn query_device_info(handle: HANDLE, path: &str, bus_type: BusType) -> DeviceInf
 
 pub(crate) struct WinApi;
 
-impl WinApi {
-    pub fn new() -> HidResult<Self> {
+impl HidBackend for WinApi {
+    type Device = WinDevice;
+
+    fn new() -> HidResult<Self> {
         Ok(WinApi)
     }
 
-    pub fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>> {
+    fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>> {
         let mut hid_guid: GUID = unsafe { core::mem::zeroed() };
         // SAFETY: out-pointer to a GUID.
         unsafe { HidD_GetHidGuid(&mut hid_guid) };
@@ -534,33 +537,14 @@ impl WinApi {
             let bus_type = bus_type_for_devnode(list.0, &devinfo);
             let info = query_device_info(handle.raw(), &path, bus_type);
 
-            let vid_ok = vendor_id == 0 || info.vendor_id == vendor_id;
-            let pid_ok = product_id == 0 || info.product_id == product_id;
-            if vid_ok && pid_ok {
+            if info.matches(vendor_id, product_id) {
                 result.push(info);
             }
         }
         Ok(result)
     }
 
-    pub fn open(
-        &self,
-        vendor_id: u16,
-        product_id: u16,
-        serial: Option<&str>,
-    ) -> HidResult<WinDevice> {
-        let candidates = self.enumerate(vendor_id, product_id)?;
-        let info = candidates
-            .into_iter()
-            .find(|info| match serial {
-                Some(s) => info.serial_number.as_deref() == Some(s),
-                None => true,
-            })
-            .ok_or(HidError::DeviceNotFound)?;
-        self.open_path(&info.path)
-    }
-
-    pub fn open_path(&self, path: &str) -> HidResult<WinDevice> {
+    fn open_path(&self, path: &str) -> HidResult<WinDevice> {
         WinDevice::open(path)
     }
 }
@@ -660,10 +644,9 @@ unsafe extern "system" fn read_wait_callback(ctx: *mut core::ffi::c_void, _timer
     // Drop blockingly unregisters the wait before releasing that count.
     let wake = unsafe { &*ctx.cast_const().cast::<ReadWake>() };
     // The wait satisfied on an *auto-reset* event and thereby consumed its
-    // signal; restore it so the synchronous paths (`WaitForSingleObject` in
-    // `read_timeout`, `GetOverlappedResult(.., wait=1)`) still observe the
-    // completion. A stale signal is harmless: every new `ReadFile` is
-    // preceded by `ResetEvent`.
+    // signal; restore it so a later `GetOverlappedResult` still observes the
+    // completion. A stale signal is harmless: every new `ReadFile` is preceded
+    // by `ResetEvent`.
     // SAFETY: the event handle outlives the callback (see ReadWake docs).
     unsafe { SetEvent(wake.event.0) };
     // Clear the flag before taking the waker so a concurrently parking poll
@@ -693,10 +676,6 @@ pub(crate) struct WinDevice {
     /// Metadata captured at open time (hidapi caches it the same way).
     info: DeviceInfo,
     feature_report_len: u16,
-    // Part of the backend contract; the wrapper now reads input via
-    // `read_async`, so the blocking-mode state is unused on this path.
-    #[allow(dead_code)]
-    blocking: AtomicBool,
     write_timeout_ms: AtomicU32,
 }
 
@@ -772,7 +751,6 @@ impl WinDevice {
             path: path.to_string(),
             info,
             feature_report_len: caps.FeatureReportByteLength,
-            blocking: AtomicBool::new(true),
             write_timeout_ms: AtomicU32::new(DEFAULT_WRITE_TIMEOUT_MS),
         })
     }
@@ -786,7 +764,273 @@ impl WinDevice {
         HidError::io(operation, std::io::Error::from_raw_os_error(err as i32))
     }
 
-    pub fn write(&self, data: &[u8]) -> HidResult<usize> {
+    /// Ensure the single background `ReadFile` hidapi keeps per device is in
+    /// flight. `Ok(Some(n))` when the call completed synchronously with `n`
+    /// bytes (the read is no longer pending), `Ok(None)` when it is pending
+    /// (newly started or left over from an earlier call).
+    fn start_read(&self, st: &mut ReadState) -> HidResult<Option<u32>> {
+        if st.pending {
+            return Ok(None);
+        }
+        st.pending = true;
+        st.buf.fill(0);
+        // SAFETY: event is owned and not in use (no read pending).
+        unsafe { ResetEvent(st.io.event.raw()) };
+        let len = st.buf.len() as u32;
+        let buf_ptr = st.buf.as_mut_ptr();
+        let ol = st.io.ol_mut();
+        let mut bytes_read = 0u32;
+        // SAFETY: st.buf and the boxed OVERLAPPED stay alive (and at a
+        // stable address) for as long as the operation is pending.
+        let res = unsafe { ReadFile(self.handle.raw(), buf_ptr, len, &mut bytes_read, ol) };
+        if res == 0 {
+            let err = unsafe { GetLastError() };
+            if err != ERROR_IO_PENDING {
+                // SAFETY: drop the failed request before reporting.
+                unsafe { CancelIoEx(self.handle.raw(), ol) };
+                st.pending = false;
+                return Err(Self::io_error("hid read", err));
+            }
+            return Ok(None);
+        }
+        st.pending = false;
+        Ok(Some(bytes_read))
+    }
+
+    /// Copy a completed report out of the staging buffer into `buf`.
+    fn copy_report(st: &ReadState, bytes_read: u32, buf: &mut [u8]) -> usize {
+        let mut report = &st.buf[..(bytes_read as usize).min(st.buf.len())];
+        // Windows always prefixes input reports with a report ID byte; for
+        // devices without numbered reports it is 0 and hidapi strips it.
+        if report.first() == Some(&0) {
+            report = &report[1..];
+        }
+        let copy_len = report.len().min(buf.len());
+        buf[..copy_len].copy_from_slice(&report[..copy_len]);
+        copy_len
+    }
+
+    /// Adjust a `GET_FEATURE`/`GET_INPUT` `DeviceIoControl` byte count to
+    /// hidapi's convention. For numbered reports Windows already includes the
+    /// leading report-ID byte in the count; for unnumbered reports the leading
+    /// byte stays 0 and is excluded, so the ID byte is added back only in that
+    /// case. `first_byte` is `buf[0]` after the call.
+    fn get_report_len(first_byte: u8, bytes_returned: usize, buf_len: usize) -> usize {
+        let n = if first_byte == 0 {
+            bytes_returned + 1
+        } else {
+            bytes_returned
+        };
+        n.min(buf_len)
+    }
+
+    /// `Future::poll` body of [`ReadAsync`].
+    fn poll_read(&self, buf: &mut [u8], cx: &mut Context<'_>) -> Poll<HidResult<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Err(HidError::InvalidData {
+                message: "read buffer must not be empty".into(),
+            }));
+        }
+        let mut st = self.read.lock().unwrap_or_else(|e| e.into_inner());
+        let bytes_read = match self.start_read(&mut st) {
+            Err(e) => return Poll::Ready(Err(e)),
+            Ok(Some(n)) => n,
+            Ok(None) => {
+                // Non-blocking completion check. The OVERLAPPED status is
+                // inspected (wait=0) instead of the event because an already
+                // fired thread-pool wait consumes the auto-reset event's
+                // signal (the callback restores it for the sync paths).
+                let ol = st.io.ol_mut();
+                let mut n = 0u32;
+                // SAFETY: ol identifies the in-flight read on our handle.
+                let res = unsafe { GetOverlappedResult(self.handle.raw(), ol, &mut n, 0) };
+                if res == 0 {
+                    let err = unsafe { GetLastError() };
+                    if err == ERROR_IO_INCOMPLETE {
+                        // Still in flight: park until the event signals. The
+                        // read keeps running when the future is dropped, so no
+                        // report is ever lost; it lands in the staging buffer
+                        // for the next `read_async`.
+                        return self.park_read(&mut st, cx);
+                    }
+                    st.pending = false;
+                    return Poll::Ready(Err(Self::io_error("hid read", err)));
+                }
+                st.pending = false;
+                n
+            }
+        };
+        Poll::Ready(Ok(Self::copy_report(&st, bytes_read, buf)))
+    }
+
+    /// Store the task's waker and make sure a one-shot thread-pool wait is
+    /// armed on the read event. Called with the read lock held while the
+    /// background read is pending; always returns `Poll::Pending`.
+    ///
+    /// Re-registration strategy: each wait is `WT_EXECUTEONLYONCE` and
+    /// `wait_registered` is cleared by the callback, so the first poll that
+    /// still finds the read pending afterwards (or before any wait existed)
+    /// arms a fresh wait, non-blockingly unregistering the spent one first.
+    /// The waker is stored *before* the flag is checked: a callback racing
+    /// with this either picks the new waker up (flag still set), or has
+    /// already cleared the flag, making this poll register a new wait on
+    /// the still/again-signaled event, which fires immediately. Either way
+    /// the wake-up cannot be lost.
+    fn park_read(&self, st: &mut ReadState, cx: &mut Context<'_>) -> Poll<HidResult<usize>> {
+        *self.wake.waker.lock().unwrap_or_else(|e| e.into_inner()) = Some(cx.waker().clone());
+        if !self.wake.wait_registered.swap(true, Ordering::AcqRel) {
+            if !st.wait.0.is_null() {
+                // The previous one-shot wait has fired; release it without
+                // waiting for its callback (the callback only touches
+                // `self.wake`, which outlives the device, see ReadWake).
+                // SAFETY: st.wait holds a wait handle we registered.
+                unsafe { UnregisterWaitEx(st.wait.0, core::ptr::null_mut()) };
+                st.wait.0 = core::ptr::null_mut();
+            }
+            let mut wait: HANDLE = core::ptr::null_mut();
+            // SAFETY: the event outlives the wait (unregistered in Drop at
+            // the latest) and the context pointer is backed by the strong
+            // count leaked at open, reclaimed only after that unregister.
+            let ok = unsafe {
+                RegisterWaitForSingleObject(
+                    &mut wait,
+                    st.io.event.raw(),
+                    Some(read_wait_callback),
+                    Arc::as_ptr(&self.wake).cast(),
+                    INFINITE,
+                    WT_EXECUTEONLYONCE | WT_EXECUTEINWAITTHREAD,
+                )
+            };
+            if ok == 0 {
+                self.wake.wait_registered.store(false, Ordering::Release);
+                return Poll::Ready(Err(HidError::last_os_error("RegisterWaitForSingleObject")));
+            }
+            st.wait.0 = wait;
+        }
+        Poll::Pending
+    }
+
+    /// Synchronous `DeviceIoControl` `GET_FEATURE` / `GET_INPUT_REPORT`, used by
+    /// hidapi because it reports the actual returned length (unlike the
+    /// `HidD_*` wrappers).
+    fn ioctl_get_report(
+        &self,
+        ioctl: u32,
+        buf: &mut [u8],
+        operation: &'static str,
+    ) -> HidResult<usize> {
+        if buf.is_empty() {
+            return Err(HidError::InvalidData {
+                message: "buffer must contain a report ID byte".into(),
+            });
+        }
+        // A private event/OVERLAPPED per call: the request never outlives
+        // this function (GetOverlappedResult below waits for completion).
+        let mut io = OverlappedIo::new()?;
+        let ol = io.ol_mut();
+        let mut returned = 0u32;
+        // SAFETY: buf is used as both input (report ID) and output, exactly
+        // like hidapi; ol stays alive until the operation is reaped.
+        let res = unsafe {
+            DeviceIoControl(
+                self.handle.raw(),
+                ioctl,
+                buf.as_ptr().cast(),
+                buf.len() as u32,
+                buf.as_mut_ptr().cast(),
+                buf.len() as u32,
+                &mut returned,
+                ol,
+            )
+        };
+        if res == 0 {
+            let err = unsafe { GetLastError() };
+            if err != ERROR_IO_PENDING {
+                return Err(Self::io_error(operation, err));
+            }
+        }
+        // SAFETY: wait=1 blocks until the request completes.
+        if unsafe { GetOverlappedResult(self.handle.raw(), ol, &mut returned, 1) } == 0 {
+            return Err(Self::io_error(operation, unsafe { GetLastError() }));
+        }
+        Ok(Self::get_report_len(buf[0], returned as usize, buf.len()))
+    }
+
+    fn reconstruct_descriptor(&self) -> HidResult<Vec<u8>> {
+        let pp = PreparsedData::get(self.handle.raw())?;
+        let caps = pp.caps()?;
+
+        // Link collection tree; node 0 is the top-level collection.
+        let count = caps.NumberLinkCollectionNodes as usize;
+        if count == 0 {
+            return Err(HidError::backend("device reports no link collections"));
+        }
+        let mut nodes = vec![HIDP_LINK_COLLECTION_NODE::default(); count];
+        let mut len = count as u32;
+        // SAFETY: nodes has room for `len` entries.
+        let status = unsafe { HidP_GetLinkCollectionNodes(nodes.as_mut_ptr(), &mut len, pp.0) };
+        if status != HIDP_STATUS_SUCCESS {
+            return Err(HidError::backend("HidP_GetLinkCollectionNodes failed"));
+        }
+        nodes.truncate(len as usize);
+
+        let mut fields = collect_fields(&pp, &caps);
+        synthesize_padding(&caps, &mut fields);
+
+        // Group fields by owning collection, ordered by report type, report
+        // ID, then HidP enumeration order.
+        let mut by_node: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+        for (i, f) in fields.iter().enumerate() {
+            if let Some(v) = by_node.get_mut(f.link as usize) {
+                v.push(i);
+            }
+        }
+        for v in &mut by_node {
+            v.sort_by_key(|&i| (fields[i].kind, fields[i].report_id, fields[i].order));
+        }
+
+        let mut b = DescriptorBuilder::new();
+        emit_collection(&mut b, &nodes, &by_node, &fields, 0, 0)?;
+        Ok(b.build())
+    }
+
+    /// `hid_winapi_get_container_id`: the `DEVPKEY_Device_ContainerId` GUID
+    /// of the devnode behind this interface, as 16 bytes in the GUID's
+    /// in-memory (little-endian fields) layout.
+    pub(crate) fn container_id(&self) -> HidResult<[u8; 16]> {
+        let (list, devinfo) = devnode_for_interface(&self.path)?;
+        let mut guid: GUID = unsafe { core::mem::zeroed() };
+        let mut prop_type: DEVPROPTYPE = 0;
+        // SAFETY: out-buffer is a GUID, matching DEVPROP_TYPE_GUID.
+        let ok = unsafe {
+            SetupDiGetDevicePropertyW(
+                list.0,
+                &devinfo,
+                &DEVPKEY_Device_ContainerId,
+                &mut prop_type,
+                (&mut guid as *mut GUID).cast(),
+                core::mem::size_of::<GUID>() as u32,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        if ok == 0 {
+            return Err(HidError::last_os_error("SetupDiGetDevicePropertyW"));
+        }
+        if prop_type != DEVPROP_TYPE_GUID {
+            return Err(HidError::backend("container id property is not a GUID"));
+        }
+        Ok(guid_to_bytes(&guid))
+    }
+
+    /// `hid_winapi_set_write_timeout`.
+    pub(crate) fn set_write_timeout(&self, timeout_ms: u32) {
+        self.write_timeout_ms.store(timeout_ms, Ordering::Relaxed);
+    }
+}
+
+impl HidDeviceBackend for WinDevice {
+    fn write(&self, data: &[u8]) -> HidResult<usize> {
         if data.is_empty() {
             return Err(HidError::InvalidData {
                 message: "write data must contain a report ID byte".into(),
@@ -857,215 +1101,19 @@ impl WinDevice {
         Ok(data.len())
     }
 
-    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
-    pub fn read(&self, buf: &mut [u8]) -> HidResult<usize> {
-        let timeout = if self.blocking.load(Ordering::Relaxed) {
-            -1
-        } else {
-            0
-        };
-        self.read_timeout(buf, timeout)
-    }
-
-    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
-    pub fn read_timeout(&self, buf: &mut [u8], timeout_ms: i32) -> HidResult<usize> {
-        if buf.is_empty() {
-            return Err(HidError::InvalidData {
-                message: "read buffer must not be empty".into(),
-            });
-        }
-        let mut st = self.read.lock().unwrap_or_else(|e| e.into_inner());
-        let bytes_read = match self.start_read(&mut st)? {
-            Some(n) => n,
-            None => {
-                if timeout_ms >= 0 {
-                    // SAFETY: event belongs to the in-flight read.
-                    let wait = unsafe { WaitForSingleObject(st.io.event.raw(), timeout_ms as u32) };
-                    if wait == WAIT_TIMEOUT {
-                        // No data yet; leave the overlapped read running
-                        // (hidapi semantics) and report a timeout.
-                        return Ok(0);
-                    }
-                    if wait != WAIT_OBJECT_0 {
-                        return Err(HidError::last_os_error("WaitForSingleObject on read"));
-                    }
-                }
-                let ol = st.io.ol_mut();
-                let mut n = 0u32;
-                // SAFETY: wait=1 blocks until completion when timeout_ms < 0.
-                let res = unsafe { GetOverlappedResult(self.handle.raw(), ol, &mut n, 1) };
-                st.pending = false;
-                if res == 0 {
-                    return Err(Self::io_error("hid read", unsafe { GetLastError() }));
-                }
-                n
-            }
-        };
-        Ok(Self::copy_report(&st, bytes_read, buf))
-    }
-
-    /// Ensure the single background `ReadFile` hidapi keeps per device is in
-    /// flight. `Ok(Some(n))` when the call completed synchronously with `n`
-    /// bytes (the read is no longer pending), `Ok(None)` when it is pending
-    /// (newly started or left over from an earlier call).
-    fn start_read(&self, st: &mut ReadState) -> HidResult<Option<u32>> {
-        if st.pending {
-            return Ok(None);
-        }
-        st.pending = true;
-        st.buf.fill(0);
-        // SAFETY: event is owned and not in use (no read pending).
-        unsafe { ResetEvent(st.io.event.raw()) };
-        let len = st.buf.len() as u32;
-        let buf_ptr = st.buf.as_mut_ptr();
-        let ol = st.io.ol_mut();
-        let mut bytes_read = 0u32;
-        // SAFETY: st.buf and the boxed OVERLAPPED stay alive (and at a
-        // stable address) for as long as the operation is pending.
-        let res = unsafe { ReadFile(self.handle.raw(), buf_ptr, len, &mut bytes_read, ol) };
-        if res == 0 {
-            let err = unsafe { GetLastError() };
-            if err != ERROR_IO_PENDING {
-                // SAFETY: drop the failed request before reporting.
-                unsafe { CancelIoEx(self.handle.raw(), ol) };
-                st.pending = false;
-                return Err(Self::io_error("hid read", err));
-            }
-            return Ok(None);
-        }
-        st.pending = false;
-        Ok(Some(bytes_read))
-    }
-
-    /// Copy a completed report out of the staging buffer into `buf`.
-    fn copy_report(st: &ReadState, bytes_read: u32, buf: &mut [u8]) -> usize {
-        let mut report = &st.buf[..(bytes_read as usize).min(st.buf.len())];
-        // Windows always prefixes input reports with a report ID byte; for
-        // devices without numbered reports it is 0 and hidapi strips it.
-        if report.first() == Some(&0) {
-            report = &report[1..];
-        }
-        let copy_len = report.len().min(buf.len());
-        buf[..copy_len].copy_from_slice(&report[..copy_len]);
-        copy_len
-    }
-
-    /// Adjust a `GET_FEATURE`/`GET_INPUT` DeviceIoControl byte count to
-    /// hidapi's convention. For numbered reports Windows already includes the
-    /// leading report-ID byte in the count; for unnumbered reports the leading
-    /// byte stays 0 and is excluded, so the ID byte is added back only in that
-    /// case. `first_byte` is `buf[0]` after the call.
-    fn get_report_len(first_byte: u8, bytes_returned: usize, buf_len: usize) -> usize {
-        let n = if first_byte == 0 {
-            bytes_returned + 1
-        } else {
-            bytes_returned
-        };
-        n.min(buf_len)
-    }
-
     /// Read one input report without ever resolving with `Ok(0)`: the future
     /// completes once the persistent background `ReadFile` delivers a report,
     /// and fails with [`HidError::Disconnected`] when the device is removed.
     /// Wake-ups come from a one-shot thread-pool wait on the read event
     /// (`RegisterWaitForSingleObject`, raw [`Waker`]s, no executor assumed).
-    pub fn read_async<'a>(&'a self, buf: &'a mut [u8]) -> ReadAsync<'a> {
+    fn read_async<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> impl Future<Output = HidResult<usize>> + Send + 'a {
         ReadAsync { dev: self, buf }
     }
 
-    /// `Future::poll` body of [`ReadAsync`].
-    fn poll_read(&self, buf: &mut [u8], cx: &mut Context<'_>) -> Poll<HidResult<usize>> {
-        if buf.is_empty() {
-            return Poll::Ready(Err(HidError::InvalidData {
-                message: "read buffer must not be empty".into(),
-            }));
-        }
-        let mut st = self.read.lock().unwrap_or_else(|e| e.into_inner());
-        let bytes_read = match self.start_read(&mut st) {
-            Err(e) => return Poll::Ready(Err(e)),
-            Ok(Some(n)) => n,
-            Ok(None) => {
-                // Non-blocking completion check. The OVERLAPPED status is
-                // inspected (wait=0) instead of the event because an already
-                // fired thread-pool wait consumes the auto-reset event's
-                // signal (the callback restores it for the sync paths).
-                let ol = st.io.ol_mut();
-                let mut n = 0u32;
-                // SAFETY: ol identifies the in-flight read on our handle.
-                let res = unsafe { GetOverlappedResult(self.handle.raw(), ol, &mut n, 0) };
-                if res == 0 {
-                    let err = unsafe { GetLastError() };
-                    if err == ERROR_IO_INCOMPLETE {
-                        // Still in flight: park until the event signals. The
-                        // read keeps running when the future is dropped, so
-                        // no report is ever lost, it lands in the staging
-                        // buffer for the next read/read_timeout/read_async.
-                        return self.park_read(&mut st, cx);
-                    }
-                    st.pending = false;
-                    return Poll::Ready(Err(Self::io_error("hid read", err)));
-                }
-                st.pending = false;
-                n
-            }
-        };
-        Poll::Ready(Ok(Self::copy_report(&st, bytes_read, buf)))
-    }
-
-    /// Store the task's waker and make sure a one-shot thread-pool wait is
-    /// armed on the read event. Called with the read lock held while the
-    /// background read is pending; always returns `Poll::Pending`.
-    ///
-    /// Re-registration strategy: each wait is `WT_EXECUTEONLYONCE` and
-    /// `wait_registered` is cleared by the callback, so the first poll that
-    /// still finds the read pending afterwards (or before any wait existed)
-    /// arms a fresh wait, non-blockingly unregistering the spent one first.
-    /// The waker is stored *before* the flag is checked: a callback racing
-    /// with this either picks the new waker up (flag still set), or has
-    /// already cleared the flag, making this poll register a new wait on
-    /// the still/again-signaled event, which fires immediately. Either way
-    /// the wake-up cannot be lost.
-    fn park_read(&self, st: &mut ReadState, cx: &mut Context<'_>) -> Poll<HidResult<usize>> {
-        *self.wake.waker.lock().unwrap_or_else(|e| e.into_inner()) = Some(cx.waker().clone());
-        if !self.wake.wait_registered.swap(true, Ordering::AcqRel) {
-            if !st.wait.0.is_null() {
-                // The previous one-shot wait has fired; release it without
-                // waiting for its callback (the callback only touches
-                // `self.wake`, which outlives the device, see ReadWake).
-                // SAFETY: st.wait holds a wait handle we registered.
-                unsafe { UnregisterWaitEx(st.wait.0, core::ptr::null_mut()) };
-                st.wait.0 = core::ptr::null_mut();
-            }
-            let mut wait: HANDLE = core::ptr::null_mut();
-            // SAFETY: the event outlives the wait (unregistered in Drop at
-            // the latest) and the context pointer is backed by the strong
-            // count leaked at open, reclaimed only after that unregister.
-            let ok = unsafe {
-                RegisterWaitForSingleObject(
-                    &mut wait,
-                    st.io.event.raw(),
-                    Some(read_wait_callback),
-                    Arc::as_ptr(&self.wake).cast(),
-                    INFINITE,
-                    WT_EXECUTEONLYONCE | WT_EXECUTEINWAITTHREAD,
-                )
-            };
-            if ok == 0 {
-                self.wake.wait_registered.store(false, Ordering::Release);
-                return Poll::Ready(Err(HidError::last_os_error("RegisterWaitForSingleObject")));
-            }
-            st.wait.0 = wait;
-        }
-        Poll::Pending
-    }
-
-    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
-    pub fn set_blocking_mode(&self, blocking: bool) -> HidResult<()> {
-        self.blocking.store(blocking, Ordering::Relaxed);
-        Ok(())
-    }
-
-    pub fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
+    fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
         if data.is_empty() {
             return Err(HidError::InvalidData {
                 message: "feature report must contain a report ID byte".into(),
@@ -1091,57 +1139,11 @@ impl WinDevice {
         Ok(())
     }
 
-    /// Synchronous `DeviceIoControl` GET_FEATURE / GET_INPUT_REPORT, used by
-    /// hidapi because it reports the actual returned length (unlike the
-    /// `HidD_*` wrappers).
-    fn ioctl_get_report(
-        &self,
-        ioctl: u32,
-        buf: &mut [u8],
-        operation: &'static str,
-    ) -> HidResult<usize> {
-        if buf.is_empty() {
-            return Err(HidError::InvalidData {
-                message: "buffer must contain a report ID byte".into(),
-            });
-        }
-        // A private event/OVERLAPPED per call: the request never outlives
-        // this function (GetOverlappedResult below waits for completion).
-        let mut io = OverlappedIo::new()?;
-        let ol = io.ol_mut();
-        let mut returned = 0u32;
-        // SAFETY: buf is used as both input (report ID) and output, exactly
-        // like hidapi; ol stays alive until the operation is reaped.
-        let res = unsafe {
-            DeviceIoControl(
-                self.handle.raw(),
-                ioctl,
-                buf.as_ptr().cast(),
-                buf.len() as u32,
-                buf.as_mut_ptr().cast(),
-                buf.len() as u32,
-                &mut returned,
-                ol,
-            )
-        };
-        if res == 0 {
-            let err = unsafe { GetLastError() };
-            if err != ERROR_IO_PENDING {
-                return Err(Self::io_error(operation, err));
-            }
-        }
-        // SAFETY: wait=1 blocks until the request completes.
-        if unsafe { GetOverlappedResult(self.handle.raw(), ol, &mut returned, 1) } == 0 {
-            return Err(Self::io_error(operation, unsafe { GetLastError() }));
-        }
-        Ok(Self::get_report_len(buf[0], returned as usize, buf.len()))
-    }
-
-    pub fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize> {
+    fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize> {
         self.ioctl_get_report(IOCTL_HID_GET_FEATURE, buf, "IOCTL_HID_GET_FEATURE")
     }
 
-    pub fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize> {
+    fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize> {
         match self.ioctl_get_report(
             IOCTL_HID_GET_INPUT_REPORT,
             buf,
@@ -1175,19 +1177,19 @@ impl WinDevice {
         }
     }
 
-    pub fn get_manufacturer_string(&self) -> HidResult<Option<String>> {
+    fn get_manufacturer_string(&self) -> HidResult<Option<String>> {
         Ok(self.info.manufacturer_string.clone())
     }
 
-    pub fn get_product_string(&self) -> HidResult<Option<String>> {
+    fn get_product_string(&self) -> HidResult<Option<String>> {
         Ok(self.info.product_string.clone())
     }
 
-    pub fn get_serial_number_string(&self) -> HidResult<Option<String>> {
+    fn get_serial_number_string(&self) -> HidResult<Option<String>> {
         Ok(self.info.serial_number.clone())
     }
 
-    pub fn get_indexed_string(&self, index: u32) -> HidResult<Option<String>> {
+    fn get_indexed_string(&self, index: u32) -> HidResult<Option<String>> {
         let mut buf = [0u16; MAX_STRING_WCHARS];
         // SAFETY: buffer length is in bytes, per the HidD_* contract.
         let ok = unsafe {
@@ -1210,14 +1212,14 @@ impl WinDevice {
     ///
     /// Windows never exposes the raw descriptor, so, like hidapi's
     /// `hid_winapi_descriptor_reconstruct.c`, one is rebuilt. Unlike hidapi
-    /// this uses only the documented HidP API (`HidP_GetCaps`,
+    /// this uses only the documented `HidP` API (`HidP_GetCaps`,
     /// `HidP_GetLinkCollectionNodes`, `HidP_GetButtonCaps`,
     /// `HidP_GetValueCaps`), with these limitations:
     ///
     /// * the output is not byte-identical to the original (hidapi's is not
     ///   either); it parses back via [`crate::descriptor::ReportDescriptor`]
     ///   with correct report IDs, usages and field sizes;
-    /// * fields are ordered by report type, then report ID, then HidP
+    /// * fields are ordered by report type, then report ID, then `HidP`
     ///   enumeration order, the documented API does not expose bit offsets,
     ///   so the in-report field order may differ from the device's;
     /// * constant padding bits are not enumerable; when a report type uses a
@@ -1227,87 +1229,15 @@ impl WinDevice {
     /// * array (non-variable) button fields are approximated: the documented
     ///   API does not expose their report size, so 8 bits (16 when the usage
     ///   range exceeds 255) per element is assumed, the keyboard layout.
-    pub fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize> {
+    fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize> {
         let bytes = self.reconstruct_descriptor()?;
         let len = bytes.len().min(buf.len());
         buf[..len].copy_from_slice(&bytes[..len]);
         Ok(len)
     }
 
-    fn reconstruct_descriptor(&self) -> HidResult<Vec<u8>> {
-        let pp = PreparsedData::get(self.handle.raw())?;
-        let caps = pp.caps()?;
-
-        // Link collection tree; node 0 is the top-level collection.
-        let count = caps.NumberLinkCollectionNodes as usize;
-        if count == 0 {
-            return Err(HidError::backend("device reports no link collections"));
-        }
-        let mut nodes = vec![HIDP_LINK_COLLECTION_NODE::default(); count];
-        let mut len = count as u32;
-        // SAFETY: nodes has room for `len` entries.
-        let status = unsafe { HidP_GetLinkCollectionNodes(nodes.as_mut_ptr(), &mut len, pp.0) };
-        if status != HIDP_STATUS_SUCCESS {
-            return Err(HidError::backend("HidP_GetLinkCollectionNodes failed"));
-        }
-        nodes.truncate(len as usize);
-
-        let mut fields = collect_fields(&pp, &caps);
-        synthesize_padding(&caps, &mut fields);
-
-        // Group fields by owning collection, ordered by report type, report
-        // ID, then HidP enumeration order.
-        let mut by_node: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
-        for (i, f) in fields.iter().enumerate() {
-            if let Some(v) = by_node.get_mut(f.link as usize) {
-                v.push(i);
-            }
-        }
-        for v in &mut by_node {
-            v.sort_by_key(|&i| (fields[i].kind, fields[i].report_id, fields[i].order));
-        }
-
-        let mut b = DescriptorBuilder::new();
-        emit_collection(&mut b, &nodes, &by_node, &fields, 0, 0)?;
-        Ok(b.build())
-    }
-
-    pub fn get_device_info(&self) -> HidResult<DeviceInfo> {
+    fn get_device_info(&self) -> HidResult<DeviceInfo> {
         Ok(self.info.clone())
-    }
-
-    /// `hid_winapi_get_container_id`: the `DEVPKEY_Device_ContainerId` GUID
-    /// of the devnode behind this interface, as 16 bytes in the GUID's
-    /// in-memory (little-endian fields) layout.
-    pub fn container_id(&self) -> HidResult<[u8; 16]> {
-        let (list, devinfo) = devnode_for_interface(&self.path)?;
-        let mut guid: GUID = unsafe { core::mem::zeroed() };
-        let mut prop_type: DEVPROPTYPE = 0;
-        // SAFETY: out-buffer is a GUID, matching DEVPROP_TYPE_GUID.
-        let ok = unsafe {
-            SetupDiGetDevicePropertyW(
-                list.0,
-                &devinfo,
-                &DEVPKEY_Device_ContainerId,
-                &mut prop_type,
-                (&mut guid as *mut GUID).cast(),
-                core::mem::size_of::<GUID>() as u32,
-                core::ptr::null_mut(),
-                0,
-            )
-        };
-        if ok == 0 {
-            return Err(HidError::last_os_error("SetupDiGetDevicePropertyW"));
-        }
-        if prop_type != DEVPROP_TYPE_GUID {
-            return Err(HidError::backend("container id property is not a GUID"));
-        }
-        Ok(guid_to_bytes(&guid))
-    }
-
-    /// `hid_winapi_set_write_timeout`.
-    pub fn set_write_timeout(&self, timeout_ms: u32) {
-        self.write_timeout_ms.store(timeout_ms, Ordering::Relaxed);
     }
 }
 
@@ -1343,14 +1273,12 @@ impl Drop for WinDevice {
 
 /// Future returned by [`WinDevice::read_async`].
 ///
-/// Cancel-safe: the report is only harvested inside `poll`, and the
-/// persistent background `ReadFile` keeps running when the future is dropped
-///, a completed report stays in the staging buffer for the next
-/// `read`/`read_timeout`/`read_async` (the same semantics as a timed-out
-/// synchronous read). A drop may leave the one-shot thread-pool wait armed
-/// with a stale waker; it fires at most once as a spurious (or no-op) wake
-/// and is unregistered on the next registration, or blockingly in
-/// `WinDevice`'s `Drop`.
+/// Cancel-safe: the report is only harvested inside `poll`, and the persistent
+/// background `ReadFile` keeps running when the future is dropped, so a
+/// completed report stays in the staging buffer for the next `read_async`. A
+/// drop may leave the one-shot thread-pool wait armed with a stale waker; it
+/// fires at most once as a spurious (or no-op) wake and is unregistered on the
+/// next registration, or blockingly in `WinDevice`'s `Drop`.
 pub(crate) struct ReadAsync<'a> {
     dev: &'a WinDevice,
     buf: &'a mut [u8],
@@ -1367,26 +1295,26 @@ impl Future for ReadAsync<'_> {
 
 // --- descriptor reconstruction --------------------------------------------------
 
-/// Report types in emission order; doubles as the sort key.
-const KIND_INPUT: u8 = 0;
-const KIND_OUTPUT: u8 = 1;
-const KIND_FEATURE: u8 = 2;
+/// What every enumerated field carries, whatever its kind.
+#[derive(Clone, Copy)]
+struct Common {
+    usage_page: u16,
+    /// `Some((min, max))` for usage ranges, otherwise `usage` applies.
+    range: Option<(u16, u16)>,
+    usage: u16,
+    report_count: u16,
+    /// Main-item flags (`BitField`) as declared by the device.
+    flags: MainFlags,
+}
 
-enum FieldData {
-    Button {
-        usage_page: u16,
-        /// `Some((min, max))` for usage ranges, otherwise `usage` applies.
-        range: Option<(u16, u16)>,
-        usage: u16,
-        report_count: u16,
-        /// Raw main-item data (`BitField`) as declared by the device.
-        flags: u32,
-    },
+/// The part of a field that depends on which `HidP` cap it came from.
+#[derive(Clone, Copy)]
+enum FieldKind {
+    /// From `HidP_GetButtonCaps`: one bit per usage when variable, an array
+    /// selector otherwise.
+    Button,
+    /// From `HidP_GetValueCaps`: a sized value with logical/physical ranges.
     Value {
-        usage_page: u16,
-        range: Option<(u16, u16)>,
-        usage: u16,
-        report_count: u16,
         bit_size: u16,
         logical_min: i32,
         logical_max: i32,
@@ -1394,33 +1322,35 @@ enum FieldData {
         physical_max: i32,
         unit: u32,
         unit_exp: i32,
-        flags: u32,
     },
-    /// Synthesized constant padding (see `get_report_descriptor` docs).
+    /// Synthesized constant padding (see `get_report_descriptor` docs). Its
+    /// `Common` is a placeholder: padding emits no usage items.
     Padding { bits: u32 },
 }
 
 struct Field {
-    kind: u8,
+    kind: ReportKind,
     report_id: u8,
     /// Owning link collection index.
     link: u16,
-    /// HidP enumeration order, used as the in-report tiebreaker.
+    /// `HidP` enumeration order, used as the in-report tiebreaker.
     order: usize,
-    data: FieldData,
+    common: Common,
+    data: FieldKind,
 }
 
-impl FieldData {
+impl Field {
     /// `(report_size, report_count)` as they will be emitted.
     fn layout(&self) -> (u32, u32) {
-        match *self {
-            FieldData::Button {
-                range,
-                report_count,
-                flags,
-                ..
-            } => {
-                if flags & MainFlags::VARIABLE != 0 {
+        let Common {
+            range,
+            report_count,
+            flags,
+            ..
+        } = self.common;
+        match self.data {
+            FieldKind::Button => {
+                if flags.is_variable() {
                     let count = match range {
                         Some((lo, hi)) => u32::from(hi.saturating_sub(lo)) + 1,
                         None => report_count.max(1) as u32,
@@ -1432,132 +1362,143 @@ impl FieldData {
                     (if max > 255 { 16 } else { 8 }, report_count.max(1) as u32)
                 }
             }
-            FieldData::Value {
-                range,
-                report_count,
-                bit_size,
-                ..
-            } => {
+            FieldKind::Value { bit_size, .. } => {
                 let mut count = report_count.max(1) as u32;
                 if let Some((lo, hi)) = range {
                     count = count.max(u32::from(hi.saturating_sub(lo)) + 1);
                 }
                 (bit_size as u32, count)
             }
-            FieldData::Padding { bits } => (bits, 1),
+            FieldKind::Padding { bits } => (bits, 1),
         }
     }
 }
 
+/// The `IsRange`/`IsAlias` handling and usage extraction shared by
+/// `HIDP_BUTTON_CAPS` and `HIDP_VALUE_CAPS`, which declare the same leading
+/// fields but are distinct types.
+macro_rules! caps_common {
+    ($c:expr) => {{
+        let c = $c;
+        // SAFETY: IsRange selects the active union arm.
+        let (range, usage) = unsafe {
+            if c.IsRange {
+                (
+                    Some((c.Anonymous.Range.UsageMin, c.Anonymous.Range.UsageMax)),
+                    0,
+                )
+            } else {
+                (None, c.Anonymous.NotRange.Usage)
+            }
+        };
+        Common {
+            usage_page: c.UsagePage,
+            range,
+            usage,
+            report_count: c.ReportCount,
+            flags: MainFlags(c.BitField as u32),
+        }
+    }};
+}
+
+/// Fetch one cap array through its `HidP_Get*Caps` entry point.
+///
+/// Returns an empty vector when the device declares none or the call fails;
+/// a report type whose caps cannot be read simply contributes no fields.
+macro_rules! read_caps {
+    ($get:ident, $ty:ty, $report_type:expr, $declared:expr, $pp:expr) => {{
+        let declared = $declared;
+        if declared == 0 {
+            Vec::new()
+        } else {
+            let mut caps = vec![<$ty>::default(); declared as usize];
+            let mut len = declared;
+            // SAFETY: caps has room for `len` entries.
+            let status = unsafe { $get($report_type, caps.as_mut_ptr(), &mut len, $pp) };
+            if status == HIDP_STATUS_SUCCESS {
+                caps.truncate(len as usize);
+                caps
+            } else {
+                Vec::new()
+            }
+        }
+    }};
+}
+
 /// Pull every button/value cap for all three report types.
 fn collect_fields(pp: &PreparsedData, caps: &HIDP_CAPS) -> Vec<Field> {
-    let kinds: [(u8, HIDP_REPORT_TYPE, u16, u16); 3] = [
+    let per_kind: [(ReportKind, HIDP_REPORT_TYPE, u16, u16); 3] = [
         (
-            KIND_INPUT,
+            ReportKind::Input,
             HidP_Input,
             caps.NumberInputButtonCaps,
             caps.NumberInputValueCaps,
         ),
         (
-            KIND_OUTPUT,
+            ReportKind::Output,
             HidP_Output,
             caps.NumberOutputButtonCaps,
             caps.NumberOutputValueCaps,
         ),
         (
-            KIND_FEATURE,
+            ReportKind::Feature,
             HidP_Feature,
             caps.NumberFeatureButtonCaps,
             caps.NumberFeatureValueCaps,
         ),
     ];
+
     let mut fields = Vec::new();
-    for (kind, report_type, n_buttons, n_values) in kinds {
-        if n_buttons > 0 {
-            let mut buttons = vec![HIDP_BUTTON_CAPS::default(); n_buttons as usize];
-            let mut len = n_buttons;
-            // SAFETY: buttons has room for `len` entries.
-            let status =
-                unsafe { HidP_GetButtonCaps(report_type, buttons.as_mut_ptr(), &mut len, pp.0) };
-            if status == HIDP_STATUS_SUCCESS {
-                buttons.truncate(len as usize);
-                for c in &buttons {
-                    if c.IsAlias {
-                        // Aliased usages share a field with the primary one.
-                        continue;
-                    }
-                    // SAFETY: IsRange selects the active union arm.
-                    let (range, usage) = unsafe {
-                        if c.IsRange {
-                            (
-                                Some((c.Anonymous.Range.UsageMin, c.Anonymous.Range.UsageMax)),
-                                0,
-                            )
-                        } else {
-                            (None, c.Anonymous.NotRange.Usage)
-                        }
-                    };
-                    fields.push(Field {
-                        kind,
-                        report_id: c.ReportID,
-                        link: c.LinkCollection,
-                        order: fields.len(),
-                        data: FieldData::Button {
-                            usage_page: c.UsagePage,
-                            range,
-                            usage,
-                            report_count: c.ReportCount,
-                            flags: c.BitField as u32,
-                        },
-                    });
-                }
+    for (kind, report_type, n_buttons, n_values) in per_kind {
+        let buttons = read_caps!(
+            HidP_GetButtonCaps,
+            HIDP_BUTTON_CAPS,
+            report_type,
+            n_buttons,
+            pp.0
+        );
+        for c in &buttons {
+            // Aliased usages share a field with the primary one.
+            if c.IsAlias {
+                continue;
             }
+            fields.push(Field {
+                kind,
+                report_id: c.ReportID,
+                link: c.LinkCollection,
+                order: fields.len(),
+                common: caps_common!(c),
+                data: FieldKind::Button,
+            });
         }
-        if n_values > 0 {
-            let mut values = vec![HIDP_VALUE_CAPS::default(); n_values as usize];
-            let mut len = n_values;
-            // SAFETY: values has room for `len` entries.
-            let status =
-                unsafe { HidP_GetValueCaps(report_type, values.as_mut_ptr(), &mut len, pp.0) };
-            if status == HIDP_STATUS_SUCCESS {
-                values.truncate(len as usize);
-                for c in &values {
-                    if c.IsAlias {
-                        continue;
-                    }
-                    // SAFETY: IsRange selects the active union arm.
-                    let (range, usage) = unsafe {
-                        if c.IsRange {
-                            (
-                                Some((c.Anonymous.Range.UsageMin, c.Anonymous.Range.UsageMax)),
-                                0,
-                            )
-                        } else {
-                            (None, c.Anonymous.NotRange.Usage)
-                        }
-                    };
-                    fields.push(Field {
-                        kind,
-                        report_id: c.ReportID,
-                        link: c.LinkCollection,
-                        order: fields.len(),
-                        data: FieldData::Value {
-                            usage_page: c.UsagePage,
-                            range,
-                            usage,
-                            report_count: c.ReportCount,
-                            bit_size: c.BitSize,
-                            logical_min: c.LogicalMin,
-                            logical_max: c.LogicalMax,
-                            physical_min: c.PhysicalMin,
-                            physical_max: c.PhysicalMax,
-                            unit: c.Units,
-                            unit_exp: c.UnitsExp as i32,
-                            flags: c.BitField as u32,
-                        },
-                    });
-                }
+
+        let values = read_caps!(
+            HidP_GetValueCaps,
+            HIDP_VALUE_CAPS,
+            report_type,
+            n_values,
+            pp.0
+        );
+        for c in &values {
+            if c.IsAlias {
+                continue;
             }
+            fields.push(Field {
+                kind,
+                report_id: c.ReportID,
+                link: c.LinkCollection,
+                order: fields.len(),
+                common: caps_common!(c),
+                data: FieldKind::Value {
+                    bit_size: c.BitSize,
+                    logical_min: c.LogicalMin,
+                    logical_max: c.LogicalMax,
+                    physical_min: c.PhysicalMin,
+                    physical_max: c.PhysicalMax,
+                    unit: c.Units,
+                    unit_exp: c.UnitsExp as i32,
+                },
+            });
         }
     }
     fields
@@ -1568,9 +1509,9 @@ fn collect_fields(pp: &PreparsedData, caps: &HIDP_CAPS) -> Vec<Field> {
 /// not part of the descriptor-declared bits).
 fn synthesize_padding(caps: &HIDP_CAPS, fields: &mut Vec<Field>) {
     for (kind, report_len) in [
-        (KIND_INPUT, caps.InputReportByteLength),
-        (KIND_OUTPUT, caps.OutputReportByteLength),
-        (KIND_FEATURE, caps.FeatureReportByteLength),
+        (ReportKind::Input, caps.InputReportByteLength),
+        (ReportKind::Output, caps.OutputReportByteLength),
+        (ReportKind::Feature, caps.FeatureReportByteLength),
     ] {
         if report_len < 2 {
             continue;
@@ -1579,7 +1520,7 @@ fn synthesize_padding(caps: &HIDP_CAPS, fields: &mut Vec<Field>) {
         let mut bits = 0u64;
         for f in fields.iter().filter(|f| f.kind == kind) {
             ids.insert(f.report_id);
-            let (size, count) = f.data.layout();
+            let (size, count) = f.layout();
             bits += u64::from(size) * u64::from(count);
         }
         if ids.len() != 1 {
@@ -1593,7 +1534,14 @@ fn synthesize_padding(caps: &HIDP_CAPS, fields: &mut Vec<Field>) {
                 report_id: *ids.first().expect("one id"),
                 link: 0,
                 order: usize::MAX, // sorts after all real fields
-                data: FieldData::Padding {
+                common: Common {
+                    usage_page: 0,
+                    range: None,
+                    usage: 0,
+                    report_count: 1,
+                    flags: MainFlags::CONSTANT,
+                },
+                data: FieldKind::Padding {
                     bits: (declared - bits) as u32,
                 },
             });
@@ -1641,33 +1589,25 @@ fn emit_collection(
 }
 
 fn emit_field(b: &mut DescriptorBuilder, field: &Field) {
-    if let FieldData::Padding { bits } = field.data {
+    let (size, count) = field.layout();
+
+    if let FieldKind::Padding { .. } = field.data {
         if field.report_id != 0 {
             b.report_id(field.report_id);
         }
-        b.report_size(bits);
-        b.report_count(1);
+        b.report_size(size);
+        b.report_count(count);
         emit_main(b, field.kind, MainFlags::CONSTANT);
         return;
     }
 
-    let (usage_page, range, usage, flags) = match field.data {
-        FieldData::Button {
-            usage_page,
-            range,
-            usage,
-            flags,
-            ..
-        }
-        | FieldData::Value {
-            usage_page,
-            range,
-            usage,
-            flags,
-            ..
-        } => (usage_page, range, usage, flags),
-        FieldData::Padding { .. } => unreachable!(),
-    };
+    let Common {
+        usage_page,
+        range,
+        usage,
+        flags,
+        ..
+    } = field.common;
 
     b.usage_page(usage_page);
     if field.report_id != 0 {
@@ -1686,12 +1626,11 @@ fn emit_field(b: &mut DescriptorBuilder, field: &Field) {
     // Globals are re-emitted for every field (zero values encode as
     // zero-length payloads), so nothing leaks between fields.
     match field.data {
-        FieldData::Button { range, flags, .. } => {
-            if flags & MainFlags::VARIABLE != 0 {
-                b.logical_minimum(0);
+        FieldKind::Button => {
+            b.logical_minimum(0);
+            if flags.is_variable() {
                 b.logical_maximum(1);
             } else {
-                b.logical_minimum(0);
                 b.logical_maximum(range.map(|(_, hi)| hi).unwrap_or(1) as i32);
             }
             b.physical_minimum(0);
@@ -1699,7 +1638,7 @@ fn emit_field(b: &mut DescriptorBuilder, field: &Field) {
             b.unit_exponent(0);
             b.unit(0);
         }
-        FieldData::Value {
+        FieldKind::Value {
             logical_min,
             logical_max,
             physical_min,
@@ -1715,20 +1654,19 @@ fn emit_field(b: &mut DescriptorBuilder, field: &Field) {
             b.unit_exponent(unit_exp);
             b.unit(unit);
         }
-        FieldData::Padding { .. } => unreachable!(),
+        FieldKind::Padding { .. } => {}
     }
 
-    let (size, count) = field.data.layout();
     b.report_size(size);
     b.report_count(count);
     emit_main(b, field.kind, flags);
 }
 
-fn emit_main(b: &mut DescriptorBuilder, kind: u8, flags: u32) {
+fn emit_main(b: &mut DescriptorBuilder, kind: ReportKind, flags: MainFlags) {
     match kind {
-        KIND_INPUT => b.input(flags),
-        KIND_OUTPUT => b.output(flags),
-        _ => b.feature(flags),
+        ReportKind::Input => b.input(flags),
+        ReportKind::Output => b.output(flags),
+        ReportKind::Feature => b.feature(flags),
     };
 }
 
@@ -1814,15 +1752,18 @@ mod tests {
             ..Default::default()
         };
         let mut fields = vec![Field {
-            kind: KIND_INPUT,
+            kind: ReportKind::Input,
             report_id: 0,
             link: 0,
             order: 0,
-            data: FieldData::Value {
+            common: Common {
                 usage_page: 1,
                 range: None,
                 usage: 0x30,
                 report_count: 2,
+                flags: MainFlags::VARIABLE,
+            },
+            data: FieldKind::Value {
                 bit_size: 8,
                 logical_min: 0,
                 logical_max: 255,
@@ -1830,13 +1771,12 @@ mod tests {
                 physical_max: 0,
                 unit: 0,
                 unit_exp: 0,
-                flags: MainFlags::VARIABLE,
             },
         }];
         synthesize_padding(&caps, &mut fields);
         assert_eq!(fields.len(), 2);
         match fields[1].data {
-            FieldData::Padding { bits } => assert_eq!(bits, 64 - 16),
+            FieldKind::Padding { bits } => assert_eq!(bits, 64 - 16),
             _ => panic!("expected padding"),
         }
     }

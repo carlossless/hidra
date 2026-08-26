@@ -20,7 +20,7 @@ pub(crate) struct Reactor {
 
 impl Reactor {
     /// The process-wide reactor, spawning its thread on first use.
-    pub fn global() -> &'static Reactor {
+    pub(crate) fn global() -> &'static Reactor {
         static REACTOR: OnceLock<&'static Reactor> = OnceLock::new();
         REACTOR.get_or_init(|| {
             let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
@@ -40,13 +40,23 @@ impl Reactor {
     /// Wake `waker` once `fd` is readable (or in an error state). The
     /// registration is consumed by the wake-up; spurious wake-ups after a
     /// stale registration are allowed by the `Future` contract.
-    pub fn register(&self, fd: RawFd, waker: &Waker) {
+    pub(crate) fn register(&self, fd: RawFd, waker: &Waker) {
         let mut interests = self.interests.lock().unwrap();
         let wakers = interests.entry(fd).or_default();
         if !wakers.iter().any(|w| w.will_wake(waker)) {
             wakers.push(waker.clone());
         }
         drop(interests);
+        self.nudge();
+    }
+
+    /// Forget any interest in `fd`, without waking what was parked on it.
+    ///
+    /// Called when a device is closing: registrations are keyed by fd number,
+    /// so a stale entry would otherwise still be in the interest set when the
+    /// kernel hands that number to the next `open`.
+    pub(crate) fn deregister(&self, fd: RawFd) {
+        self.interests.lock().unwrap().remove(&fd);
         self.nudge();
     }
 
@@ -145,7 +155,7 @@ mod tests {
             unsafe { libc::write(write_end, b"x".as_ptr().cast(), 1) };
         });
 
-        crate::test_util::block_on(Readable(read_end));
+        crate::maybe_future::block_on(Readable(read_end));
         writer.join().unwrap();
         unsafe {
             libc::close(read_end);
@@ -158,7 +168,7 @@ mod tests {
         let mut fds = [0 as RawFd; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) };
-        crate::test_util::block_on(Readable(fds[0]));
+        crate::maybe_future::block_on(Readable(fds[0]));
         unsafe {
             libc::close(fds[0]);
             libc::close(fds[1]);

@@ -17,12 +17,9 @@
 //! pub(crate) struct PlatformDevice;
 //! impl PlatformDevice {
 //!     pub fn write(&self, data: &[u8]) -> HidResult<usize>;
-//!     pub fn read(&self, buf: &mut [u8]) -> HidResult<usize>;
-//!     pub fn read_timeout(&self, buf: &mut [u8], timeout_ms: i32) -> HidResult<usize>;
 //!     /// Returns a Send future resolving with one input report; never 0.
 //!     pub fn read_async<'a>(&'a self, buf: &'a mut [u8])
 //!         -> impl Future<Output = HidResult<usize>> + Send + 'a;
-//!     pub fn set_blocking_mode(&self, blocking: bool) -> HidResult<()>;
 //!     pub fn send_feature_report(&self, data: &[u8]) -> HidResult<()>;
 //!     pub fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize>;
 //!     pub fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize>;
@@ -40,13 +37,10 @@
 //! * `write` / `send_feature_report`: `data[0]` is the report ID; use 0 when
 //!   the device has no numbered reports. The ID byte counts toward the
 //!   returned length.
-//! * `read` / `read_timeout`: input reports are prefixed with their report ID
-//!   only when the device uses numbered reports. `timeout_ms < 0` blocks
-//!   forever, `0` polls.
 //! * `get_feature_report` / `get_input_report`: `buf[0]` must contain the
 //!   report ID on entry; on return the buffer starts with that ID.
-//! * In non-blocking mode, `read` returns `Ok(0)` when no report is queued.
-//! * `read_async` ignores the blocking mode, never resolves with `Ok(0)`,
+//! * `read_async` yields input reports prefixed with their report ID only
+//!   when the device uses numbered reports. It never resolves with `Ok(0)`,
 //!   fails with `HidError::Disconnected` on removal, and must be
 //!   cancel-safe: dropping the future may not lose an already-delivered
 //!   report (it stays queued for the next read). Wake-ups are

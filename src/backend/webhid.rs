@@ -2,7 +2,7 @@
 //!
 //! Internal module: the public `wasm32` surface is [`crate::Hidra`] /
 //! [`crate::HidDevice`], which wrap the types here. Unlike the native backends
-//! this API is inherently async (every WebHID operation returns a Promise) and
+//! this API is inherently async (every `WebHID` operation returns a Promise) and
 //! event-driven (input reports arrive as `inputreport` events instead of being
 //! read from a handle). Method names and buffer conventions still mirror
 //! hidapi where they make sense:
@@ -13,7 +13,7 @@
 //! * [`WebHidDevice::get_feature_report`] and [`InputReportStream::read`]
 //!   return hidapi-style buffers (report-ID prefixed when numbered).
 //!
-//! WebHID is only available in secure contexts (HTTPS or localhost) on
+//! `WebHID` is only available in secure contexts (HTTPS or localhost) on
 //! Chromium-based browsers, and device access is permission-gated: the user
 //! must pick devices from the chooser shown by
 //! [`crate::Hidra::request_device`], which in turn may only be called from a
@@ -48,7 +48,7 @@ use wasm_bindgen_futures::JsFuture;
 use crate::error::{HidError, HidResult};
 use crate::{BusType, DeviceInfo};
 
-pub use crate::report_info::{
+pub(crate) use crate::report_info::{
     reconstruct_descriptor, uses_report_ids, CollectionInfo, ReportInfo, ReportItemInfo, UnitSystem,
 };
 
@@ -120,6 +120,15 @@ impl EventListenerHandle {
     }
 }
 
+impl core::fmt::Debug for EventListenerHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("EventListenerHandle")
+            .field("event", &self.event)
+            .field("registered", &self.closure.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Drop for EventListenerHandle {
     fn drop(&mut self) {
         if let Some(closure) = &self.closure {
@@ -130,7 +139,7 @@ impl Drop for EventListenerHandle {
     }
 }
 
-/// A device filter for [`crate::Hidra::request_device`], mirroring WebHID's
+/// A device filter for [`crate::Hidra::request_device`], mirroring `WebHID`'s
 /// `HIDDeviceFilter` dictionary. Unset fields match anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DeviceFilter {
@@ -192,24 +201,24 @@ impl DeviceFilter {
     }
 }
 
-/// Entry point to WebHID (`hid_init` / `hid_enumerate` equivalent, bound to
+/// Entry point to `WebHID` (`hid_init` / `hid_enumerate` equivalent, bound to
 /// `navigator.hid`).
 ///
 /// Enumeration differs from native hidapi: the browser only ever exposes
 /// devices the user has granted access to.
 /// [`request_device`](Self::request_device) shows the permission chooser,
 /// [`get_devices`](Self::get_devices) lists previously granted devices.
-pub struct WebHidApi {
+pub(crate) struct WebHidApi {
     hid: web_sys::Hid,
 }
 
 impl WebHidApi {
     /// Bind to `window.navigator.hid`.
     ///
-    /// Fails with [`HidError::Initialization`] when WebHID is unavailable:
-    /// no `window` (e.g. a worker without WebHID), a non-secure context, or
-    /// a browser without WebHID support.
-    pub fn new() -> HidResult<Self> {
+    /// Fails with [`HidError::Initialization`] when `WebHID` is unavailable:
+    /// no `window` (e.g. a worker without `WebHID`), a non-secure context, or
+    /// a browser without `WebHID` support.
+    pub(crate) fn new() -> HidResult<Self> {
         let window = web_sys::window().ok_or_else(|| HidError::Initialization {
             message: "no global window object (WebHID requires a window context)".into(),
         })?;
@@ -233,7 +242,10 @@ impl WebHidApi {
     /// user granted (an empty `Vec` when the chooser was dismissed). **Must
     /// be called from within a user gesture** (e.g. a click event handler),
     /// otherwise the browser rejects the request.
-    pub async fn request_device(&self, filters: &[DeviceFilter]) -> HidResult<Vec<WebHidDevice>> {
+    pub(crate) async fn request_device(
+        &self,
+        filters: &[DeviceFilter],
+    ) -> HidResult<Vec<WebHidDevice>> {
         let js_filters: Vec<web_sys::HidDeviceFilter> = filters.iter().map(|f| f.to_js()).collect();
         let options = web_sys::HidDeviceRequestOptions::new(&js_filters);
         let devices = JsFuture::from(self.hid.request_device(&options))
@@ -244,7 +256,7 @@ impl WebHidApi {
 
     /// Devices the user has already granted this origin access to
     /// (`navigator.hid.getDevices`). Needs no user gesture.
-    pub async fn get_devices(&self) -> HidResult<Vec<WebHidDevice>> {
+    pub(crate) async fn get_devices(&self) -> HidResult<Vec<WebHidDevice>> {
         let devices = JsFuture::from(self.hid.get_devices())
             .await
             .map_err(|e| js_err("getDevices", e))?;
@@ -253,13 +265,16 @@ impl WebHidApi {
 
     /// Invoke `f` whenever a granted device is plugged in (the `connect`
     /// event). Drop the returned handle to unregister.
-    pub fn on_connect(&self, f: impl FnMut(WebHidDevice) + 'static) -> EventListenerHandle {
+    pub(crate) fn on_connect(&self, f: impl FnMut(WebHidDevice) + 'static) -> EventListenerHandle {
         self.connection_listener("connect", f)
     }
 
     /// Invoke `f` whenever a granted device is unplugged (the `disconnect`
     /// event). Drop the returned handle to unregister.
-    pub fn on_disconnect(&self, f: impl FnMut(WebHidDevice) + 'static) -> EventListenerHandle {
+    pub(crate) fn on_disconnect(
+        &self,
+        f: impl FnMut(WebHidDevice) + 'static,
+    ) -> EventListenerHandle {
         self.connection_listener("disconnect", f)
     }
 
@@ -276,7 +291,7 @@ impl WebHidApi {
     }
 
     /// The underlying `navigator.hid` object.
-    pub fn raw(&self) -> &web_sys::Hid {
+    pub(crate) fn raw(&self) -> &web_sys::Hid {
         &self.hid
     }
 }
@@ -288,23 +303,23 @@ impl WebHidApi {
 /// unlike native hidapi the handle exists before the device is opened, call
 /// [`open`](Self::open) before transferring reports.
 #[derive(Debug, Clone)]
-pub struct WebHidDevice {
+pub(crate) struct WebHidDevice {
     device: web_sys::HidDevice,
 }
 
 impl WebHidDevice {
     /// Wrap a `web_sys::HidDevice` obtained elsewhere (e.g. from JS glue).
-    pub fn from_raw(device: web_sys::HidDevice) -> Self {
+    pub(crate) fn from_raw(device: web_sys::HidDevice) -> Self {
         WebHidDevice { device }
     }
 
     /// The underlying `HIDDevice` object.
-    pub fn raw(&self) -> &web_sys::HidDevice {
+    pub(crate) fn raw(&self) -> &web_sys::HidDevice {
         &self.device
     }
 
     /// Open the device for I/O (`hid_open` equivalent; `HIDDevice.open`).
-    pub async fn open(&self) -> HidResult<()> {
+    pub(crate) async fn open(&self) -> HidResult<()> {
         JsFuture::from(self.device.open())
             .await
             .map_err(|e| match js_err("open", e) {
@@ -316,7 +331,7 @@ impl WebHidDevice {
 
     /// Close the device (`hid_close` equivalent; `HIDDevice.close`). The
     /// permission grant is kept, reopen with [`open`](Self::open).
-    pub async fn close(&self) -> HidResult<()> {
+    pub(crate) async fn close(&self) -> HidResult<()> {
         JsFuture::from(self.device.close())
             .await
             .map_err(|e| js_err("close", e))?;
@@ -327,10 +342,10 @@ impl WebHidDevice {
     /// (`HIDDevice.forget`; no hidapi equivalent). The device disappears
     /// from [`WebHidApi::get_devices`] until requested again.
     ///
-    /// `forget()` is newer than the rest of WebHID (Chromium 100+) and is
+    /// `forget()` is newer than the rest of `WebHID` (Chromium 100+) and is
     /// called dynamically; browsers without it yield
     /// [`HidError::Unsupported`].
-    pub async fn forget(&self) -> HidResult<()> {
+    pub(crate) async fn forget(&self) -> HidResult<()> {
         let device_js: &JsValue = self.device.as_ref();
         let method = js_sys::Reflect::get(device_js, &JsValue::from_str("forget"))
             .map_err(|e| js_err("forget", e))?;
@@ -349,24 +364,24 @@ impl WebHidDevice {
     }
 
     /// Whether the device is currently open (`HIDDevice.opened`).
-    pub fn opened(&self) -> bool {
+    pub(crate) fn opened(&self) -> bool {
         self.device.opened()
     }
 
     /// USB-style vendor ID.
-    pub fn vendor_id(&self) -> u16 {
+    pub(crate) fn vendor_id(&self) -> u16 {
         self.device.vendor_id()
     }
 
     /// USB-style product ID.
-    pub fn product_id(&self) -> u16 {
+    pub(crate) fn product_id(&self) -> u16 {
         self.device.product_id()
     }
 
     /// Product string (`hid_get_product_string` equivalent;
     /// `HIDDevice.productName`). `None` when the browser reports an empty
     /// name.
-    pub fn product_name(&self) -> Option<String> {
+    pub(crate) fn product_name(&self) -> Option<String> {
         let name = self.device.product_name();
         if name.is_empty() {
             None
@@ -376,18 +391,18 @@ impl WebHidDevice {
     }
 
     /// Metadata for this device (`hid_get_device_info` equivalent), filled
-    /// with everything WebHID exposes:
+    /// with everything `WebHID` exposes:
     ///
     /// * vendor/product ID and product string;
     /// * `usage_page`/`usage` from the first top-level collection;
     /// * a synthetic `path` of the form `webhid:<vid>:<pid>:<product>`
-    ///   (WebHID has no stable platform path; the path cannot be used to
+    ///   (`WebHID` has no stable platform path; the path cannot be used to
     ///   reopen a device);
     /// * `bus_type` is always [`BusType::Unknown`] and `interface_number` is
     ///   `-1` ("not applicable"); serial number, manufacturer string and
-    ///   release number are not exposed by WebHID and stay at their
+    ///   release number are not exposed by `WebHID` and stay at their
     ///   defaults.
-    pub fn device_info(&self) -> DeviceInfo {
+    pub(crate) fn device_info(&self) -> DeviceInfo {
         let vendor_id = self.vendor_id();
         let product_id = self.product_id();
         let product = self.product_name();
@@ -419,7 +434,7 @@ impl WebHidDevice {
     /// hidapi buffer convention: `data[0]` is the report ID (0 when the
     /// device has no numbered reports) and is not part of the payload.
     /// Returns `data.len()` on success, like `hid_write`.
-    pub async fn write(&self, data: &[u8]) -> HidResult<usize> {
+    pub(crate) async fn write(&self, data: &[u8]) -> HidResult<usize> {
         let (report_id, payload) = data.split_first().ok_or_else(|| HidError::InvalidData {
             message: "write requires at least the report ID byte".into(),
         })?;
@@ -437,7 +452,7 @@ impl WebHidDevice {
     /// Send a feature report (`hid_send_feature_report` equivalent;
     /// `HIDDevice.sendFeatureReport`). `data[0]` is the report ID, 0 if
     /// unnumbered.
-    pub async fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
+    pub(crate) async fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
         let (report_id, payload) = data.split_first().ok_or_else(|| HidError::InvalidData {
             message: "send_feature_report requires at least the report ID byte".into(),
         })?;
@@ -459,7 +474,7 @@ impl WebHidDevice {
     /// convention; the returned buffer is prefixed with `report_id` (added
     /// by hidra, not parsed from the browser data) so it matches the buffer
     /// layout `hid_get_feature_report` produces.
-    pub async fn get_feature_report(&self, report_id: u8) -> HidResult<Vec<u8>> {
+    pub(crate) async fn get_feature_report(&self, report_id: u8) -> HidResult<Vec<u8>> {
         let view = JsFuture::from(self.device.receive_feature_report(report_id))
             .await
             .map_err(|e| js_err("receiveFeatureReport", e))?;
@@ -486,7 +501,10 @@ impl WebHidDevice {
     /// unnumbered reports. Drop the returned handle to unregister.
     ///
     /// The device must be [`open`](Self::open)ed to receive reports.
-    pub fn on_input_report(&self, mut f: impl FnMut(u8, Vec<u8>) + 'static) -> EventListenerHandle {
+    pub(crate) fn on_input_report(
+        &self,
+        mut f: impl FnMut(u8, Vec<u8>) + 'static,
+    ) -> EventListenerHandle {
         let closure = Closure::wrap(Box::new(move |ev: web_sys::Event| {
             let ev: web_sys::HidInputReportEvent = ev.unchecked_into();
             f(ev.report_id(), dataview_to_vec(&ev.data()));
@@ -495,12 +513,12 @@ impl WebHidDevice {
     }
 
     /// Start buffering input reports, returning a stream to read them from
-    /// (the closest WebHID gets to `hid_read`).
+    /// (the closest `WebHID` gets to `hid_read`).
     ///
     /// Reports are queued from the moment this is called (the device must be
     /// [`open`](Self::open)ed); at most 64 are buffered, after which the
     /// oldest is dropped. Dropping the stream stops listening.
-    pub fn start_reading(&self) -> InputReportStream {
+    pub(crate) fn start_reading(&self) -> InputReportStream {
         // Match the native read() convention: prefix the report ID byte only
         // when the device declares numbered reports.
         let numbered = uses_report_ids(&self.collections());
@@ -535,7 +553,7 @@ impl WebHidDevice {
 
     /// The collection tree the browser parsed from the device's report
     /// descriptor (`HIDDevice.collections`), converted to plain Rust types.
-    pub fn collections(&self) -> Vec<CollectionInfo> {
+    pub(crate) fn collections(&self) -> Vec<CollectionInfo> {
         self.device
             .collections()
             .iter()
@@ -551,13 +569,15 @@ impl WebHidDevice {
     /// the browser-parsed collection data via
     /// [`reconstruct_descriptor`]: report IDs, sizes, flags and usages are
     /// preserved, exact byte layout is not.
-    pub fn report_descriptor(&self) -> HidResult<Vec<u8>> {
+    pub(crate) fn report_descriptor(&self) -> HidResult<Vec<u8>> {
         Ok(reconstruct_descriptor(&self.collections()))
     }
 
     /// Parsed report descriptor (hidra extension, matching the native
     /// `HidDevice::parsed_report_descriptor`).
-    pub fn parsed_report_descriptor(&self) -> HidResult<crate::descriptor::ReportDescriptor> {
+    pub(crate) fn parsed_report_descriptor(
+        &self,
+    ) -> HidResult<crate::descriptor::ReportDescriptor> {
         crate::descriptor::ReportDescriptor::parse(&self.report_descriptor()?)
     }
 }
@@ -580,6 +600,14 @@ struct StreamState {
 pub struct InputReportStream {
     state: Rc<RefCell<StreamState>>,
     _listener: EventListenerHandle,
+}
+
+impl core::fmt::Debug for InputReportStream {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("InputReportStream")
+            .field("queued", &self.state.borrow().queue.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl InputReportStream {

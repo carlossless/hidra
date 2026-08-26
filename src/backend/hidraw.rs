@@ -6,7 +6,6 @@
 use std::fs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::descriptor::ReportDescriptor;
 use crate::error::{HidError, HidResult};
@@ -25,9 +24,9 @@ use crate::{BusType, DeviceInfo, MAX_REPORT_DESCRIPTOR_SIZE};
     target_arch = "sparc64",
 )))]
 mod ioc {
-    pub const SIZEBITS: u32 = 14; // dir takes the remaining 2 bits
-    pub const WRITE: u32 = 1;
-    pub const READ: u32 = 2;
+    pub(super) const SIZEBITS: u32 = 14; // dir takes the remaining 2 bits
+    pub(super) const WRITE: u32 = 1;
+    pub(super) const READ: u32 = 2;
 }
 
 #[cfg(any(
@@ -259,11 +258,11 @@ fn device_infos(hid_dev_dir: &Path, dev_path: &str) -> Option<Vec<DeviceInfo>> {
 pub(crate) struct HidrawApi;
 
 impl HidrawApi {
-    pub fn new() -> HidResult<Self> {
+    pub(crate) fn new() -> HidResult<Self> {
         Ok(HidrawApi)
     }
 
-    pub fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>> {
+    pub(crate) fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>> {
         let mut result = Vec::new();
         let entries = match fs::read_dir("/sys/class/hidraw") {
             Ok(entries) => entries,
@@ -295,7 +294,7 @@ impl HidrawApi {
         Ok(result)
     }
 
-    pub fn open(
+    pub(crate) fn open(
         &self,
         vendor_id: u16,
         product_id: u16,
@@ -312,7 +311,7 @@ impl HidrawApi {
         self.open_path(&info.path)
     }
 
-    pub fn open_path(&self, path: &str) -> HidResult<HidrawDevice> {
+    pub(crate) fn open_path(&self, path: &str) -> HidResult<HidrawDevice> {
         HidrawDevice::open(path)
     }
 }
@@ -321,10 +320,6 @@ impl HidrawApi {
 
 pub(crate) struct HidrawDevice {
     fd: OwnedFd,
-    // Part of the backend contract; the wrapper now reads input via
-    // `read_async`, so the blocking-mode state is unused on this path.
-    #[allow(dead_code)]
-    blocking: AtomicBool,
     /// Canonical sysfs HID device directory, for metadata lookups.
     sysfs_hid_dir: PathBuf,
     /// `/dev/hidrawN`.
@@ -351,7 +346,6 @@ impl HidrawDevice {
         let sysfs_hid_dir = sysfs_dir_for_fd(fd.as_raw_fd())?;
         Ok(HidrawDevice {
             fd,
-            blocking: AtomicBool::new(true),
             sysfs_hid_dir,
             dev_path: path.to_string(),
         })
@@ -361,7 +355,7 @@ impl HidrawDevice {
         self.fd.as_raw_fd()
     }
 
-    pub fn write(&self, data: &[u8]) -> HidResult<usize> {
+    pub(crate) fn write(&self, data: &[u8]) -> HidResult<usize> {
         if data.is_empty() {
             return Err(HidError::InvalidData {
                 message: "write data must contain a report ID byte".into(),
@@ -386,37 +380,18 @@ impl HidrawDevice {
         Ok(res)
     }
 
-    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
-    pub fn read(&self, buf: &mut [u8]) -> HidResult<usize> {
-        let timeout = if self.blocking.load(Ordering::Relaxed) {
-            -1
-        } else {
-            0
-        };
-        self.read_timeout(buf, timeout)
-    }
-
     /// Read one input report without ever returning `Ok(0)`: resolves when a
     /// report arrives, fails with [`HidError::Disconnected`] when the device
     /// goes away. Wake-ups come from the crate's [`reactor`](super::reactor).
-    pub fn read_async<'a>(&'a self, buf: &'a mut [u8]) -> ReadAsync<'a> {
+    pub(crate) fn read_async<'a>(&'a self, buf: &'a mut [u8]) -> ReadAsync<'a> {
         ReadAsync { dev: self, buf }
     }
 
     /// Non-blocking read attempt: `Ok(None)` when no report is queued.
+    ///
+    /// The fd is opened blocking, so readiness is established with a
+    /// zero-timeout `poll` before the `read` syscall.
     fn try_read_now(&self, buf: &mut [u8]) -> HidResult<Option<usize>> {
-        if buf.is_empty() {
-            return Err(HidError::InvalidData {
-                message: "read buffer must not be empty".into(),
-            });
-        }
-        match self.read_timeout(buf, 0)? {
-            0 => Ok(None),
-            n => Ok(Some(n)),
-        }
-    }
-
-    pub fn read_timeout(&self, buf: &mut [u8], timeout_ms: i32) -> HidResult<usize> {
         if buf.is_empty() {
             return Err(HidError::InvalidData {
                 message: "read buffer must not be empty".into(),
@@ -428,7 +403,7 @@ impl HidrawDevice {
             revents: 0,
         };
         loop {
-            let res = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+            let res = unsafe { libc::poll(&mut pollfd, 1, 0) };
             if res < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::EINTR) {
@@ -437,7 +412,7 @@ impl HidrawDevice {
                 return Err(HidError::io("poll on hidraw device", err));
             }
             if res == 0 {
-                return Ok(0); // timeout
+                return Ok(None);
             }
             break;
         }
@@ -448,21 +423,17 @@ impl HidrawDevice {
         if res < 0 {
             let err = std::io::Error::last_os_error();
             return match err.raw_os_error() {
-                Some(libc::EAGAIN) | Some(libc::EINPROGRESS) => Ok(0),
+                Some(libc::EAGAIN) | Some(libc::EINPROGRESS) => Ok(None),
                 Some(libc::EIO) | Some(libc::ENODEV) => Err(HidError::Disconnected),
                 _ => Err(HidError::io("hidraw read", err)),
             };
         }
-        Ok(res as usize)
+        // A zero-length read would make `read_async` resolve with `Ok(0)`,
+        // which its contract forbids; treat it as "nothing queued" instead.
+        Ok((res > 0).then_some(res as usize))
     }
 
-    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
-    pub fn set_blocking_mode(&self, blocking: bool) -> HidResult<()> {
-        self.blocking.store(blocking, Ordering::Relaxed);
-        Ok(())
-    }
-
-    pub fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
+    pub(crate) fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
         if data.is_empty() {
             return Err(HidError::InvalidData {
                 message: "feature report must contain a report ID byte".into(),
@@ -481,7 +452,7 @@ impl HidrawDevice {
         Ok(())
     }
 
-    pub fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize> {
+    pub(crate) fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize> {
         if buf.is_empty() {
             return Err(HidError::InvalidData {
                 message: "buffer must contain a report ID byte".into(),
@@ -500,7 +471,7 @@ impl HidrawDevice {
         Ok(res as usize)
     }
 
-    pub fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize> {
+    pub(crate) fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize> {
         if buf.is_empty() {
             return Err(HidError::InvalidData {
                 message: "buffer must contain a report ID byte".into(),
@@ -526,19 +497,19 @@ impl HidrawDevice {
         Ok(res as usize)
     }
 
-    pub fn get_manufacturer_string(&self) -> HidResult<Option<String>> {
+    pub(crate) fn get_manufacturer_string(&self) -> HidResult<Option<String>> {
         Ok(self.get_device_info()?.manufacturer_string)
     }
 
-    pub fn get_product_string(&self) -> HidResult<Option<String>> {
+    pub(crate) fn get_product_string(&self) -> HidResult<Option<String>> {
         Ok(self.get_device_info()?.product_string)
     }
 
-    pub fn get_serial_number_string(&self) -> HidResult<Option<String>> {
+    pub(crate) fn get_serial_number_string(&self) -> HidResult<Option<String>> {
         Ok(self.get_device_info()?.serial_number)
     }
 
-    pub fn get_indexed_string(&self, _index: u32) -> HidResult<Option<String>> {
+    pub(crate) fn get_indexed_string(&self, _index: u32) -> HidResult<Option<String>> {
         // Same as hidapi's hidraw backend: not available without raw USB
         // access. The `nusb` feature backend supports it.
         Err(HidError::Unsupported {
@@ -546,7 +517,7 @@ impl HidrawDevice {
         })
     }
 
-    pub fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize> {
+    pub(crate) fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize> {
         let mut size: libc::c_int = 0;
         let res = unsafe { libc::ioctl(self.raw_fd(), hidiocgrdescsize() as _, &mut size) };
         if res < 0 {
@@ -565,7 +536,7 @@ impl HidrawDevice {
         Ok(len)
     }
 
-    pub fn get_device_info(&self) -> HidResult<DeviceInfo> {
+    pub(crate) fn get_device_info(&self) -> HidResult<DeviceInfo> {
         let mut infos = device_infos(&self.sysfs_hid_dir, &self.dev_path)
             .ok_or_else(|| HidError::backend("failed to read device metadata from sysfs"))?;
         // For multi-collection devices hidapi returns the first entry.
@@ -684,7 +655,6 @@ mod tests {
         let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
         let dev = HidrawDevice {
             fd: write_fd,
-            blocking: AtomicBool::new(true),
             sysfs_hid_dir: PathBuf::new(),
             dev_path: String::new(),
         };

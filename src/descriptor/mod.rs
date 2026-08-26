@@ -7,7 +7,7 @@
 //! * [`ReportDescriptor`], a parsed model: the collection tree plus every
 //!   declared report with field offsets, usages, logical ranges and sizes.
 //! * [`DescriptorBuilder`], an encoder that emits descriptor bytes, used by
-//!   the WebHID backend to reconstruct descriptors from browser-parsed
+//!   the `WebHID` backend to reconstruct descriptors from browser-parsed
 //!   collection data and usable standalone.
 //!
 //! These primitives are platform-independent and compiled on every target.

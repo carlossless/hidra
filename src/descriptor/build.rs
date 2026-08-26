@@ -1,7 +1,7 @@
 //! Report descriptor encoder.
 //!
 //! [`DescriptorBuilder`] emits short items with minimally-sized payloads.
-//! The WebHID backend uses it to reconstruct a byte-level report descriptor
+//! The `WebHID` backend uses it to reconstruct a byte-level report descriptor
 //! from the parsed collection data the browser exposes; it is also useful on
 //! its own for building descriptors in tests, emulated devices or firmware
 //! tooling.
@@ -53,31 +53,30 @@ impl DescriptorBuilder {
     /// Append a short item with an unsigned payload, using the smallest
     /// encoding that holds `value`.
     pub fn item_unsigned(&mut self, item_type: ItemType, tag: u8, value: u32) -> &mut Self {
-        let data = if value == 0 {
-            &[][..]
-        } else if value <= 0xFF {
-            &value.to_le_bytes()[..1]
-        } else if value <= 0xFFFF {
-            &value.to_le_bytes()[..2]
-        } else {
-            &value.to_le_bytes()[..4]
+        let bytes = value.to_le_bytes();
+        let len = match value {
+            0 => 0,
+            0x1..=0xFF => 1,
+            0x100..=0xFFFF => 2,
+            _ => 4,
         };
-        self.push_item(item_type, tag, data)
+        self.push_item(item_type, tag, &bytes[..len])
     }
 
     /// Append a short item with a signed payload, using the smallest
     /// encoding that sign-extends back to `value`.
     pub fn item_signed(&mut self, item_type: ItemType, tag: u8, value: i32) -> &mut Self {
-        let data = if value == 0 {
-            &[][..]
+        let bytes = value.to_le_bytes();
+        let len = if value == 0 {
+            0
         } else if i8::try_from(value).is_ok() {
-            &value.to_le_bytes()[..1]
+            1
         } else if i16::try_from(value).is_ok() {
-            &value.to_le_bytes()[..2]
+            2
         } else {
-            &value.to_le_bytes()[..4]
+            4
         };
-        self.push_item(item_type, tag, data)
+        self.push_item(item_type, tag, &bytes[..len])
     }
 
     fn push_item(&mut self, item_type: ItemType, tag: u8, data: &[u8]) -> &mut Self {

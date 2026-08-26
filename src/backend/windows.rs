@@ -1,7 +1,7 @@
-//! Windows backend: HID class devices via `hid.dll` and SetupAPI.
+//! Windows backend: HID class devices via `hid.dll` and `SetupAPI`.
 //!
 //! Mirrors hidapi's `windows/hid.c`: enumeration walks the HID device
-//! interface class with SetupAPI, devices are opened overlapped and all I/O
+//! interface class with `SetupAPI`, devices are opened overlapped and all I/O
 //! goes through one persistent background `ReadFile` plus event-driven
 //! `WriteFile`/`DeviceIoControl` calls.
 //!
@@ -10,7 +10,7 @@
 //! * the bus type is classified from the devnode's enumerator/hardware IDs
 //!   instead of `DEVPKEY_Device_BusTypeGuid`;
 //! * `get_report_descriptor` reconstructs the descriptor from the documented
-//!   HidP API rather than the undocumented preparsed-data layout;
+//!   `HidP` API rather than the undocumented preparsed-data layout;
 //! * a timed-out `write` cancels the pending I/O before returning (hidapi
 //!   leaves it running), which is required for memory safety in Rust.
 
@@ -130,7 +130,7 @@ fn guid_to_bytes(guid: &GUID) -> [u8; 16] {
 ///
 /// hidapi inspects `DEVPKEY_Device_CompatibleIds` of the *parent* devnode;
 /// this heuristic uses the same markers but reads them from the HID devnode
-/// itself, which SetupAPI hands us for free during enumeration:
+/// itself, which `SetupAPI` hands us for free during enumeration:
 ///
 /// * enumerator `USB` (or a `USB` hardware id)        -> USB
 /// * enumerator `BTHENUM` / `BTHLEDEVICE` (or id)     -> Bluetooth (incl. BLE)
@@ -221,7 +221,7 @@ impl OverlappedIo {
     }
 }
 
-/// SetupAPI device information set, destroyed on drop.
+/// `SetupAPI` device information set, destroyed on drop.
 struct DevInfoList(HDEVINFO);
 
 impl Drop for DevInfoList {
@@ -478,11 +478,11 @@ fn query_device_info(handle: HANDLE, path: &str, bus_type: BusType) -> DeviceInf
 pub(crate) struct WinApi;
 
 impl WinApi {
-    pub fn new() -> HidResult<Self> {
+    pub(crate) fn new() -> HidResult<Self> {
         Ok(WinApi)
     }
 
-    pub fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>> {
+    pub(crate) fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>> {
         let mut hid_guid: GUID = unsafe { core::mem::zeroed() };
         // SAFETY: out-pointer to a GUID.
         unsafe { HidD_GetHidGuid(&mut hid_guid) };
@@ -543,7 +543,7 @@ impl WinApi {
         Ok(result)
     }
 
-    pub fn open(
+    pub(crate) fn open(
         &self,
         vendor_id: u16,
         product_id: u16,
@@ -560,7 +560,7 @@ impl WinApi {
         self.open_path(&info.path)
     }
 
-    pub fn open_path(&self, path: &str) -> HidResult<WinDevice> {
+    pub(crate) fn open_path(&self, path: &str) -> HidResult<WinDevice> {
         WinDevice::open(path)
     }
 }
@@ -660,10 +660,9 @@ unsafe extern "system" fn read_wait_callback(ctx: *mut core::ffi::c_void, _timer
     // Drop blockingly unregisters the wait before releasing that count.
     let wake = unsafe { &*ctx.cast_const().cast::<ReadWake>() };
     // The wait satisfied on an *auto-reset* event and thereby consumed its
-    // signal; restore it so the synchronous paths (`WaitForSingleObject` in
-    // `read_timeout`, `GetOverlappedResult(.., wait=1)`) still observe the
-    // completion. A stale signal is harmless: every new `ReadFile` is
-    // preceded by `ResetEvent`.
+    // signal; restore it so a later `GetOverlappedResult` still observes the
+    // completion. A stale signal is harmless: every new `ReadFile` is preceded
+    // by `ResetEvent`.
     // SAFETY: the event handle outlives the callback (see ReadWake docs).
     unsafe { SetEvent(wake.event.0) };
     // Clear the flag before taking the waker so a concurrently parking poll
@@ -693,10 +692,6 @@ pub(crate) struct WinDevice {
     /// Metadata captured at open time (hidapi caches it the same way).
     info: DeviceInfo,
     feature_report_len: u16,
-    // Part of the backend contract; the wrapper now reads input via
-    // `read_async`, so the blocking-mode state is unused on this path.
-    #[allow(dead_code)]
-    blocking: AtomicBool,
     write_timeout_ms: AtomicU32,
 }
 
@@ -772,7 +767,6 @@ impl WinDevice {
             path: path.to_string(),
             info,
             feature_report_len: caps.FeatureReportByteLength,
-            blocking: AtomicBool::new(true),
             write_timeout_ms: AtomicU32::new(DEFAULT_WRITE_TIMEOUT_MS),
         })
     }
@@ -786,7 +780,7 @@ impl WinDevice {
         HidError::io(operation, std::io::Error::from_raw_os_error(err as i32))
     }
 
-    pub fn write(&self, data: &[u8]) -> HidResult<usize> {
+    pub(crate) fn write(&self, data: &[u8]) -> HidResult<usize> {
         if data.is_empty() {
             return Err(HidError::InvalidData {
                 message: "write data must contain a report ID byte".into(),
@@ -857,53 +851,6 @@ impl WinDevice {
         Ok(data.len())
     }
 
-    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
-    pub fn read(&self, buf: &mut [u8]) -> HidResult<usize> {
-        let timeout = if self.blocking.load(Ordering::Relaxed) {
-            -1
-        } else {
-            0
-        };
-        self.read_timeout(buf, timeout)
-    }
-
-    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
-    pub fn read_timeout(&self, buf: &mut [u8], timeout_ms: i32) -> HidResult<usize> {
-        if buf.is_empty() {
-            return Err(HidError::InvalidData {
-                message: "read buffer must not be empty".into(),
-            });
-        }
-        let mut st = self.read.lock().unwrap_or_else(|e| e.into_inner());
-        let bytes_read = match self.start_read(&mut st)? {
-            Some(n) => n,
-            None => {
-                if timeout_ms >= 0 {
-                    // SAFETY: event belongs to the in-flight read.
-                    let wait = unsafe { WaitForSingleObject(st.io.event.raw(), timeout_ms as u32) };
-                    if wait == WAIT_TIMEOUT {
-                        // No data yet; leave the overlapped read running
-                        // (hidapi semantics) and report a timeout.
-                        return Ok(0);
-                    }
-                    if wait != WAIT_OBJECT_0 {
-                        return Err(HidError::last_os_error("WaitForSingleObject on read"));
-                    }
-                }
-                let ol = st.io.ol_mut();
-                let mut n = 0u32;
-                // SAFETY: wait=1 blocks until completion when timeout_ms < 0.
-                let res = unsafe { GetOverlappedResult(self.handle.raw(), ol, &mut n, 1) };
-                st.pending = false;
-                if res == 0 {
-                    return Err(Self::io_error("hid read", unsafe { GetLastError() }));
-                }
-                n
-            }
-        };
-        Ok(Self::copy_report(&st, bytes_read, buf))
-    }
-
     /// Ensure the single background `ReadFile` hidapi keeps per device is in
     /// flight. `Ok(Some(n))` when the call completed synchronously with `n`
     /// bytes (the read is no longer pending), `Ok(None)` when it is pending
@@ -950,7 +897,7 @@ impl WinDevice {
         copy_len
     }
 
-    /// Adjust a `GET_FEATURE`/`GET_INPUT` DeviceIoControl byte count to
+    /// Adjust a `GET_FEATURE`/`GET_INPUT` `DeviceIoControl` byte count to
     /// hidapi's convention. For numbered reports Windows already includes the
     /// leading report-ID byte in the count; for unnumbered reports the leading
     /// byte stays 0 and is excluded, so the ID byte is added back only in that
@@ -969,7 +916,7 @@ impl WinDevice {
     /// and fails with [`HidError::Disconnected`] when the device is removed.
     /// Wake-ups come from a one-shot thread-pool wait on the read event
     /// (`RegisterWaitForSingleObject`, raw [`Waker`]s, no executor assumed).
-    pub fn read_async<'a>(&'a self, buf: &'a mut [u8]) -> ReadAsync<'a> {
+    pub(crate) fn read_async<'a>(&'a self, buf: &'a mut [u8]) -> ReadAsync<'a> {
         ReadAsync { dev: self, buf }
     }
 
@@ -997,9 +944,9 @@ impl WinDevice {
                     let err = unsafe { GetLastError() };
                     if err == ERROR_IO_INCOMPLETE {
                         // Still in flight: park until the event signals. The
-                        // read keeps running when the future is dropped, so
-                        // no report is ever lost, it lands in the staging
-                        // buffer for the next read/read_timeout/read_async.
+                        // read keeps running when the future is dropped, so no
+                        // report is ever lost; it lands in the staging buffer
+                        // for the next `read_async`.
                         return self.park_read(&mut st, cx);
                     }
                     st.pending = false;
@@ -1059,13 +1006,7 @@ impl WinDevice {
         Poll::Pending
     }
 
-    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
-    pub fn set_blocking_mode(&self, blocking: bool) -> HidResult<()> {
-        self.blocking.store(blocking, Ordering::Relaxed);
-        Ok(())
-    }
-
-    pub fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
+    pub(crate) fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
         if data.is_empty() {
             return Err(HidError::InvalidData {
                 message: "feature report must contain a report ID byte".into(),
@@ -1091,7 +1032,7 @@ impl WinDevice {
         Ok(())
     }
 
-    /// Synchronous `DeviceIoControl` GET_FEATURE / GET_INPUT_REPORT, used by
+    /// Synchronous `DeviceIoControl` `GET_FEATURE` / `GET_INPUT_REPORT`, used by
     /// hidapi because it reports the actual returned length (unlike the
     /// `HidD_*` wrappers).
     fn ioctl_get_report(
@@ -1137,11 +1078,11 @@ impl WinDevice {
         Ok(Self::get_report_len(buf[0], returned as usize, buf.len()))
     }
 
-    pub fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize> {
+    pub(crate) fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize> {
         self.ioctl_get_report(IOCTL_HID_GET_FEATURE, buf, "IOCTL_HID_GET_FEATURE")
     }
 
-    pub fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize> {
+    pub(crate) fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize> {
         match self.ioctl_get_report(
             IOCTL_HID_GET_INPUT_REPORT,
             buf,
@@ -1175,19 +1116,19 @@ impl WinDevice {
         }
     }
 
-    pub fn get_manufacturer_string(&self) -> HidResult<Option<String>> {
+    pub(crate) fn get_manufacturer_string(&self) -> HidResult<Option<String>> {
         Ok(self.info.manufacturer_string.clone())
     }
 
-    pub fn get_product_string(&self) -> HidResult<Option<String>> {
+    pub(crate) fn get_product_string(&self) -> HidResult<Option<String>> {
         Ok(self.info.product_string.clone())
     }
 
-    pub fn get_serial_number_string(&self) -> HidResult<Option<String>> {
+    pub(crate) fn get_serial_number_string(&self) -> HidResult<Option<String>> {
         Ok(self.info.serial_number.clone())
     }
 
-    pub fn get_indexed_string(&self, index: u32) -> HidResult<Option<String>> {
+    pub(crate) fn get_indexed_string(&self, index: u32) -> HidResult<Option<String>> {
         let mut buf = [0u16; MAX_STRING_WCHARS];
         // SAFETY: buffer length is in bytes, per the HidD_* contract.
         let ok = unsafe {
@@ -1210,14 +1151,14 @@ impl WinDevice {
     ///
     /// Windows never exposes the raw descriptor, so, like hidapi's
     /// `hid_winapi_descriptor_reconstruct.c`, one is rebuilt. Unlike hidapi
-    /// this uses only the documented HidP API (`HidP_GetCaps`,
+    /// this uses only the documented `HidP` API (`HidP_GetCaps`,
     /// `HidP_GetLinkCollectionNodes`, `HidP_GetButtonCaps`,
     /// `HidP_GetValueCaps`), with these limitations:
     ///
     /// * the output is not byte-identical to the original (hidapi's is not
     ///   either); it parses back via [`crate::descriptor::ReportDescriptor`]
     ///   with correct report IDs, usages and field sizes;
-    /// * fields are ordered by report type, then report ID, then HidP
+    /// * fields are ordered by report type, then report ID, then `HidP`
     ///   enumeration order, the documented API does not expose bit offsets,
     ///   so the in-report field order may differ from the device's;
     /// * constant padding bits are not enumerable; when a report type uses a
@@ -1227,7 +1168,7 @@ impl WinDevice {
     /// * array (non-variable) button fields are approximated: the documented
     ///   API does not expose their report size, so 8 bits (16 when the usage
     ///   range exceeds 255) per element is assumed, the keyboard layout.
-    pub fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize> {
+    pub(crate) fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize> {
         let bytes = self.reconstruct_descriptor()?;
         let len = bytes.len().min(buf.len());
         buf[..len].copy_from_slice(&bytes[..len]);
@@ -1272,14 +1213,14 @@ impl WinDevice {
         Ok(b.build())
     }
 
-    pub fn get_device_info(&self) -> HidResult<DeviceInfo> {
+    pub(crate) fn get_device_info(&self) -> HidResult<DeviceInfo> {
         Ok(self.info.clone())
     }
 
     /// `hid_winapi_get_container_id`: the `DEVPKEY_Device_ContainerId` GUID
     /// of the devnode behind this interface, as 16 bytes in the GUID's
     /// in-memory (little-endian fields) layout.
-    pub fn container_id(&self) -> HidResult<[u8; 16]> {
+    pub(crate) fn container_id(&self) -> HidResult<[u8; 16]> {
         let (list, devinfo) = devnode_for_interface(&self.path)?;
         let mut guid: GUID = unsafe { core::mem::zeroed() };
         let mut prop_type: DEVPROPTYPE = 0;
@@ -1306,7 +1247,7 @@ impl WinDevice {
     }
 
     /// `hid_winapi_set_write_timeout`.
-    pub fn set_write_timeout(&self, timeout_ms: u32) {
+    pub(crate) fn set_write_timeout(&self, timeout_ms: u32) {
         self.write_timeout_ms.store(timeout_ms, Ordering::Relaxed);
     }
 }
@@ -1343,14 +1284,12 @@ impl Drop for WinDevice {
 
 /// Future returned by [`WinDevice::read_async`].
 ///
-/// Cancel-safe: the report is only harvested inside `poll`, and the
-/// persistent background `ReadFile` keeps running when the future is dropped
-///, a completed report stays in the staging buffer for the next
-/// `read`/`read_timeout`/`read_async` (the same semantics as a timed-out
-/// synchronous read). A drop may leave the one-shot thread-pool wait armed
-/// with a stale waker; it fires at most once as a spurious (or no-op) wake
-/// and is unregistered on the next registration, or blockingly in
-/// `WinDevice`'s `Drop`.
+/// Cancel-safe: the report is only harvested inside `poll`, and the persistent
+/// background `ReadFile` keeps running when the future is dropped, so a
+/// completed report stays in the staging buffer for the next `read_async`. A
+/// drop may leave the one-shot thread-pool wait armed with a stale waker; it
+/// fires at most once as a spurious (or no-op) wake and is unregistered on the
+/// next registration, or blockingly in `WinDevice`'s `Drop`.
 pub(crate) struct ReadAsync<'a> {
     dev: &'a WinDevice,
     buf: &'a mut [u8],
@@ -1405,7 +1344,7 @@ struct Field {
     report_id: u8,
     /// Owning link collection index.
     link: u16,
-    /// HidP enumeration order, used as the in-report tiebreaker.
+    /// `HidP` enumeration order, used as the in-report tiebreaker.
     order: usize,
     data: FieldData,
 }

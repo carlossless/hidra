@@ -57,7 +57,7 @@ impl DeviceInfo {
     /// Platform-specific device path, usable with `Hidra::open_path`.
     ///
     /// On Linux this is a `/dev/hidrawN` node, on Windows a device interface
-    /// path, on macOS an IORegistry entry path.
+    /// path, on macOS an `IORegistry` entry path.
     pub fn path(&self) -> &str {
         &self.path
     }

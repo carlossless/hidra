@@ -2,6 +2,10 @@
 name = "hidra"
 version = "0.0.2"
 edition = "2021"
+# Applies to the default feature set (the per-OS backends and WebHID). Turning
+# on `nusb` raises the effective floor to whatever nusb itself requires (1.85
+# as of nusb 0.2.7); cargo reports that on its own.
+rust-version = "1.77"
 description = "Pure Rust HID library."
 license = "MIT"
 repository = "https://github.com/carlossless/hidra"
@@ -16,6 +20,19 @@ default-target = "x86_64-unknown-linux-gnu"
 targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
 rustc-args = ["--cfg=web_sys_unstable_apis"]
 rustdoc-args = ["--cfg=web_sys_unstable_apis"]
+
+# `#![deny(missing_docs)]` and friends live here so every target and every
+# backend is held to the same bar without repeating attributes per module.
+# `clippy::undocumented_unsafe_blocks` is deliberately not enabled: the FFI
+# backends carry SAFETY comments where an invariant is actually at stake, and
+# requiring one on every `unsafe { GetLastError() }` would bury those.
+[lints.rust]
+missing_docs = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+doc_markdown = "warn"
 
 [features]
 default = []

@@ -1,6 +1,6 @@
 [package]
 name = "hidra"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 # Applies to the default feature set (the per-OS backends and WebHID). Turning
 # on `nusb` raises the effective floor to whatever nusb itself requires (1.85

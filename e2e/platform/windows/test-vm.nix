@@ -93,17 +93,24 @@ let
 
   # ---- pinned downloads for the provisioning boot ------------------------
 
+  # Microsoft rev's the aka.ms/vs/17/release/* bootstrapper URLs in place, so a
+  # hash pinned against one breaks on the next rev. Those URLs redirect to a
+  # download.visualstudio.microsoft.com permalink whose second path segment is the
+  # file's own sha256 — content-addressed and immutable, so pin that instead. To
+  # move to a newer bootstrapper:
+  #   curl -sIL https://aka.ms/vs/17/release/<name> | grep -i ^location
+  # and take the new URL + the hash from its path.
+  #
   # VC++ 2015-2022 x64 runtime: a fresh Win11 lacks vcruntime140.dll, which both
-  # the MSVC test binary and WinUHid.dll need (see README). Pin the hash on first
-  # build (nix prints it); Microsoft rev's this URL in place.
+  # the MSVC test binary and WinUHid.dll need (see README).
   vcRedist = pkgs.fetchurl {
     name = "vc_redist.x64.exe";
-    url = "https://aka.ms/vs/17/release/vc_redist.x64.exe";
+    url = "https://download.visualstudio.microsoft.com/download/pr/9d270333-8b7b-4f96-9458-6fcdb2ec0b25/CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe";
     sha256 = "sha256-zA/w6x3D9RiK5jAPrvMr9b7rpL3W6ORFqRhAcglrcTs=";
   };
 
-  # rustup + VS Build Tools bootstrappers. Both are small online installers that
-  # pull the real payload during the (networked) provisioning boot.
+  # rustup + VS Build Tools bootstrappers: small online installers that pull the
+  # real payload during the (networked) provisioning boot.
   rustupInit = pkgs.fetchurl {
     name = "rustup-init.exe";
     url = "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe";
@@ -111,8 +118,8 @@ let
   };
   vsBuildTools = pkgs.fetchurl {
     name = "vs_BuildTools.exe";
-    url = "https://aka.ms/vs/17/release/vs_BuildTools.exe";
-    sha256 = "sha256-znu5d6zK4XSBkSM9Be5oMqS2GjGUGWJ7/NvYGN5b/Wg=";
+    url = "https://download.visualstudio.microsoft.com/download/pr/fa619120-9c0e-47e6-bfe0-3ee96fb671b2/2aeac090a9cfb2c56474aa9a6c5817ad8cfb879539e0ed1aecec33de9fc2dc4f/vs_BuildTools.exe";
+    sha256 = "sha256-KurAkKnPssVkdKqabFgXrYz7h5U54O0a7Owz3p/C3E8=";
   };
 
   # WinUHid: cgutman's userland virtual-HID framework (test-signed KMDF/VHF

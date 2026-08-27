@@ -365,19 +365,26 @@ fn check_descriptor(
     wait_for_start(&mut uhid);
 
     let api = hidra::Hidra::new().unwrap();
-    let info = {
+    // The hidraw node can lag the sysfs entry enumerate() reads, so retry the
+    // open too, not just the enumeration.
+    let device = {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            if let Some(d) = api.enumerate(TEST_VID, pid).unwrap().into_iter().next() {
+            let opened = api
+                .enumerate(TEST_VID, pid)
+                .unwrap()
+                .into_iter()
+                .next()
+                .and_then(|info| api.open_path(info.path()).wait().ok());
+            if let Some(d) = opened {
                 break d;
             }
             if Instant::now() >= deadline {
-                panic!("device {pid:#06x} did not enumerate");
+                panic!("device {pid:#06x} did not enumerate and open");
             }
             std::thread::sleep(Duration::from_millis(50));
         }
     };
-    let device = api.open_path(info.path()).wait().expect("open_path");
     let raw = device
         .report_descriptor()
         .wait()
@@ -395,7 +402,6 @@ fn uhid_descriptor_variety() {
     }
     use hidra::descriptor::ReportKind;
 
-    // 1. Distinct report IDs with different payload sizes per report.
     let mut b = DescriptorBuilder::new();
     b.usage_page(0xFF00)
         .usage(0x01)
@@ -445,7 +451,6 @@ fn uhid_descriptor_variety() {
         assert_eq!(out.size_bytes(), 8, "mixed: output 8x8 bits = 8 bytes");
     });
 
-    // 2. A CONSTANT padding field between two VARIABLE data fields.
     let mut b = DescriptorBuilder::new();
     b.usage_page(0xFF00)
         .usage(0x01)
@@ -474,7 +479,6 @@ fn uhid_descriptor_variety() {
         assert_eq!(inp.size_bytes(), 3, "padding: 3 fields x 1 byte");
     });
 
-    // 3. An array field: report_count elements chosen from a usage range.
     let mut b = DescriptorBuilder::new();
     b.usage_page(0xFF00)
         .usage(0x01)

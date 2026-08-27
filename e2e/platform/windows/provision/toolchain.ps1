@@ -40,8 +40,11 @@ $cert = New-SelfSignedCertificate -Type CodeSigningCert `
 Export-Certificate -Cert $cert -FilePath C:\winuhid.cer | Out-Null
 # Root: validates the driver's signing chain. TrustedPublisher: suppresses the
 # driver-install trust prompt (unattended). The private key stays in My (signtool
-# signs from there).
-Import-Certificate -FilePath C:\winuhid.cer -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
-Import-Certificate -FilePath C:\winuhid.cer -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
+# signs from there). certutil rather than Import-Certificate: the latter is denied
+# on LocalMachine\TrustedPublisher (E_ACCESSDENIED) even elevated.
+& certutil -f -addstore Root C:\winuhid.cer | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "certutil -addstore Root failed ($LASTEXITCODE)" }
+& certutil -f -addstore TrustedPublisher C:\winuhid.cer | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "certutil -addstore TrustedPublisher failed ($LASTEXITCODE)" }
 
 Write-Host "== Toolchain install complete =="

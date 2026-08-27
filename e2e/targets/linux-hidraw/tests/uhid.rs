@@ -485,7 +485,7 @@ fn uhid_descriptor_variety() {
         .report_count(6)
         .usage_minimum(0)
         .usage_maximum(101)
-        .input(0) // array (no VARIABLE bit)
+        .input(MainFlags::NONE) // array (no VARIABLE bit)
         .end_collection();
     let rd = b.build();
     check_descriptor(0x0012, &rd, |desc, raw| {

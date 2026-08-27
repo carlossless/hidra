@@ -1,9 +1,8 @@
 //! Windows backend: HID class devices via `hid.dll` and `SetupAPI`.
 //!
-//! Enumeration walks the HID device
-//! interface class with `SetupAPI`, devices are opened overlapped and all I/O
-//! goes through one persistent background `ReadFile` plus event-driven
-//! `WriteFile`/`DeviceIoControl` calls.
+//! Enumeration walks the HID device interface class with `SetupAPI`, devices
+//! are opened overlapped, and all I/O goes through one persistent background
+//! `ReadFile` plus event-driven `WriteFile`/`DeviceIoControl` calls.
 //!
 //! Notable design choices, each documented at the relevant method:
 //!

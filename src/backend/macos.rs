@@ -1,7 +1,5 @@
 //! macOS backend: `IOHIDManager` / `IOHIDDevice` through hand-written `IOKit` FFI.
 //!
-//! The macOS IOHIDManager HID backend:
-//!
 //! * Device paths use the modern `DevSrvsID:<registry-entry-id>` form.
 //! * Each open device runs a dedicated read thread pumping a private
 //!   `CFRunLoop` mode; input reports land in a bounded queue (30 entries,

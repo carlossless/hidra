@@ -81,21 +81,9 @@ should report *Kext Signing* and *NVRAM Protections* as `disabled`.
 ## Code-signing the test binary
 
 Creating a virtual HID device requires the binary to carry the virtual-device
-entitlement. Ad-hoc signing is sufficient on an AMFI-off system.
-
-The entitlements file lives at
-[`hid-virtual-device.entitlements`](hid-virtual-device.entitlements):
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>com.apple.developer.hid.virtual.device</key>
-  <true/>
-</dict>
-</plist>
-```
+entitlement ([`hid-virtual-device.entitlements`](hid-virtual-device.entitlements):
+a single `com.apple.developer.hid.virtual.device` = `true`). Ad-hoc signing is
+sufficient on an AMFI-off system.
 
 Build the test binary (`cargo test -p macos --no-run` from `e2e/`), sign it,
 then run it as root:

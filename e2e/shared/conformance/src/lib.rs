@@ -341,7 +341,6 @@ pub fn run_conformance(numbered: bool, caps: &Caps, vdev: &dyn VirtualDevice) {
         eprintln!(
             "[{lb}] SKIP product/serial strings: not exposed by this virtual-device mechanism"
         );
-        // Must still succeed (None/empty), never error.
         device.get_product_string().wait().unwrap();
         device.get_serial_number_string().wait().unwrap();
     }
@@ -526,7 +525,6 @@ pub fn run_conformance(numbered: bool, caps: &Caps, vdev: &dyn VirtualDevice) {
     // Robustness: odd/oversized/malformed inputs must return cleanly (Ok or Err),
     // never crash or hang; the exact result is backend-defined.
     {
-        // Only the report-ID byte, no payload.
         let _ = device
             .write(&[if numbered { RID_OUTPUT } else { 0 }])
             .wait();

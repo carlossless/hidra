@@ -17,7 +17,6 @@ POLICY="$POLICY_DIR/hidra-webhid.json"
 : "${XVFB_RUN:=xvfb-run}"
 [ -n "$CHROMIUM" ] || { echo "set CHROMIUM to a chromium/chrome binary"; exit 2; }
 
-# Build the fixture crate unless a caller pre-built it.
 FIXTURE="$WEB/fixture/target/debug/webhid_uhid_fixture"
 [ -x "$FIXTURE" ] || ( cd "$WEB/fixture" && cargo build )
 

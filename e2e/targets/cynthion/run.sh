@@ -43,7 +43,6 @@ start_device() {
   lsusb 2>/dev/null | grep -q '1209:000c' || { echo "device never enumerated"; cat "$LOG"; exit 3; }
 }
 
-# Resolve the test binary for a feature set (builds it first).
 bin_for() {
   ( cd "$E2E" && cargo test -p cynthion "$@" --no-run ) >/dev/null 2>&1
   cd "$E2E" && cargo test -p cynthion "$@" --no-run --message-format=json 2>/dev/null \

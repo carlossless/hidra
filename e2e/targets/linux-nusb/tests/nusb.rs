@@ -125,7 +125,6 @@ struct NusbGadget {
 impl NusbGadget {
     fn create(numbered: bool) -> Self {
         let rd = make_descriptor(numbered);
-        // Report body is 8 bytes; a numbered report also carries its ID byte.
         let report_len = if numbered { 9 } else { 8 };
         setup_gadget(&rd, report_len);
         let hidg = open_hidg();

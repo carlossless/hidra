@@ -1,0 +1,6 @@
+# hidra's webhid backend needs this unstable web-sys cfg.
+# The wasm32 target is deliberately NOT pinned here: wasm-pack sets it, and pinning
+# would cascade into the sibling native fixture/ crate (cargo config applies to
+# subdirectories) and force it to build for wasm too.
+[build]
+rustflags = ["--cfg=web_sys_unstable_apis"]

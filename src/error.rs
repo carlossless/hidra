@@ -7,13 +7,13 @@ pub type HidResult<T> = Result<T, HidError>;
 
 /// Errors returned by hidra.
 ///
-/// This maps the information `hid_error()` exposes in hidapi onto a typed
+/// This maps the failure information the platform HID APIs expose onto a typed
 /// Rust enum, so callers can match on the failure class instead of parsing
 /// strings.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum HidError {
-    /// The platform backend failed to initialize (`hid_init` equivalent).
+    /// The platform backend failed to initialize.
     Initialization {
         /// Human-readable description of the failure.
         message: String,
@@ -52,7 +52,7 @@ pub enum HidError {
         message: String,
     },
     /// A backend-specific failure that fits no other category
-    /// (the catch-all hidapi reports through `hid_error`).
+    /// (the catch-all for errors that map to no typed variant).
     Backend {
         /// Backend-provided error text.
         message: String,

@@ -1,4 +1,4 @@
-//! List every connected HID device, like hidapi's `hidtest` enumeration.
+//! List every connected HID device.
 //!
 //! ```sh
 //! cargo run --example enumerate

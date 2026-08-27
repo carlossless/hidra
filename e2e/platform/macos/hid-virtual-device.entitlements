@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Restricted entitlement required to create an IOHIDUserDevice. Apple does
+       not grant it to normal developer accounts, so the binary is ad-hoc signed
+       and only accepted by a kernel booted with SIP disabled and
+       amfi_get_out_of_my_way=1. See tests/macos.rs. -->
+  <key>com.apple.developer.hid.virtual.device</key>
+  <true/>
+</dict>
+</plist>

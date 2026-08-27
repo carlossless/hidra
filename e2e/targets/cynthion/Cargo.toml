@@ -1,0 +1,14 @@
+# Runs the conformance suite against a real USB HID device emulated by a Cynthion
+# running Facedancer (device.py), driven over a TCP control channel.
+[package]
+name = "cynthion"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dev-dependencies]
+hidra = { path = "../../.." }
+conformance = { path = "../../shared/conformance" }
+
+[features]
+nusb = ["hidra/nusb", "conformance/nusb"]

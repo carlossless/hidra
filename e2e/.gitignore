@@ -1,0 +1,7 @@
+# build artifacts across every nested crate/workspace under e2e
+target/
+node_modules/
+pkg/
+package-lock.json
+__pycache__/
+*.pyc

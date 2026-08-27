@@ -12,7 +12,7 @@
 //! * you want the kernel driver detached from the interface (Linux), e.g. to
 //!   take a vendor interface away from `usbhid`.
 //!
-//! The trade-offs mirror hidapi-libusb exactly: opening a device **claims the
+//! Opening a device **claims the
 //! whole USB interface, stealing it from the OS driver** until the handle is
 //! dropped, and raw USB access needs appropriate permissions, udev rules
 //! granting access to the `/dev/bus/usb` node on Linux, a WinUSB-compatible
@@ -64,12 +64,12 @@ const HID_SET_REPORT: u8 = 0x09;
 const REPORT_TYPE_INPUT: u16 = 1;
 const REPORT_TYPE_OUTPUT: u16 = 2;
 const REPORT_TYPE_FEATURE: u16 = 3;
-/// hidapi uses a fixed 1000 ms timeout for every transfer it issues, control
-/// and interrupt OUT alike.
+/// A fixed 1000 ms timeout for every transfer issued, control and interrupt
+/// OUT alike.
 const TRANSFER_TIMEOUT: Duration = Duration::from_millis(1000);
 /// How often the reader thread re-checks the shutdown flag while idle.
 const READER_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// The string-descriptor language hidapi requests.
+/// The string-descriptor language requested.
 const US_ENGLISH: u16 = 0x0409;
 
 // --- path handling -----------------------------------------------------------
@@ -123,7 +123,7 @@ const DESCRIPTOR_TYPE_HID: u8 = 0x21;
 /// `wDescriptorLength` declared by the HID class descriptor of the given
 /// interface's alternate setting 0.
 ///
-/// hidapi-libusb requests exactly this many bytes, and so do we: some
+/// We request exactly this many bytes: some
 /// devices (seen on a UVC webcam with a vendor HID interface) return
 /// unrelated descriptor data past the real report descriptor when the
 /// request asks for more.
@@ -192,8 +192,8 @@ fn read_report_descriptor_unclaimed(
 }
 
 /// `WinUSB` only allows control transfers through a claimed interface handle,
-/// so enumeration stays non-invasive and reports usage 0/0, like
-/// hidapi-libusb built without `INVASIVE_GET_USAGE`.
+/// so enumeration stays non-invasive and reports usage 0/0, without opening
+/// the device.
 #[cfg(target_os = "windows")]
 fn read_report_descriptor_unclaimed(
     _device: &nusb::Device,
@@ -233,7 +233,7 @@ impl HidBackend for NusbApi {
     /// Usage page/usage require reading each device's report descriptor,
     /// which needs the device opened; this is attempted best-effort and the
     /// fields stay 0/0 when the device cannot be opened (e.g. missing udev
-    /// permissions), matching hidapi-libusb.
+    /// permissions).
     fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>> {
         let devices = match nusb::list_devices().wait() {
             Ok(devices) => devices,
@@ -336,7 +336,7 @@ impl NusbDevice {
                 message: format!("claiming interface {interface_number}: {e}"),
             })?;
 
-        // Probe the report descriptor once, like hidapi: it determines report
+        // Probe the report descriptor once: it determines report
         // ID usage / input sizes and backs `get_report_descriptor`.
         let report_descriptor = read_report_descriptor(&interface).unwrap_or_default();
         let parsed = ReportDescriptor::parse(&report_descriptor).ok();
@@ -439,7 +439,7 @@ impl NusbDevice {
 
     /// `GET_REPORT` shared by feature and input reports. `buf[0]` carries the
     /// report ID on entry; for ID 0 the returned data is written at
-    /// `buf[1..]` so the ID stays in byte 0, exactly like hidapi.
+    /// `buf[1..]` so the ID stays in byte 0.
     fn get_report(
         &self,
         report_type: u16,
@@ -693,7 +693,7 @@ fn reader_loop(
                 break;
             }
             Err(TransferError::Cancelled) => break,
-            // Transient conditions (stall, fault): resubmit, like hidapi.
+            // Transient conditions (stall, fault): resubmit.
             Err(_) => endpoint.submit(completion.buffer),
         }
     }

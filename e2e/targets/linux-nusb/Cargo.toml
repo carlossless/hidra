@@ -1,0 +1,9 @@
+[package]
+name = "linux-nusb"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dev-dependencies]
+hidra = { path = "../../..", features = ["nusb"] }
+conformance = { path = "../../shared/conformance", features = ["nusb"] }

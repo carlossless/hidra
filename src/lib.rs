@@ -114,9 +114,9 @@ mod native {
     use crate::{DeviceInfo, HidResult};
 
     /// Entry point to the library; owns backend state and the cached device
-    /// list (`hid_init` / `hid_enumerate` equivalents).
+    /// list.
     ///
-    /// Unlike hidapi there is no global state: create as many instances as
+    /// There is no global state: create as many instances as
     /// you like, from any thread.
     pub struct Hidra {
         backend: PlatformApi,
@@ -215,26 +215,25 @@ mod native {
         }
     }
 
-    /// macOS-specific options (`hid_darwin_*` equivalents).
+    /// macOS-specific options.
     #[cfg(all(target_os = "macos", not(feature = "nusb")))]
     impl Hidra {
-        /// Whether subsequently opened devices are seized exclusively
-        /// (`hid_darwin_set_open_exclusive`). Defaults to shared, matching
-        /// hidapi >= 0.12.
+        /// Whether subsequently opened devices are seized exclusively.
+        /// Defaults to shared (non-exclusive) access.
         pub fn set_open_exclusive(&self, exclusive: bool) {
             self.backend.set_open_exclusive(exclusive);
         }
 
-        /// Current exclusivity setting (`hid_darwin_get_open_exclusive`).
+        /// Current exclusivity setting.
         pub fn open_exclusive(&self) -> bool {
             self.backend.open_exclusive()
         }
     }
 
-    /// An open HID device (`hid_device` equivalent). Closed on drop.
+    /// An open HID device. Closed on drop.
     ///
     /// All methods take `&self`; the handle is `Send + Sync` and may be
-    /// shared across threads, like hidapi handles.
+    /// shared across threads.
     pub struct HidDevice {
         backend: PlatformDevice,
     }
@@ -426,7 +425,7 @@ mod web {
 
     /// Entry point to the library, backed by `WebHID` (`navigator.hid`).
     ///
-    /// Discovery is WebHID-shaped rather than hidapi-shaped: the browser only
+    /// Discovery is WebHID-shaped rather than native-HID-shaped: the browser only
     /// ever exposes devices the user has granted access to, so there is no
     /// enumerate / open-by-vid-pid. Use [`request_device`](Self::request_device)
     /// to show the permission chooser and [`get_devices`](Self::get_devices) to
@@ -503,10 +502,9 @@ mod web {
         }
     }
 
-    /// An HID device exposed by the browser (`hid_device` equivalent), backed
-    /// by `WebHID`.
+    /// An HID device exposed by the browser, backed by `WebHID`.
     ///
-    /// Unlike native hidapi the handle exists before the device is opened, so
+    /// Unlike a native HID library the handle exists before the device is opened, so
     /// call [`open`](Self::open) before transferring reports.
     pub struct HidDevice {
         backend: WebHidDevice,

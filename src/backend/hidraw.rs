@@ -6,8 +6,10 @@
 use std::fs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
+use core::future::Future;
+
+use super::{HidBackend, HidDeviceBackend};
 use crate::descriptor::ReportDescriptor;
 use crate::error::{HidError, HidResult};
 use crate::{BusType, DeviceInfo, MAX_REPORT_DESCRIPTOR_SIZE};
@@ -25,9 +27,9 @@ use crate::{BusType, DeviceInfo, MAX_REPORT_DESCRIPTOR_SIZE};
     target_arch = "sparc64",
 )))]
 mod ioc {
-    pub const SIZEBITS: u32 = 14; // dir takes the remaining 2 bits
-    pub const WRITE: u32 = 1;
-    pub const READ: u32 = 2;
+    pub(super) const SIZEBITS: u32 = 14; // dir takes the remaining 2 bits
+    pub(super) const WRITE: u32 = 1;
+    pub(super) const READ: u32 = 2;
 }
 
 #[cfg(any(
@@ -236,34 +238,21 @@ fn device_infos(hid_dev_dir: &Path, dev_path: &str) -> Option<Vec<DeviceInfo>> {
         .map(|d| d.top_level_usages())
         .unwrap_or_default();
 
-    let mut entries = Vec::with_capacity(usages.len().max(1));
-    match usages.as_slice() {
-        [] => entries.push(info),
-        [first @ .., last] => {
-            for &(page, usage) in first {
-                let mut e = info.clone();
-                e.usage_page = page;
-                e.usage = usage;
-                entries.push(e);
-            }
-            info.usage_page = last.0;
-            info.usage = last.1;
-            entries.push(info);
-        }
-    }
-    Some(entries)
+    Some(info.per_usage(&usages))
 }
 
 // --- backend API -------------------------------------------------------------
 
 pub(crate) struct HidrawApi;
 
-impl HidrawApi {
-    pub fn new() -> HidResult<Self> {
+impl HidBackend for HidrawApi {
+    type Device = HidrawDevice;
+
+    fn new() -> HidResult<Self> {
         Ok(HidrawApi)
     }
 
-    pub fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>> {
+    fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>> {
         let mut result = Vec::new();
         let entries = match fs::read_dir("/sys/class/hidraw") {
             Ok(entries) => entries,
@@ -284,35 +273,16 @@ impl HidrawApi {
             let Some(infos) = device_infos(&hid_dev_dir, &dev_path) else {
                 continue;
             };
-            for info in infos {
-                let vid_ok = vendor_id == 0 || info.vendor_id == vendor_id;
-                let pid_ok = product_id == 0 || info.product_id == product_id;
-                if vid_ok && pid_ok {
-                    result.push(info);
-                }
-            }
+            result.extend(
+                infos
+                    .into_iter()
+                    .filter(|info| info.matches(vendor_id, product_id)),
+            );
         }
         Ok(result)
     }
 
-    pub fn open(
-        &self,
-        vendor_id: u16,
-        product_id: u16,
-        serial: Option<&str>,
-    ) -> HidResult<HidrawDevice> {
-        let candidates = self.enumerate(vendor_id, product_id)?;
-        let info = candidates
-            .into_iter()
-            .find(|info| match serial {
-                Some(s) => info.serial_number.as_deref() == Some(s),
-                None => true,
-            })
-            .ok_or(HidError::DeviceNotFound)?;
-        self.open_path(&info.path)
-    }
-
-    pub fn open_path(&self, path: &str) -> HidResult<HidrawDevice> {
+    fn open_path(&self, path: &str) -> HidResult<HidrawDevice> {
         HidrawDevice::open(path)
     }
 }
@@ -321,14 +291,14 @@ impl HidrawApi {
 
 pub(crate) struct HidrawDevice {
     fd: OwnedFd,
-    // Part of the backend contract; the wrapper now reads input via
-    // `read_async`, so the blocking-mode state is unused on this path.
-    #[allow(dead_code)]
-    blocking: AtomicBool,
-    /// Canonical sysfs HID device directory, for metadata lookups.
-    sysfs_hid_dir: PathBuf,
-    /// `/dev/hidrawN`.
-    dev_path: String,
+    /// Metadata read from sysfs at open time.
+    ///
+    /// hidapi caches this the same way, as do the Windows and nusb backends.
+    /// Reading it per call meant `get_manufacturer_string`, `get_product_string`
+    /// and `get_serial_number_string` each re-walked sysfs *and* re-parsed the
+    /// whole report descriptor for one field. `None` when sysfs had nothing to
+    /// say, which `get_device_info` reports as it always did.
+    info: Option<DeviceInfo>,
 }
 
 impl HidrawDevice {
@@ -349,19 +319,65 @@ impl HidrawDevice {
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
         let sysfs_hid_dir = sysfs_dir_for_fd(fd.as_raw_fd())?;
-        Ok(HidrawDevice {
-            fd,
-            blocking: AtomicBool::new(true),
-            sysfs_hid_dir,
-            dev_path: path.to_string(),
-        })
+        // For multi-collection devices hidapi returns the first entry.
+        let info = device_infos(&sysfs_hid_dir, path)
+            .and_then(|mut i| (!i.is_empty()).then(|| i.remove(0)));
+        Ok(HidrawDevice { fd, info })
     }
 
     fn raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
 
-    pub fn write(&self, data: &[u8]) -> HidResult<usize> {
+    /// Non-blocking read attempt: `Ok(None)` when no report is queued.
+    ///
+    /// The fd is opened blocking, so readiness is established with a
+    /// zero-timeout `poll` before the `read` syscall.
+    fn try_read_now(&self, buf: &mut [u8]) -> HidResult<Option<usize>> {
+        if buf.is_empty() {
+            return Err(HidError::InvalidData {
+                message: "read buffer must not be empty".into(),
+            });
+        }
+        let mut pollfd = libc::pollfd {
+            fd: self.raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            let res = unsafe { libc::poll(&mut pollfd, 1, 0) };
+            if res < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(HidError::io("poll on hidraw device", err));
+            }
+            if res == 0 {
+                return Ok(None);
+            }
+            break;
+        }
+        if pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(HidError::Disconnected);
+        }
+        let res = unsafe { libc::read(self.raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        if res < 0 {
+            let err = std::io::Error::last_os_error();
+            return match err.raw_os_error() {
+                Some(libc::EAGAIN) | Some(libc::EINPROGRESS) => Ok(None),
+                Some(libc::EIO) | Some(libc::ENODEV) => Err(HidError::Disconnected),
+                _ => Err(HidError::io("hidraw read", err)),
+            };
+        }
+        // A zero-length read would make `read_async` resolve with `Ok(0)`,
+        // which its contract forbids; treat it as "nothing queued" instead.
+        Ok((res > 0).then_some(res as usize))
+    }
+}
+
+impl HidDeviceBackend for HidrawDevice {
+    fn write(&self, data: &[u8]) -> HidResult<usize> {
         if data.is_empty() {
             return Err(HidError::InvalidData {
                 message: "write data must contain a report ID byte".into(),
@@ -386,83 +402,15 @@ impl HidrawDevice {
         Ok(res)
     }
 
-    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
-    pub fn read(&self, buf: &mut [u8]) -> HidResult<usize> {
-        let timeout = if self.blocking.load(Ordering::Relaxed) {
-            -1
-        } else {
-            0
-        };
-        self.read_timeout(buf, timeout)
-    }
-
-    /// Read one input report without ever returning `Ok(0)`: resolves when a
-    /// report arrives, fails with [`HidError::Disconnected`] when the device
-    /// goes away. Wake-ups come from the crate's [`reactor`](super::reactor).
-    pub fn read_async<'a>(&'a self, buf: &'a mut [u8]) -> ReadAsync<'a> {
+    /// Wake-ups come from the crate's [`reactor`](super::reactor).
+    fn read_async<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> impl Future<Output = HidResult<usize>> + Send + 'a {
         ReadAsync { dev: self, buf }
     }
 
-    /// Non-blocking read attempt: `Ok(None)` when no report is queued.
-    fn try_read_now(&self, buf: &mut [u8]) -> HidResult<Option<usize>> {
-        if buf.is_empty() {
-            return Err(HidError::InvalidData {
-                message: "read buffer must not be empty".into(),
-            });
-        }
-        match self.read_timeout(buf, 0)? {
-            0 => Ok(None),
-            n => Ok(Some(n)),
-        }
-    }
-
-    pub fn read_timeout(&self, buf: &mut [u8], timeout_ms: i32) -> HidResult<usize> {
-        if buf.is_empty() {
-            return Err(HidError::InvalidData {
-                message: "read buffer must not be empty".into(),
-            });
-        }
-        let mut pollfd = libc::pollfd {
-            fd: self.raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        loop {
-            let res = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
-            if res < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                return Err(HidError::io("poll on hidraw device", err));
-            }
-            if res == 0 {
-                return Ok(0); // timeout
-            }
-            break;
-        }
-        if pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-            return Err(HidError::Disconnected);
-        }
-        let res = unsafe { libc::read(self.raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-        if res < 0 {
-            let err = std::io::Error::last_os_error();
-            return match err.raw_os_error() {
-                Some(libc::EAGAIN) | Some(libc::EINPROGRESS) => Ok(0),
-                Some(libc::EIO) | Some(libc::ENODEV) => Err(HidError::Disconnected),
-                _ => Err(HidError::io("hidraw read", err)),
-            };
-        }
-        Ok(res as usize)
-    }
-
-    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
-    pub fn set_blocking_mode(&self, blocking: bool) -> HidResult<()> {
-        self.blocking.store(blocking, Ordering::Relaxed);
-        Ok(())
-    }
-
-    pub fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
+    fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
         if data.is_empty() {
             return Err(HidError::InvalidData {
                 message: "feature report must contain a report ID byte".into(),
@@ -481,7 +429,7 @@ impl HidrawDevice {
         Ok(())
     }
 
-    pub fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize> {
+    fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize> {
         if buf.is_empty() {
             return Err(HidError::InvalidData {
                 message: "buffer must contain a report ID byte".into(),
@@ -500,7 +448,7 @@ impl HidrawDevice {
         Ok(res as usize)
     }
 
-    pub fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize> {
+    fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize> {
         if buf.is_empty() {
             return Err(HidError::InvalidData {
                 message: "buffer must contain a report ID byte".into(),
@@ -526,19 +474,19 @@ impl HidrawDevice {
         Ok(res as usize)
     }
 
-    pub fn get_manufacturer_string(&self) -> HidResult<Option<String>> {
+    fn get_manufacturer_string(&self) -> HidResult<Option<String>> {
         Ok(self.get_device_info()?.manufacturer_string)
     }
 
-    pub fn get_product_string(&self) -> HidResult<Option<String>> {
+    fn get_product_string(&self) -> HidResult<Option<String>> {
         Ok(self.get_device_info()?.product_string)
     }
 
-    pub fn get_serial_number_string(&self) -> HidResult<Option<String>> {
+    fn get_serial_number_string(&self) -> HidResult<Option<String>> {
         Ok(self.get_device_info()?.serial_number)
     }
 
-    pub fn get_indexed_string(&self, _index: u32) -> HidResult<Option<String>> {
+    fn get_indexed_string(&self, _index: u32) -> HidResult<Option<String>> {
         // Not available without raw USB access; the `nusb` feature backend
         // supports it.
         Err(HidError::Unsupported {
@@ -546,7 +494,7 @@ impl HidrawDevice {
         })
     }
 
-    pub fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize> {
+    fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize> {
         let mut size: libc::c_int = 0;
         let res = unsafe { libc::ioctl(self.raw_fd(), hidiocgrdescsize() as _, &mut size) };
         if res < 0 {
@@ -565,11 +513,19 @@ impl HidrawDevice {
         Ok(len)
     }
 
-    pub fn get_device_info(&self) -> HidResult<DeviceInfo> {
-        let mut infos = device_infos(&self.sysfs_hid_dir, &self.dev_path)
-            .ok_or_else(|| HidError::backend("failed to read device metadata from sysfs"))?;
-        // For multi-collection devices the first entry is returned.
-        Ok(infos.remove(0))
+    fn get_device_info(&self) -> HidResult<DeviceInfo> {
+        self.info
+            .clone()
+            .ok_or_else(|| HidError::backend("failed to read device metadata from sysfs"))
+    }
+}
+
+impl Drop for HidrawDevice {
+    fn drop(&mut self) {
+        // Drop any reactor interest before `fd` closes. Interests are keyed by
+        // fd number, so leaving one behind would let a later `open` that
+        // recycles the number inherit this device's parked wakers.
+        super::reactor::Reactor::global().deregister(self.fd.as_raw_fd());
     }
 }
 
@@ -684,9 +640,7 @@ mod tests {
         let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
         let dev = HidrawDevice {
             fd: write_fd,
-            blocking: AtomicBool::new(true),
-            sysfs_hid_dir: PathBuf::new(),
-            dev_path: String::new(),
+            info: None,
         };
 
         let n = dev.write(&[0x00, 0xAA, 0xBB]).unwrap();

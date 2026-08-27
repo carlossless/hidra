@@ -23,22 +23,20 @@
 //! on Linux). Paths are stable for as long as the device stays connected, but
 //! are not preserved across replug, like libusb bus addresses.
 //!
-//! Input reports can be read both blocking ([`NusbDevice::read`] /
-//! [`NusbDevice::read_timeout`]) and asynchronously
-//! ([`NusbDevice::read_async`]). Writes and feature reports remain blocking,
-//! they are control or interrupt OUT transfers that complete quickly.
+//! Input reports are read asynchronously ([`NusbDevice::read_async`]) from a
+//! queue filled by a background reader thread. Writes and feature reports are
+//! blocking; they are control or interrupt OUT transfers that complete
+//! quickly.
 //!
 //! [nusb]: https://docs.rs/nusb
 
-use std::collections::VecDeque;
 use std::future::Future;
 use std::num::NonZeroU8;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nusb::descriptors::TransferType;
 use nusb::transfer::{
@@ -46,6 +44,8 @@ use nusb::transfer::{
 };
 use nusb::{Endpoint, Interface, MaybeFuture};
 
+use super::queue::ReportQueue;
+use super::{payload_after_report_id, HidBackend, HidDeviceBackend};
 use crate::descriptor::{ReportDescriptor, ReportKind};
 use crate::error::{HidError, HidResult};
 use crate::{BusType, DeviceInfo, MAX_REPORT_DESCRIPTOR_SIZE};
@@ -64,12 +64,11 @@ const HID_SET_REPORT: u8 = 0x09;
 const REPORT_TYPE_INPUT: u16 = 1;
 const REPORT_TYPE_OUTPUT: u16 = 2;
 const REPORT_TYPE_FEATURE: u16 = 3;
-/// A fixed 1000 ms timeout is used for all control transfers and writes.
-const CONTROL_TIMEOUT: Duration = Duration::from_millis(1000);
+/// A fixed 1000 ms timeout for every transfer issued, control and interrupt
+/// OUT alike.
+const TRANSFER_TIMEOUT: Duration = Duration::from_millis(1000);
 /// How often the reader thread re-checks the shutdown flag while idle.
 const READER_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// The oldest queued input report beyond 30 is dropped.
-const MAX_QUEUED_REPORTS: usize = 30;
 /// The string-descriptor language requested.
 const US_ENGLISH: u16 = 0x0409;
 
@@ -118,25 +117,6 @@ fn device_info(dev: &nusb::DeviceInfo, interface_number: u8) -> DeviceInfo {
     }
 }
 
-/// Append one `DeviceInfo` per top-level usage pair. With no
-/// readable descriptor a single entry with usage 0/0 is emitted.
-fn push_usage_entries(mut info: DeviceInfo, usages: &[(u16, u16)], out: &mut Vec<DeviceInfo>) {
-    match usages {
-        [] => out.push(info),
-        [first @ .., last] => {
-            for &(page, usage) in first {
-                let mut e = info.clone();
-                e.usage_page = page;
-                e.usage = usage;
-                out.push(e);
-            }
-            info.usage_page = last.0;
-            info.usage = last.1;
-            out.push(info);
-        }
-    }
-}
-
 /// `bDescriptorType` of the HID class descriptor inside an interface.
 const DESCRIPTOR_TYPE_HID: u8 = 0x21;
 
@@ -178,7 +158,7 @@ fn read_report_descriptor(interface: &Interface) -> Option<Vec<u8>> {
     let mut data = interface
         .control_in(
             report_descriptor_request(interface_number, length),
-            CONTROL_TIMEOUT,
+            TRANSFER_TIMEOUT,
         )
         .wait()
         .ok()
@@ -202,7 +182,7 @@ fn read_report_descriptor_unclaimed(
     let mut data = device
         .control_in(
             report_descriptor_request(interface_number, length),
-            CONTROL_TIMEOUT,
+            TRANSFER_TIMEOUT,
         )
         .wait()
         .ok()
@@ -211,9 +191,9 @@ fn read_report_descriptor_unclaimed(
     Some(data)
 }
 
-/// WinUSB only allows control transfers through a claimed interface handle,
-/// so enumeration stays non-invasive and reports usage 0/0, a
-/// non-invasive enumeration that does not open the device.
+/// `WinUSB` only allows control transfers through a claimed interface handle,
+/// so enumeration stays non-invasive and reports usage 0/0, without opening
+/// the device.
 #[cfg(target_os = "windows")]
 fn read_report_descriptor_unclaimed(
     _device: &nusb::Device,
@@ -237,14 +217,14 @@ fn transfer_length(max_input_wire: usize, max_packet_size: usize) -> usize {
 /// Entry point for the USB backend; the platform backend behind
 /// [`crate::Hidra`] when the `nusb` feature is enabled. See the
 /// [module docs](self) for when to prefer it.
-pub(crate) struct NusbApi {
-    _private: (),
-}
+pub(crate) struct NusbApi;
 
-impl NusbApi {
+impl HidBackend for NusbApi {
+    type Device = NusbDevice;
+
     /// Initialize the backend.
-    pub fn new() -> HidResult<Self> {
-        Ok(NusbApi { _private: () })
+    fn new() -> HidResult<Self> {
+        Ok(NusbApi)
     }
 
     /// Enumerate connected USB HID interfaces. `vendor_id`/`product_id` of 0
@@ -254,7 +234,7 @@ impl NusbApi {
     /// which needs the device opened; this is attempted best-effort and the
     /// fields stay 0/0 when the device cannot be opened (e.g. missing udev
     /// permissions).
-    pub fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>> {
+    fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>> {
         let devices = match nusb::list_devices().wait() {
             Ok(devices) => devices,
             // A missing /sys/bus/usb (containers, build sandboxes) means no
@@ -271,57 +251,39 @@ impl NusbApi {
         };
         let mut result = Vec::new();
         for dev in devices {
-            let vid_ok = vendor_id == 0 || dev.vendor_id() == vendor_id;
-            let pid_ok = product_id == 0 || dev.product_id() == product_id;
-            if !vid_ok || !pid_ok {
-                continue;
-            }
-            let hid_interfaces: Vec<u8> = dev
+            // `device_info` reads cached descriptors only, so the filter runs
+            // before anything is opened: a device nobody asked for is never
+            // touched.
+            let wanted: Vec<(u8, DeviceInfo)> = dev
                 .interfaces()
                 .filter(|i| i.class() == USB_CLASS_HID)
-                .map(|i| i.interface_number())
+                .map(|i| {
+                    let number = i.interface_number();
+                    (number, device_info(&dev, number))
+                })
+                .filter(|(_, info)| info.matches(vendor_id, product_id))
                 .collect();
-            if hid_interfaces.is_empty() {
+            if wanted.is_empty() {
                 continue;
             }
             // Opening does not claim any interface, so this is non-invasive.
             let opened = dev.open().wait().ok();
-            for interface_number in hid_interfaces {
-                let info = device_info(&dev, interface_number);
+            for (interface_number, info) in wanted {
                 let usages = opened
                     .as_ref()
                     .and_then(|d| read_report_descriptor_unclaimed(d, interface_number))
                     .and_then(|bytes| ReportDescriptor::parse(&bytes).ok())
                     .map(|d| d.top_level_usages())
                     .unwrap_or_default();
-                push_usage_entries(info, &usages, &mut result);
+                result.extend(info.per_usage(&usages));
             }
         }
         Ok(result)
     }
 
-    /// Open the first interface matching `vendor_id`/`product_id` and,
-    /// optionally, the serial number.
-    pub fn open(
-        &self,
-        vendor_id: u16,
-        product_id: u16,
-        serial: Option<&str>,
-    ) -> HidResult<NusbDevice> {
-        let candidates = self.enumerate(vendor_id, product_id)?;
-        let info = candidates
-            .into_iter()
-            .find(|info| match serial {
-                Some(s) => info.serial_number.as_deref() == Some(s),
-                None => true,
-            })
-            .ok_or(HidError::DeviceNotFound)?;
-        self.open_path(&info.path)
-    }
-
     /// Open a device by `usb:<bus>:<device-address>:<interface>` path, as
-    /// reported by [`enumerate`](Self::enumerate).
-    pub fn open_path(&self, path: &str) -> HidResult<NusbDevice> {
+    /// reported by [`HidBackend::enumerate`].
+    fn open_path(&self, path: &str) -> HidResult<NusbDevice> {
         let (bus_id, device_address, interface_number) =
             parse_path(path).ok_or_else(|| HidError::InvalidData {
                 message: format!("invalid USB device path: {path}"),
@@ -337,90 +299,6 @@ impl NusbApi {
 }
 
 // --- device handle ---------------------------------------------------------------
-
-/// Input state guarded by the [`Shared`] mutex.
-#[derive(Default)]
-struct InputQueue {
-    /// Completed input reports, oldest first, capped at
-    /// [`MAX_QUEUED_REPORTS`].
-    reports: VecDeque<Vec<u8>>,
-    /// Tasks parked in [`Shared::poll_read`] on an empty queue, deduplicated
-    /// via [`Waker::will_wake`]. Drained (and woken, after the lock is
-    /// released) whenever a report is queued or the reader exits.
-    wakers: Vec<Waker>,
-}
-
-/// State shared between the device handle and its reader thread.
-#[derive(Default)]
-struct Shared {
-    queue: Mutex<InputQueue>,
-    /// Signaled whenever a report is queued or the reader exits.
-    data_available: Condvar,
-    /// Reader thread has exited (or must exit).
-    shutdown: AtomicBool,
-    /// The device is gone; reads fail once the queue drains.
-    disconnected: AtomicBool,
-}
-
-impl Shared {
-    /// Queue a completed report, dropping the oldest beyond the cap, and
-    /// wake every blocked or parked reader.
-    fn push_report(&self, report: Vec<u8>) {
-        let mut input = self.queue.lock().unwrap();
-        if input.reports.len() >= MAX_QUEUED_REPORTS {
-            input.reports.pop_front(); // drop the oldest
-        }
-        input.reports.push_back(report);
-        let wakers = std::mem::take(&mut input.wakers);
-        drop(input);
-        self.data_available.notify_all();
-        for waker in wakers {
-            waker.wake();
-        }
-    }
-
-    /// Wake every blocked or parked reader without queueing data; called
-    /// after the disconnect/shutdown flags change so waiters re-check them.
-    fn wake_readers(&self) {
-        let wakers = std::mem::take(&mut self.queue.lock().unwrap().wakers);
-        self.data_available.notify_all();
-        for waker in wakers {
-            waker.wake();
-        }
-    }
-
-    /// Pop-or-park core of [`NusbDevice::read_async`]: copy one queued
-    /// report into `buf`, fail once the device is gone and the queue has
-    /// drained, or park the task's waker on the queue.
-    ///
-    /// The flag checks and the waker registration happen under the queue
-    /// lock, and the reader thread sets the flags before taking that lock,
-    /// so a parked waker is never missed.
-    fn poll_read(&self, buf: &mut [u8], cx: &mut Context<'_>) -> Poll<HidResult<usize>> {
-        if buf.is_empty() {
-            return Poll::Ready(Err(HidError::InvalidData {
-                message: "read buffer must not be empty".into(),
-            }));
-        }
-        let mut input = self.queue.lock().unwrap();
-        if let Some(report) = input.reports.pop_front() {
-            let len = report.len().min(buf.len());
-            buf[..len].copy_from_slice(&report[..len]);
-            return Poll::Ready(Ok(len));
-        }
-        // Queued reports drain even after a disconnect, like the sync path.
-        if self.disconnected.load(Ordering::SeqCst) {
-            return Poll::Ready(Err(HidError::Disconnected));
-        }
-        if self.shutdown.load(Ordering::SeqCst) {
-            return Poll::Ready(Err(HidError::backend("USB reader thread terminated")));
-        }
-        if !input.wakers.iter().any(|w| w.will_wake(cx.waker())) {
-            input.wakers.push(cx.waker().clone());
-        }
-        Poll::Pending
-    }
-}
 
 /// An open USB HID interface; the platform device behind
 /// [`crate::HidDevice`] when the `nusb` feature is enabled.
@@ -439,11 +317,9 @@ pub(crate) struct NusbDevice {
     report_descriptor: Vec<u8>,
     /// Interrupt OUT endpoint; writes fall back to `SET_REPORT` without one.
     out_endpoint: Option<Mutex<Endpoint<Interrupt, Out>>>,
-    // Part of the backend contract; the wrapper now reads input via
-    // `read_async`, so the blocking-mode state is unused on this path.
-    #[allow(dead_code)]
-    blocking: AtomicBool,
-    shared: Arc<Shared>,
+    queue: Arc<ReportQueue>,
+    /// Interrupt IN reader thread; absent on interfaces with no such endpoint,
+    /// which support only the control-transfer report calls.
     reader: Option<JoinHandle<()>>,
 }
 
@@ -469,8 +345,10 @@ impl NusbDevice {
             .map(|d| d.max_wire_size(ReportKind::Input))
             .unwrap_or(0);
 
-        // Interrupt endpoints from alternate setting 0; IN is mandatory for
-        // HID, OUT is optional.
+        // Interrupt endpoints from alternate setting 0; both are optional. HID
+        // 1.11 §4.4 mandates an interrupt IN endpoint, but control-only devices
+        // that declare bNumEndpoints 0 exist in the wild and are perfectly
+        // usable through GET_REPORT/SET_REPORT on the control pipe.
         let mut in_address = None;
         let mut out_address = None;
         let alt0 = interface
@@ -489,11 +367,13 @@ impl NusbDevice {
                 }
             }
         }
-        let in_address = in_address
-            .ok_or_else(|| HidError::backend("HID interface has no interrupt IN endpoint"))?;
-        let in_endpoint: Endpoint<Interrupt, In> = interface
-            .endpoint(in_address)
-            .map_err(|e| HidError::backend(format!("opening interrupt IN endpoint: {e}")))?;
+        let in_endpoint: Option<Endpoint<Interrupt, In>> = in_address
+            .map(|address| {
+                interface
+                    .endpoint(address)
+                    .map_err(|e| HidError::backend(format!("opening interrupt IN endpoint: {e}")))
+            })
+            .transpose()?;
         let out_endpoint = match out_address {
             Some(address) => Some(Mutex::new(
                 interface.endpoint::<Interrupt, Out>(address).map_err(|e| {
@@ -503,13 +383,18 @@ impl NusbDevice {
             None => None,
         };
 
-        let max_packet_size = in_endpoint.max_packet_size();
-        if max_packet_size == 0 {
-            return Err(HidError::backend(
-                "interrupt IN endpoint declares a zero wMaxPacketSize",
-            ));
-        }
-        let transfer_len = transfer_length(max_input_wire, max_packet_size);
+        let transfer_len = match in_endpoint.as_ref() {
+            Some(endpoint) => {
+                let max_packet_size = endpoint.max_packet_size();
+                if max_packet_size == 0 {
+                    return Err(HidError::backend(
+                        "interrupt IN endpoint declares a zero wMaxPacketSize",
+                    ));
+                }
+                transfer_length(max_input_wire, max_packet_size)
+            }
+            None => 0,
+        };
 
         let mut info = device_info(dev_info, interface_number);
         if let Some((page, usage)) = parsed
@@ -520,13 +405,24 @@ impl NusbDevice {
             info.usage = usage;
         }
 
-        let shared = Arc::new(Shared::default());
-        let reader = {
-            let shared = Arc::clone(&shared);
-            std::thread::Builder::new()
-                .name("hidra-usb-read".into())
-                .spawn(move || reader_loop(in_endpoint, shared, transfer_len))
-                .map_err(|e| HidError::io("spawning USB reader thread", e))?
+        let queue = Arc::new(ReportQueue::new("USB reader thread terminated"));
+        let reader = match in_endpoint {
+            Some(in_endpoint) => {
+                let queue = Arc::clone(&queue);
+                Some(
+                    std::thread::Builder::new()
+                        .name("hidra-usb-read".into())
+                        .spawn(move || reader_loop(in_endpoint, queue, transfer_len))
+                        .map_err(|e| HidError::io("spawning USB reader thread", e))?,
+                )
+            }
+            None => {
+                // Nothing will ever queue an input report, so mark the queue shut
+                // down at open time: reads then fail like a departed reader
+                // thread instead of parking forever.
+                queue.set_shutdown();
+                None
+            }
         };
 
         Ok(NusbDevice {
@@ -536,177 +432,9 @@ impl NusbDevice {
             info,
             report_descriptor,
             out_endpoint,
-            blocking: AtomicBool::new(true),
-            shared,
-            reader: Some(reader),
+            queue,
+            reader,
         })
-    }
-
-    /// Send an output report. `data[0]` is the report ID; a 0 ID byte is
-    /// stripped before transmission on both
-    /// the interrupt and the `SET_REPORT` control path, while a nonzero ID
-    /// is sent on the wire. Returns the original length on success.
-    pub fn write(&self, data: &[u8]) -> HidResult<usize> {
-        if data.is_empty() {
-            return Err(HidError::InvalidData {
-                message: "write data must contain a report ID byte".into(),
-            });
-        }
-        let report_number = data[0];
-        let payload = if report_number == 0 { &data[1..] } else { data };
-        match &self.out_endpoint {
-            Some(endpoint) => {
-                let mut endpoint = endpoint.lock().unwrap();
-                let completion =
-                    endpoint.transfer_blocking(payload.to_vec().into(), CONTROL_TIMEOUT);
-                match completion.status {
-                    // Report the caller's original length (report-ID byte
-                    // included), matching the documented contract and
-                    // the SET_REPORT path below. `actual_len` counts only the
-                    // payload bytes the endpoint transferred, so it would
-                    // under-report on a short transfer.
-                    Ok(()) => Ok(data.len()),
-                    Err(e) => Err(transfer_error("interrupt OUT write", e)),
-                }
-            }
-            None => {
-                // No interrupt OUT endpoint: use SET_REPORT(Output).
-                self.interface
-                    .control_out(
-                        ControlOut {
-                            control_type: ControlType::Class,
-                            recipient: Recipient::Interface,
-                            request: HID_SET_REPORT,
-                            value: (REPORT_TYPE_OUTPUT << 8) | u16::from(report_number),
-                            index: u16::from(self.interface_number),
-                            data: payload,
-                        },
-                        CONTROL_TIMEOUT,
-                    )
-                    .wait()
-                    .map_err(|e| transfer_error("SET_REPORT (output)", e))?;
-                Ok(data.len())
-            }
-        }
-    }
-
-    /// Read an input report, honoring the blocking mode.
-    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
-    pub fn read(&self, buf: &mut [u8]) -> HidResult<usize> {
-        let timeout = if self.blocking.load(Ordering::Relaxed) {
-            -1
-        } else {
-            0
-        };
-        self.read_timeout(buf, timeout)
-    }
-
-    /// Read an input report queued by the reader thread. Negative timeout
-    /// blocks forever, `0` polls; returns `Ok(0)` on timeout. Reports pass
-    /// through in USB wire format, which already matches the
-    /// convention: the report ID prefix is present only for devices with
-    /// numbered reports.
-    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
-    pub fn read_timeout(&self, buf: &mut [u8], timeout_ms: i32) -> HidResult<usize> {
-        if buf.is_empty() {
-            return Err(HidError::InvalidData {
-                message: "read buffer must not be empty".into(),
-            });
-        }
-        let deadline =
-            (timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(timeout_ms as u64));
-        let mut queue = self.shared.queue.lock().unwrap();
-        loop {
-            if let Some(report) = queue.reports.pop_front() {
-                let len = report.len().min(buf.len());
-                buf[..len].copy_from_slice(&report[..len]);
-                return Ok(len);
-            }
-            // Queued reports drain even after a disconnect.
-            if self.shared.disconnected.load(Ordering::SeqCst) {
-                return Err(HidError::Disconnected);
-            }
-            if self.shared.shutdown.load(Ordering::SeqCst) {
-                return Err(HidError::backend("USB reader thread terminated"));
-            }
-            if timeout_ms == 0 {
-                return Ok(0);
-            }
-            queue = match deadline {
-                Some(deadline) => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Ok(0);
-                    }
-                    self.shared
-                        .data_available
-                        .wait_timeout(queue, deadline - now)
-                        .unwrap()
-                        .0
-                }
-                None => self.shared.data_available.wait(queue).unwrap(),
-            };
-        }
-    }
-
-    /// Read an input report asynchronously (hidra extension).
-    ///
-    /// Resolves once a report queued by the reader thread has been copied
-    /// into `buf`, returning its length, never `Ok(0)`; use your runtime's
-    /// timeout combinator (e.g. `tokio::time::timeout`) instead of
-    /// [`read_timeout`]. Fails with [`HidError::Disconnected`] when the
-    /// device is removed and the queue has drained, like [`read`].
-    ///
-    /// The future is runtime-agnostic (plain `Waker` wake-ups, like nusb,
-    /// works under tokio, async-std, smol or a hand-rolled executor) and
-    /// cancel-safe: reports are only dequeued inside `poll`, so dropping it
-    /// never loses input; pending reports stay queued for the next read.
-    /// The blocking mode set by [`set_blocking_mode`] is ignored.
-    ///
-    /// [`read`]: Self::read
-    /// [`read_timeout`]: Self::read_timeout
-    /// [`set_blocking_mode`]: Self::set_blocking_mode
-    pub fn read_async<'a>(
-        &'a self,
-        buf: &'a mut [u8],
-    ) -> impl Future<Output = HidResult<usize>> + Send + 'a {
-        ReadAsync {
-            shared: &self.shared,
-            buf,
-        }
-    }
-
-    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
-    pub fn set_blocking_mode(&self, blocking: bool) -> HidResult<()> {
-        self.blocking.store(blocking, Ordering::Relaxed);
-        Ok(())
-    }
-
-    /// Send a feature report via `SET_REPORT(Feature)`. `data[0]` is the
-    /// report ID; a 0 ID byte is stripped.
-    pub fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
-        if data.is_empty() {
-            return Err(HidError::InvalidData {
-                message: "feature report must contain a report ID byte".into(),
-            });
-        }
-        let report_number = data[0];
-        let payload = if report_number == 0 { &data[1..] } else { data };
-        self.interface
-            .control_out(
-                ControlOut {
-                    control_type: ControlType::Class,
-                    recipient: Recipient::Interface,
-                    request: HID_SET_REPORT,
-                    value: (REPORT_TYPE_FEATURE << 8) | u16::from(report_number),
-                    index: u16::from(self.interface_number),
-                    data: payload,
-                },
-                CONTROL_TIMEOUT,
-            )
-            .wait()
-            .map_err(|e| transfer_error("SET_REPORT (feature)", e))?;
-        Ok(())
     }
 
     /// `GET_REPORT` shared by feature and input reports. `buf[0]` carries the
@@ -737,7 +465,7 @@ impl NusbDevice {
                     index: u16::from(self.interface_number),
                     length,
                 },
-                CONTROL_TIMEOUT,
+                TRANSFER_TIMEOUT,
             )
             .wait()
             .map_err(|e| transfer_error(operation, e))?;
@@ -745,34 +473,135 @@ impl NusbDevice {
         buf[offset..offset + len].copy_from_slice(&data[..len]);
         Ok(len + offset)
     }
+}
+
+impl HidDeviceBackend for NusbDevice {
+    /// Send an output report. `data[0]` is the report ID; like hidapi's
+    /// libusb backend, a 0 ID byte is stripped before transmission on both
+    /// the interrupt and the `SET_REPORT` control path, while a nonzero ID
+    /// is sent on the wire. Returns the original length on success.
+    fn write(&self, data: &[u8]) -> HidResult<usize> {
+        if data.is_empty() {
+            return Err(HidError::InvalidData {
+                message: "write data must contain a report ID byte".into(),
+            });
+        }
+        let report_number = data[0];
+        let payload = payload_after_report_id(data);
+        match &self.out_endpoint {
+            Some(endpoint) => {
+                let mut endpoint = endpoint.lock().unwrap();
+                let completion =
+                    endpoint.transfer_blocking(payload.to_vec().into(), TRANSFER_TIMEOUT);
+                match completion.status {
+                    // Report the caller's original length (report-ID byte
+                    // included), matching the documented contract, hidapi, and
+                    // the SET_REPORT path below. `actual_len` counts only the
+                    // payload bytes the endpoint transferred, so it would
+                    // under-report on a short transfer.
+                    Ok(()) => Ok(data.len()),
+                    Err(e) => Err(transfer_error("interrupt OUT write", e)),
+                }
+            }
+            None => {
+                // No interrupt OUT endpoint: use SET_REPORT(Output), like
+                // hidapi.
+                self.interface
+                    .control_out(
+                        ControlOut {
+                            control_type: ControlType::Class,
+                            recipient: Recipient::Interface,
+                            request: HID_SET_REPORT,
+                            value: (REPORT_TYPE_OUTPUT << 8) | u16::from(report_number),
+                            index: u16::from(self.interface_number),
+                            data: payload,
+                        },
+                        TRANSFER_TIMEOUT,
+                    )
+                    .wait()
+                    .map_err(|e| transfer_error("SET_REPORT (output)", e))?;
+                Ok(data.len())
+            }
+        }
+    }
+
+    /// Read an input report asynchronously (hidra extension; hidapi has no
+    /// async API).
+    ///
+    /// Resolves once a report queued by the reader thread has been copied
+    /// into `buf`, returning its length, never `Ok(0)`; use your runtime's
+    /// timeout combinator (e.g. `tokio::time::timeout`) to bound the wait.
+    /// Fails with [`HidError::Disconnected`] when the device is removed and
+    /// the queue has drained.
+    ///
+    /// The future is runtime-agnostic (plain `Waker` wake-ups, like nusb,
+    /// works under tokio, async-std, smol or a hand-rolled executor) and
+    /// cancel-safe: reports are only dequeued inside `poll`, so dropping it
+    /// never loses input; pending reports stay queued for the next read.
+    fn read_async<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> impl Future<Output = HidResult<usize>> + Send + 'a {
+        ReadAsync {
+            queue: &self.queue,
+            buf,
+        }
+    }
+
+    /// Send a feature report via `SET_REPORT(Feature)`. `data[0]` is the
+    /// report ID; a 0 ID byte is stripped, like hidapi.
+    fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
+        if data.is_empty() {
+            return Err(HidError::InvalidData {
+                message: "feature report must contain a report ID byte".into(),
+            });
+        }
+        let report_number = data[0];
+        let payload = payload_after_report_id(data);
+        self.interface
+            .control_out(
+                ControlOut {
+                    control_type: ControlType::Class,
+                    recipient: Recipient::Interface,
+                    request: HID_SET_REPORT,
+                    value: (REPORT_TYPE_FEATURE << 8) | u16::from(report_number),
+                    index: u16::from(self.interface_number),
+                    data: payload,
+                },
+                TRANSFER_TIMEOUT,
+            )
+            .wait()
+            .map_err(|e| transfer_error("SET_REPORT (feature)", e))?;
+        Ok(())
+    }
 
     /// Get a feature report via `GET_REPORT(Feature)`. Set `buf[0]` to the
     /// report ID before calling.
-    pub fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize> {
+    fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize> {
         self.get_report(REPORT_TYPE_FEATURE, buf, "GET_REPORT (feature)")
     }
 
     /// Get an input report synchronously via `GET_REPORT(Input)`. Same
     /// buffer convention as [`get_feature_report`](Self::get_feature_report).
-    pub fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize> {
+    fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize> {
         self.get_report(REPORT_TYPE_INPUT, buf, "GET_REPORT (input)")
     }
 
-    pub fn get_manufacturer_string(&self) -> HidResult<Option<String>> {
+    fn get_manufacturer_string(&self) -> HidResult<Option<String>> {
         Ok(self.info.manufacturer_string.clone())
     }
 
-    pub fn get_product_string(&self) -> HidResult<Option<String>> {
+    fn get_product_string(&self) -> HidResult<Option<String>> {
         Ok(self.info.product_string.clone())
     }
 
-    pub fn get_serial_number_string(&self) -> HidResult<Option<String>> {
+    fn get_serial_number_string(&self) -> HidResult<Option<String>> {
         Ok(self.info.serial_number.clone())
     }
 
     /// Read a string descriptor by index (US English), which only this
     /// backend supports, the native hidraw backend cannot.
-    pub fn get_indexed_string(&self, index: u32) -> HidResult<Option<String>> {
+    fn get_indexed_string(&self, index: u32) -> HidResult<Option<String>> {
         let index = u8::try_from(index)
             .ok()
             .and_then(NonZeroU8::new)
@@ -781,7 +610,7 @@ impl NusbDevice {
             })?;
         let s = self
             .device
-            .get_string_descriptor(index, US_ENGLISH, CONTROL_TIMEOUT)
+            .get_string_descriptor(index, US_ENGLISH, TRANSFER_TIMEOUT)
             .wait()
             .map_err(|e| match e {
                 nusb::GetDescriptorError::Transfer(TransferError::Disconnected) => {
@@ -793,7 +622,7 @@ impl NusbDevice {
     }
 
     /// Raw report descriptor, served from the copy read at open time.
-    pub fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize> {
+    fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize> {
         if self.report_descriptor.is_empty() {
             return Err(HidError::backend(
                 "the HID report descriptor could not be read when the device was opened",
@@ -805,15 +634,14 @@ impl NusbDevice {
     }
 
     /// Enumeration-style metadata for this interface, captured at open time.
-    pub fn get_device_info(&self) -> HidResult<DeviceInfo> {
+    fn get_device_info(&self) -> HidResult<DeviceInfo> {
         Ok(self.info.clone())
     }
 }
 
 impl Drop for NusbDevice {
     fn drop(&mut self) {
-        self.shared.shutdown.store(true, Ordering::SeqCst);
-        self.shared.wake_readers();
+        self.queue.set_shutdown();
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
@@ -826,7 +654,7 @@ impl Drop for NusbDevice {
 /// [`Future::poll`], so dropping the future before completion leaves any
 /// pending report queued for the next read.
 struct ReadAsync<'a> {
-    shared: &'a Shared,
+    queue: &'a ReportQueue,
     buf: &'a mut [u8],
 }
 
@@ -835,30 +663,33 @@ impl Future for ReadAsync<'_> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        this.shared.poll_read(this.buf, cx)
+        this.queue.poll_read(this.buf, cx)
     }
 }
 
 /// Reader thread: keeps one interrupt IN transfer pending and queues
-/// completed reports.
-fn reader_loop(mut endpoint: Endpoint<Interrupt, In>, shared: Arc<Shared>, transfer_len: usize) {
+/// completed reports, mirroring hidapi's `read_callback` loop.
+fn reader_loop(
+    mut endpoint: Endpoint<Interrupt, In>,
+    queue: Arc<ReportQueue>,
+    transfer_len: usize,
+) {
     let buf = endpoint.allocate(transfer_len);
     endpoint.submit(buf);
-    while !shared.shutdown.load(Ordering::SeqCst) {
+    while !queue.is_shutdown() {
         let Some(completion) = endpoint.wait_next_complete(READER_POLL_INTERVAL) else {
-            continue; // idle; re-check the shutdown flag
+            continue;
         };
         match completion.status {
             Ok(()) => {
                 let len = completion.actual_len.min(completion.buffer.len());
                 if len > 0 {
-                    shared.push_report(completion.buffer[..len].to_vec());
+                    queue.push(completion.buffer[..len].to_vec());
                 }
                 endpoint.submit(completion.buffer);
             }
             Err(TransferError::Disconnected) => {
-                shared.disconnected.store(true, Ordering::SeqCst);
-                shared.wake_readers();
+                queue.set_disconnected();
                 break;
             }
             Err(TransferError::Cancelled) => break,
@@ -876,8 +707,7 @@ fn reader_loop(mut endpoint: Endpoint<Interrupt, In>, shared: Arc<Shared>, trans
             break;
         }
     }
-    shared.shutdown.store(true, Ordering::SeqCst);
-    shared.wake_readers();
+    queue.set_shutdown();
 }
 
 #[cfg(test)]
@@ -926,108 +756,6 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<NusbApi>();
         assert_send_sync::<NusbDevice>();
-    }
-
-    /// Drive `Shared::poll_read` as a future, as `read_async` does.
-    fn block_on_read(shared: &Shared, buf: &mut [u8]) -> HidResult<usize> {
-        crate::test_util::block_on(std::future::poll_fn(|cx| shared.poll_read(buf, cx)))
-    }
-
-    #[test]
-    fn poll_read_pops_queued_reports_with_truncation() {
-        let shared = Shared::default();
-        shared.push_report(vec![1, 2, 3, 4]);
-        shared.push_report(vec![5]);
-        let mut buf = [0u8; 3];
-        // Same truncation semantics as the sync path: excess bytes are lost.
-        assert_eq!(block_on_read(&shared, &mut buf).unwrap(), 3);
-        assert_eq!(buf, [1, 2, 3]);
-        assert_eq!(block_on_read(&shared, &mut buf).unwrap(), 1);
-        assert_eq!(buf[0], 5);
-    }
-
-    #[test]
-    fn poll_read_rejects_empty_buffer() {
-        let shared = Shared::default();
-        shared.push_report(vec![1]);
-        let err = block_on_read(&shared, &mut []).unwrap_err();
-        assert!(matches!(err, HidError::InvalidData { .. }));
-        // The queued report must not have been consumed.
-        assert_eq!(shared.queue.lock().unwrap().reports.len(), 1);
-    }
-
-    #[test]
-    fn poll_read_drains_queue_before_reporting_disconnect() {
-        let shared = Shared::default();
-        shared.push_report(vec![9]);
-        shared.disconnected.store(true, Ordering::SeqCst);
-        let mut buf = [0u8; 4];
-        assert_eq!(block_on_read(&shared, &mut buf).unwrap(), 1);
-        let err = block_on_read(&shared, &mut buf).unwrap_err();
-        assert!(matches!(err, HidError::Disconnected));
-    }
-
-    #[test]
-    fn poll_read_parks_until_a_report_is_pushed() {
-        let shared = Arc::new(Shared::default());
-        let pusher = {
-            let shared = Arc::clone(&shared);
-            std::thread::spawn(move || {
-                // Give the main thread a chance to park its waker first.
-                while shared.queue.lock().unwrap().wakers.is_empty() {
-                    std::thread::yield_now();
-                }
-                shared.push_report(vec![7, 8]);
-            })
-        };
-        let mut buf = [0u8; 4];
-        assert_eq!(block_on_read(&shared, &mut buf).unwrap(), 2);
-        assert_eq!(buf[..2], [7, 8]);
-        pusher.join().unwrap();
-    }
-
-    #[test]
-    fn poll_read_parks_until_disconnect_is_flagged() {
-        let shared = Arc::new(Shared::default());
-        let disconnector = {
-            let shared = Arc::clone(&shared);
-            std::thread::spawn(move || {
-                while shared.queue.lock().unwrap().wakers.is_empty() {
-                    std::thread::yield_now();
-                }
-                // Same order as the reader thread: flag first, then wake.
-                shared.disconnected.store(true, Ordering::SeqCst);
-                shared.wake_readers();
-            })
-        };
-        let mut buf = [0u8; 4];
-        let err = block_on_read(&shared, &mut buf).unwrap_err();
-        assert!(matches!(err, HidError::Disconnected));
-        disconnector.join().unwrap();
-    }
-
-    #[test]
-    fn poll_read_dedups_wakers_of_the_same_task() {
-        struct CountingWaker(std::sync::atomic::AtomicUsize);
-        impl std::task::Wake for CountingWaker {
-            fn wake(self: Arc<Self>) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        let shared = Shared::default();
-        let counter = Arc::new(CountingWaker(std::sync::atomic::AtomicUsize::new(0)));
-        let waker = Waker::from(Arc::clone(&counter));
-        let mut cx = Context::from_waker(&waker);
-        let mut buf = [0u8; 4];
-        // Re-polling the same task must not pile up waker clones.
-        assert!(shared.poll_read(&mut buf, &mut cx).is_pending());
-        assert!(shared.poll_read(&mut buf, &mut cx).is_pending());
-        assert_eq!(shared.queue.lock().unwrap().wakers.len(), 1);
-        // A pushed report drains the parked waker and wakes it exactly once.
-        shared.push_report(vec![1]);
-        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
-        assert!(shared.queue.lock().unwrap().wakers.is_empty());
     }
 
     #[test]

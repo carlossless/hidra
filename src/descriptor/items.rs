@@ -6,10 +6,49 @@
 
 use crate::error::{HidError, HidResult};
 
+/// Declares a short-item tag enum together with the `bTag` values the HID
+/// spec assigns it.
+///
+/// Encoding and decoding both come from this one list, so a tag cannot be
+/// read as one item and written back as another. `build.rs` used to carry a
+/// hand-written inverse of the tables below.
+macro_rules! item_tags {
+    (
+        $(#[$enum_meta:meta])*
+        pub enum $name:ident {
+            $( $(#[$variant_meta:meta])* $variant:ident = $code:literal, )*
+        }
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum $name {
+            $( $(#[$variant_meta])* $variant, )*
+        }
+
+        impl $name {
+            /// The `bTag` nibble this item uses in a short-item prefix.
+            pub const fn code(self) -> u8 {
+                match self {
+                    $( $name::$variant => $code, )*
+                }
+            }
+
+            /// The item this `bTag` nibble denotes, or `None` when the HID
+            /// spec assigns it no meaning.
+            pub const fn from_code(code: u8) -> Option<Self> {
+                match code {
+                    $( $code => Some($name::$variant), )*
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
 /// `bType` of a short item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemType {
-    /// Main item (Input/Output/Feature/Collection/EndCollection).
+    /// Main item (Input/Output/Feature/Collection/`EndCollection`).
     Main,
     /// Global item (state that persists across items, e.g. usage page).
     Global,
@@ -19,73 +58,99 @@ pub enum ItemType {
     Reserved,
 }
 
-/// Tags of Main items (HID 1.11, 6.2.2.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MainTag {
-    /// Input item: a data field reported by the device.
-    Input,
-    /// Output item: a data field sent to the device.
-    Output,
-    /// Feature item: a data field for configuration, both directions.
-    Feature,
-    /// Collection: opens a grouping of items; data is the collection type.
-    Collection,
-    /// End Collection: closes the most recently opened collection.
-    EndCollection,
+impl ItemType {
+    /// The 2-bit `bType` field of a short-item prefix.
+    pub const fn code(self) -> u8 {
+        match self {
+            ItemType::Main => 0,
+            ItemType::Global => 1,
+            ItemType::Local => 2,
+            ItemType::Reserved => 3,
+        }
+    }
+
+    /// The item type a 2-bit `bType` field denotes. Total: every value of the
+    /// field is defined, with 3 reserved.
+    pub const fn from_code(code: u8) -> Self {
+        match code & 0x3 {
+            0 => ItemType::Main,
+            1 => ItemType::Global,
+            2 => ItemType::Local,
+            _ => ItemType::Reserved,
+        }
+    }
 }
 
-/// Tags of Global items (HID 1.11, 6.2.2.7).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GlobalTag {
-    /// Usage Page: the usage page applied to subsequent usages.
-    UsagePage,
-    /// Logical Minimum: minimum value a field can report.
-    LogicalMinimum,
-    /// Logical Maximum: maximum value a field can report.
-    LogicalMaximum,
-    /// Physical Minimum: logical minimum mapped to physical units.
-    PhysicalMinimum,
-    /// Physical Maximum: logical maximum mapped to physical units.
-    PhysicalMaximum,
-    /// Unit Exponent: base-10 exponent applied to physical units.
-    UnitExponent,
-    /// Unit: encoded physical unit of a field.
-    Unit,
-    /// Report Size: size of each field, in bits.
-    ReportSize,
-    /// Report ID: identifier prefixed to subsequent reports.
-    ReportId,
-    /// Report Count: number of fields in the item.
-    ReportCount,
-    /// Push: save the current global item state onto the stack.
-    Push,
-    /// Pop: restore the global item state from the stack.
-    Pop,
+item_tags! {
+    /// Tags of Main items (HID 1.11, 6.2.2.4).
+    pub enum MainTag {
+        /// Input item: a data field reported by the device.
+        Input = 0b1000,
+        /// Output item: a data field sent to the device.
+        Output = 0b1001,
+        /// Feature item: a data field for configuration, both directions.
+        Feature = 0b1011,
+        /// Collection: opens a grouping of items; data is the collection type.
+        Collection = 0b1010,
+        /// End Collection: closes the most recently opened collection.
+        EndCollection = 0b1100,
+    }
 }
 
-/// Tags of Local items (HID 1.11, 6.2.2.8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LocalTag {
-    /// Usage: a usage assigned to the next field(s).
-    Usage,
-    /// Usage Minimum: start of a range of usages.
-    UsageMinimum,
-    /// Usage Maximum: end of a range of usages.
-    UsageMaximum,
-    /// Designator Index: physical designator from the physical descriptor.
-    DesignatorIndex,
-    /// Designator Minimum: start of a range of designators.
-    DesignatorMinimum,
-    /// Designator Maximum: end of a range of designators.
-    DesignatorMaximum,
-    /// String Index: index of a string descriptor for the field.
-    StringIndex,
-    /// String Minimum: start of a range of string indices.
-    StringMinimum,
-    /// String Maximum: end of a range of string indices.
-    StringMaximum,
-    /// Delimiter: opens or closes a set of alternative usages.
-    Delimiter,
+item_tags! {
+    /// Tags of Global items (HID 1.11, 6.2.2.7).
+    pub enum GlobalTag {
+        /// Usage Page: the usage page applied to subsequent usages.
+        UsagePage = 0x0,
+        /// Logical Minimum: minimum value a field can report.
+        LogicalMinimum = 0x1,
+        /// Logical Maximum: maximum value a field can report.
+        LogicalMaximum = 0x2,
+        /// Physical Minimum: logical minimum mapped to physical units.
+        PhysicalMinimum = 0x3,
+        /// Physical Maximum: logical maximum mapped to physical units.
+        PhysicalMaximum = 0x4,
+        /// Unit Exponent: base-10 exponent applied to physical units.
+        UnitExponent = 0x5,
+        /// Unit: encoded physical unit of a field.
+        Unit = 0x6,
+        /// Report Size: size of each field, in bits.
+        ReportSize = 0x7,
+        /// Report ID: identifier prefixed to subsequent reports.
+        ReportId = 0x8,
+        /// Report Count: number of fields in the item.
+        ReportCount = 0x9,
+        /// Push: save the current global item state onto the stack.
+        Push = 0xA,
+        /// Pop: restore the global item state from the stack.
+        Pop = 0xB,
+    }
+}
+
+item_tags! {
+    /// Tags of Local items (HID 1.11, 6.2.2.8).
+    pub enum LocalTag {
+        /// Usage: a usage assigned to the next field(s).
+        Usage = 0x0,
+        /// Usage Minimum: start of a range of usages.
+        UsageMinimum = 0x1,
+        /// Usage Maximum: end of a range of usages.
+        UsageMaximum = 0x2,
+        /// Designator Index: physical designator from the physical descriptor.
+        DesignatorIndex = 0x3,
+        /// Designator Minimum: start of a range of designators.
+        DesignatorMinimum = 0x4,
+        /// Designator Maximum: end of a range of designators.
+        DesignatorMaximum = 0x5,
+        /// String Index: index of a string descriptor for the field.
+        StringIndex = 0x7,
+        /// String Minimum: start of a range of string indices.
+        StringMinimum = 0x8,
+        /// String Maximum: end of a range of string indices.
+        StringMaximum = 0x9,
+        /// Delimiter: opens or closes a set of alternative usages.
+        Delimiter = 0xA,
+    }
 }
 
 /// A single item of a report descriptor, borrowed from the input buffer.
@@ -124,59 +189,24 @@ impl<'a> RawItem<'a> {
 
     /// Typed Main tag, if this is a recognized Main item.
     pub fn main_tag(&self) -> Option<MainTag> {
-        if self.long || self.item_type != ItemType::Main {
-            return None;
-        }
-        Some(match self.tag {
-            0b1000 => MainTag::Input,
-            0b1001 => MainTag::Output,
-            0b1011 => MainTag::Feature,
-            0b1010 => MainTag::Collection,
-            0b1100 => MainTag::EndCollection,
-            _ => return None,
-        })
+        self.typed_tag(ItemType::Main, MainTag::from_code)
     }
 
     /// Typed Global tag, if this is a recognized Global item.
     pub fn global_tag(&self) -> Option<GlobalTag> {
-        if self.long || self.item_type != ItemType::Global {
-            return None;
-        }
-        Some(match self.tag {
-            0x0 => GlobalTag::UsagePage,
-            0x1 => GlobalTag::LogicalMinimum,
-            0x2 => GlobalTag::LogicalMaximum,
-            0x3 => GlobalTag::PhysicalMinimum,
-            0x4 => GlobalTag::PhysicalMaximum,
-            0x5 => GlobalTag::UnitExponent,
-            0x6 => GlobalTag::Unit,
-            0x7 => GlobalTag::ReportSize,
-            0x8 => GlobalTag::ReportId,
-            0x9 => GlobalTag::ReportCount,
-            0xA => GlobalTag::Push,
-            0xB => GlobalTag::Pop,
-            _ => return None,
-        })
+        self.typed_tag(ItemType::Global, GlobalTag::from_code)
     }
 
     /// Typed Local tag, if this is a recognized Local item.
     pub fn local_tag(&self) -> Option<LocalTag> {
-        if self.long || self.item_type != ItemType::Local {
+        self.typed_tag(ItemType::Local, LocalTag::from_code)
+    }
+
+    fn typed_tag<T>(&self, want: ItemType, decode: fn(u8) -> Option<T>) -> Option<T> {
+        if self.long || self.item_type != want {
             return None;
         }
-        Some(match self.tag {
-            0x0 => LocalTag::Usage,
-            0x1 => LocalTag::UsageMinimum,
-            0x2 => LocalTag::UsageMaximum,
-            0x3 => LocalTag::DesignatorIndex,
-            0x4 => LocalTag::DesignatorMinimum,
-            0x5 => LocalTag::DesignatorMaximum,
-            0x7 => LocalTag::StringIndex,
-            0x8 => LocalTag::StringMinimum,
-            0x9 => LocalTag::StringMaximum,
-            0xA => LocalTag::Delimiter,
-            _ => return None,
-        })
+        decode(self.tag)
     }
 }
 
@@ -239,12 +269,7 @@ impl<'a> Iterator for Items<'a> {
             3 => 4,
             n => n as usize,
         };
-        let item_type = match (prefix >> 2) & 0x03 {
-            0 => ItemType::Main,
-            1 => ItemType::Global,
-            2 => ItemType::Local,
-            _ => ItemType::Reserved,
-        };
+        let item_type = ItemType::from_code(prefix >> 2);
         let tag = prefix >> 4;
         if self.rest.len() < 1 + size {
             self.failed = true;
@@ -295,6 +320,64 @@ mod tests {
         let item = Items::new(&bytes).next().unwrap().unwrap();
         assert_eq!(item.data.len(), 4);
         assert_eq!(item.signed(), -2147483647);
+    }
+
+    #[test]
+    fn tag_codes_round_trip() {
+        // The macro generates `code` and `from_code` from one list; this pins
+        // that they stay inverses, and that gaps stay gaps.
+        for tag in [
+            MainTag::Input,
+            MainTag::Output,
+            MainTag::Feature,
+            MainTag::Collection,
+            MainTag::EndCollection,
+        ] {
+            assert_eq!(MainTag::from_code(tag.code()), Some(tag));
+        }
+        for tag in [
+            GlobalTag::UsagePage,
+            GlobalTag::LogicalMinimum,
+            GlobalTag::LogicalMaximum,
+            GlobalTag::PhysicalMinimum,
+            GlobalTag::PhysicalMaximum,
+            GlobalTag::UnitExponent,
+            GlobalTag::Unit,
+            GlobalTag::ReportSize,
+            GlobalTag::ReportId,
+            GlobalTag::ReportCount,
+            GlobalTag::Push,
+            GlobalTag::Pop,
+        ] {
+            assert_eq!(GlobalTag::from_code(tag.code()), Some(tag));
+        }
+        for tag in [
+            LocalTag::Usage,
+            LocalTag::UsageMinimum,
+            LocalTag::UsageMaximum,
+            LocalTag::DesignatorIndex,
+            LocalTag::DesignatorMinimum,
+            LocalTag::DesignatorMaximum,
+            LocalTag::StringIndex,
+            LocalTag::StringMinimum,
+            LocalTag::StringMaximum,
+            LocalTag::Delimiter,
+        ] {
+            assert_eq!(LocalTag::from_code(tag.code()), Some(tag));
+        }
+        // 0x6 is the reserved gap between Designator Maximum and String Index.
+        assert_eq!(LocalTag::from_code(0x6), None);
+        assert_eq!(GlobalTag::from_code(0xC), None);
+        assert_eq!(MainTag::from_code(0b1101), None);
+
+        for ty in [
+            ItemType::Main,
+            ItemType::Global,
+            ItemType::Local,
+            ItemType::Reserved,
+        ] {
+            assert_eq!(ItemType::from_code(ty.code()), ty);
+        }
     }
 
     #[test]

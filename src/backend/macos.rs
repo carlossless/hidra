@@ -1,25 +1,22 @@
-//! macOS backend: IOHIDManager / IOHIDDevice through hand-written IOKit FFI.
+//! macOS backend: `IOHIDManager` / `IOHIDDevice` through hand-written `IOKit` FFI.
 //!
 //! The macOS IOHIDManager HID backend:
 //!
 //! * Device paths use the modern `DevSrvsID:<registry-entry-id>` form.
 //! * Each open device runs a dedicated read thread pumping a private
-//!   CFRunLoop mode; input reports land in a bounded queue (30 entries,
+//!   `CFRunLoop` mode; input reports land in a bounded queue (30 entries,
 //!   oldest dropped first).
 //! * Exclusive open maps to `kIOHIDOptionsTypeSeizeDevice`; the default is
 //!   shared.
 //!
 //! CoreFoundation declarations come from `core-foundation-sys` (which links
-//! the framework); the IOKit symbols below link `IOKit.framework` directly.
+//! the framework); the `IOKit` symbols below link `IOKit.framework` directly.
 
-use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::task::Waker;
 use std::thread;
-use std::time::{Duration, Instant};
 
 use core_foundation_sys::array::{
     CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueAtIndex, CFArrayRef,
@@ -45,6 +42,8 @@ use core_foundation_sys::string::{
     CFStringGetLength, CFStringGetMaximumSizeForEncoding, CFStringGetTypeID, CFStringRef,
 };
 
+use super::queue::ReportQueue;
+use super::{payload_after_report_id, HidBackend, HidDeviceBackend};
 use crate::error::{HidError, HidResult};
 use crate::{BusType, DeviceInfo};
 
@@ -184,17 +183,14 @@ const KEY_REPORT_DESCRIPTOR: &str = "ReportDescriptor"; // kIOHIDReportDescripto
 /// Device path prefix, the modern `DevSrvsID:%llu` form.
 const PATH_PREFIX: &str = "DevSrvsID:";
 
-/// Unread input reports kept per device before the oldest is dropped.
-const MAX_QUEUED_REPORTS: usize = 30;
-
 // --- pure helpers --------------------------------------------------------------
 
-/// Parse a `DevSrvsID:<decimal id>` path into the IORegistry entry ID.
+/// Parse a `DevSrvsID:<decimal id>` path into the `IORegistry` entry ID.
 fn parse_dev_srvs_id(path: &str) -> Option<u64> {
     path.strip_prefix(PATH_PREFIX)?.parse().ok()
 }
 
-/// Format an IORegistry entry ID as a `DevSrvsID:` path.
+/// Format an `IORegistry` entry ID as a `DevSrvsID:` path.
 fn format_dev_srvs_id(entry_id: u64) -> String {
     format!("{PATH_PREFIX}{entry_id}")
 }
@@ -215,13 +211,72 @@ fn bus_type_from_transport(transport: &str) -> BusType {
 
 // --- CoreFoundation helpers -----------------------------------------------------
 
-/// Create a CFString from a Rust string. The caller releases it.
-unsafe fn cfstr(s: &str) -> CFStringRef {
-    let c = CString::new(s).expect("CF key contains NUL");
-    CFStringCreateWithCString(kCFAllocatorDefault, c.as_ptr(), kCFStringEncodingUTF8)
+/// An owned (+1) CoreFoundation reference, released on drop.
+///
+/// Everything this backend creates or copies out of the `IORegistry` comes back
+/// under the CF "Create rule" and has to be released exactly once. Doing that
+/// by hand meant pairing every `cfstr`/`IORegistryEntrySearchCFProperty` with
+/// a `CFRelease` on every path out of the function.
+struct CfRef(CFTypeRef);
+
+impl CfRef {
+    /// Take ownership of a +1 reference, or `None` if it is null.
+    ///
+    /// # Safety
+    /// `value` must be a reference this caller owns; it is released on drop.
+    unsafe fn from_create(value: CFTypeRef) -> Option<Self> {
+        // Not `then_some`: that builds the `CfRef` eagerly and drops it when
+        // the condition is false, which would `CFRelease(NULL)`.
+        if value.is_null() {
+            None
+        } else {
+            Some(CfRef(value))
+        }
+    }
+
+    fn as_type_ref(&self) -> CFTypeRef {
+        self.0
+    }
 }
 
-/// Convert a CF object to `String` if it is a CFString.
+impl Drop for CfRef {
+    fn drop(&mut self) {
+        // SAFETY: the reference is owned and released only here.
+        unsafe { CFRelease(self.0) };
+    }
+}
+
+/// An owned `CFString` built from a Rust string, for use as a property key.
+struct CfString(CFStringRef);
+
+impl CfString {
+    fn new(s: &str) -> Self {
+        let c = CString::new(s).expect("CF key contains NUL");
+        // SAFETY: `c` is NUL-terminated and outlives the call; the returned
+        // reference is +1 and owned by the CfString.
+        CfString(unsafe {
+            CFStringCreateWithCString(kCFAllocatorDefault, c.as_ptr(), kCFStringEncodingUTF8)
+        })
+    }
+
+    fn as_ref(&self) -> CFStringRef {
+        self.0
+    }
+}
+
+impl Drop for CfString {
+    fn drop(&mut self) {
+        // `CFStringCreateWithCString` returns null on allocation failure, and
+        // `CFRelease(NULL)` traps.
+        if self.0.is_null() {
+            return;
+        }
+        // SAFETY: the reference is owned and released only here.
+        unsafe { CFRelease(self.0 as CFTypeRef) };
+    }
+}
+
+/// Convert a CF object to `String` if it is a `CFString`.
 unsafe fn cfstring_to_string(value: CFTypeRef) -> Option<String> {
     if value.is_null() || CFGetTypeID(value) != CFStringGetTypeID() {
         return None;
@@ -248,7 +303,7 @@ unsafe fn cfstring_to_string(value: CFTypeRef) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
-/// Convert a CF object to `i32` if it is a CFNumber.
+/// Convert a CF object to `i32` if it is a `CFNumber`.
 unsafe fn cfnumber_to_i32(value: CFTypeRef) -> Option<i32> {
     if value.is_null() || CFGetTypeID(value) != CFNumberGetTypeID() {
         return None;
@@ -265,10 +320,7 @@ unsafe fn cfnumber_to_i32(value: CFTypeRef) -> Option<i32> {
 /// Fetch a device property. Per the CF "Get rule" the returned reference is
 /// not owned and must not be released.
 unsafe fn device_property(device: IOHIDDeviceRef, key: &str) -> CFTypeRef {
-    let key = cfstr(key);
-    let value = IOHIDDeviceGetProperty(device, key);
-    CFRelease(key as CFTypeRef);
-    value
+    IOHIDDeviceGetProperty(device, CfString::new(key).as_ref())
 }
 
 unsafe fn string_property(device: IOHIDDeviceRef, key: &str) -> Option<String> {
@@ -279,7 +331,7 @@ unsafe fn i32_property(device: IOHIDDeviceRef, key: &str) -> Option<i32> {
     cfnumber_to_i32(device_property(device, key))
 }
 
-/// IORegistry entry ID of the device's backing service.
+/// `IORegistry` entry ID of the device's backing service.
 unsafe fn registry_entry_id(device: IOHIDDeviceRef) -> Option<u64> {
     // IOHIDDeviceGetService does not transfer ownership; nothing to release.
     let service = IOHIDDeviceGetService(device);
@@ -291,10 +343,8 @@ unsafe fn registry_entry_id(device: IOHIDDeviceRef) -> Option<u64> {
         .then_some(entry_id)
 }
 
-/// Build the `DeviceInfo` entries for one IOHIDDevice: the primary usage pair
-/// first, then one entry per additional pair in `kIOHIDDeviceUsagePairsKey`.
 /// The USB `bInterfaceNumber` of a HID device, found by searching up the
-/// IOService plane to the owning `IOUSBHostInterface`. Returns `-1` for
+/// `IOService` plane to the owning `IOUSBHostInterface`. Returns `-1` for
 /// devices with no USB interface ancestor (Bluetooth, etc.).
 unsafe fn usb_interface_number(device: IOHIDDeviceRef) -> i32 {
     let service = IOHIDDeviceGetService(device);
@@ -303,23 +353,22 @@ unsafe fn usb_interface_number(device: IOHIDDeviceRef) -> i32 {
     }
     // `kIOServicePlane` is the C string "IOService".
     let plane = b"IOService\0";
-    let key = cfstr("bInterfaceNumber");
-    let value = IORegistryEntrySearchCFProperty(
+    // Unlike IOHIDDeviceGetProperty this follows the Create rule.
+    let value = CfRef::from_create(IORegistryEntrySearchCFProperty(
         service,
         plane.as_ptr() as *const c_char,
-        key,
+        CfString::new("bInterfaceNumber").as_ref(),
         kCFAllocatorDefault,
         IO_REGISTRY_ITERATE_PARENTS_RECURSIVELY,
-    );
-    CFRelease(key as CFTypeRef);
-    if value.is_null() {
-        return -1;
-    }
-    let n = cfnumber_to_i32(value).unwrap_or(-1);
-    CFRelease(value);
-    n
+    ));
+    value
+        .and_then(|v| cfnumber_to_i32(v.as_type_ref()))
+        .unwrap_or(-1)
 }
 
+/// Build the `DeviceInfo` entries for one `IOHIDDevice`: the primary usage pair
+/// first, then one entry per additional pair in `kIOHIDDeviceUsagePairsKey`,
+/// exactly like hidapi.
 unsafe fn device_infos(device: IOHIDDeviceRef) -> Vec<DeviceInfo> {
     let info = DeviceInfo {
         // Fall back to an empty path when the registry ID is
@@ -344,38 +393,39 @@ unsafe fn device_infos(device: IOHIDDeviceRef) -> Vec<DeviceInfo> {
             .unwrap_or(BusType::Unknown),
     };
 
-    let mut entries = vec![info.clone()];
+    // The primary pair leads, then every other pair the device declares.
+    let mut usages = vec![(info.usage_page, info.usage)];
 
     let pairs = device_property(device, KEY_DEVICE_USAGE_PAIRS);
     if !pairs.is_null() && CFGetTypeID(pairs) == CFArrayGetTypeID() {
         let pairs = pairs as CFArrayRef;
-        let page_key = cfstr(KEY_DEVICE_USAGE_PAGE);
-        let usage_key = cfstr(KEY_DEVICE_USAGE);
+        let page_key = CfString::new(KEY_DEVICE_USAGE_PAGE);
+        let usage_key = CfString::new(KEY_DEVICE_USAGE);
         for i in 0..CFArrayGetCount(pairs) {
             let dict = CFArrayGetValueAtIndex(pairs, i) as CFTypeRef;
             if dict.is_null() || CFGetTypeID(dict) != CFDictionaryGetTypeID() {
                 continue;
             }
             let dict = dict as CFDictionaryRef;
-            let page = cfnumber_to_i32(CFDictionaryGetValue(dict, page_key as *const c_void));
-            let usage = cfnumber_to_i32(CFDictionaryGetValue(dict, usage_key as *const c_void));
+            let page = cfnumber_to_i32(CFDictionaryGetValue(
+                dict,
+                page_key.as_ref() as *const c_void,
+            ));
+            let usage = cfnumber_to_i32(CFDictionaryGetValue(
+                dict,
+                usage_key.as_ref() as *const c_void,
+            ));
             let (Some(page), Some(usage)) = (page, usage) else {
                 continue;
             };
-            let (page, usage) = (page as u16, usage as u16);
-            if page == info.usage_page && usage == info.usage {
-                continue; // primary pair, already added
+            let pair = (page as u16, usage as u16);
+            if !usages.contains(&pair) {
+                usages.push(pair);
             }
-            let mut entry = info.clone();
-            entry.usage_page = page;
-            entry.usage = usage;
-            entries.push(entry);
         }
-        CFRelease(page_key as CFTypeRef);
-        CFRelease(usage_key as CFTypeRef);
     }
 
-    entries
+    info.per_usage(&usages)
 }
 
 // --- backend API -----------------------------------------------------------------
@@ -390,23 +440,27 @@ pub(crate) struct MacApi {
 // `enumerate` call creates and releases its own IOHIDManager.
 
 impl MacApi {
-    pub fn new() -> HidResult<Self> {
+    /// `hid_darwin_set_open_exclusive` equivalent.
+    pub(crate) fn set_open_exclusive(&self, exclusive: bool) {
+        self.open_exclusive.store(exclusive, Ordering::Relaxed);
+    }
+
+    /// `hid_darwin_get_open_exclusive` equivalent.
+    pub(crate) fn open_exclusive(&self) -> bool {
+        self.open_exclusive.load(Ordering::Relaxed)
+    }
+}
+
+impl HidBackend for MacApi {
+    type Device = MacDevice;
+
+    fn new() -> HidResult<Self> {
         Ok(MacApi {
             open_exclusive: AtomicBool::new(false),
         })
     }
 
-    /// `hid_darwin_set_open_exclusive` equivalent.
-    pub fn set_open_exclusive(&self, exclusive: bool) {
-        self.open_exclusive.store(exclusive, Ordering::Relaxed);
-    }
-
-    /// `hid_darwin_get_open_exclusive` equivalent.
-    pub fn open_exclusive(&self) -> bool {
-        self.open_exclusive.load(Ordering::Relaxed)
-    }
-
-    pub fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>> {
+    fn enumerate(&self, vendor_id: u16, product_id: u16) -> HidResult<Vec<DeviceInfo>> {
         let mut result = Vec::new();
         // SAFETY: the copied set owns one reference to each IOHIDDeviceRef;
         // the refs are only used before the set is released.
@@ -436,13 +490,11 @@ impl MacApi {
                 if device.is_null() {
                     continue;
                 }
-                for info in device_infos(device as IOHIDDeviceRef) {
-                    let vid_ok = vendor_id == 0 || info.vendor_id == vendor_id;
-                    let pid_ok = product_id == 0 || info.product_id == product_id;
-                    if vid_ok && pid_ok {
-                        result.push(info);
-                    }
-                }
+                result.extend(
+                    device_infos(device as IOHIDDeviceRef)
+                        .into_iter()
+                        .filter(|info| info.matches(vendor_id, product_id)),
+                );
             }
             CFRelease(set as CFTypeRef);
             CFRelease(manager as CFTypeRef);
@@ -450,24 +502,7 @@ impl MacApi {
         Ok(result)
     }
 
-    pub fn open(
-        &self,
-        vendor_id: u16,
-        product_id: u16,
-        serial: Option<&str>,
-    ) -> HidResult<MacDevice> {
-        let candidates = self.enumerate(vendor_id, product_id)?;
-        let info = candidates
-            .into_iter()
-            .find(|info| match serial {
-                Some(s) => info.serial_number.as_deref() == Some(s),
-                None => true,
-            })
-            .ok_or(HidError::DeviceNotFound)?;
-        self.open_path(&info.path)
-    }
-
-    pub fn open_path(&self, path: &str) -> HidResult<MacDevice> {
+    fn open_path(&self, path: &str) -> HidResult<MacDevice> {
         let entry_id = parse_dev_srvs_id(path).ok_or_else(|| HidError::InvalidData {
             message: format!("not a macOS device path (expected \"DevSrvsID:<id>\"): {path}"),
         })?;
@@ -482,36 +517,40 @@ impl MacApi {
 
 // --- device handle -----------------------------------------------------------------
 
-/// State shared between the device handle, the read thread, and the IOKit
+/// State shared between the device handle, the read thread, and the `IOKit`
 /// callbacks.
 #[derive(Default)]
 struct Shared {
-    state: Mutex<State>,
-    cond: Condvar,
+    /// Input reports plus the disconnect/shutdown flags and parked readers.
+    queue: ReportQueue,
+    /// Read-thread lifecycle, which the queue does not model.
+    thread: Mutex<ThreadState>,
+    /// Signals `ThreadState::ready`; only [`MacDevice::open`]'s startup
+    /// barrier waits on it. Input reports and disconnects reach readers
+    /// through the queue's wakers, never through this.
+    ready_cond: Condvar,
 }
 
 #[derive(Default)]
-struct State {
-    /// Queued input reports, oldest first.
-    reports: VecDeque<Vec<u8>>,
-    /// Set by the removal callback (or when the run loop dies unexpectedly).
-    disconnected: bool,
-    /// Set by `Drop` to make the read thread exit.
-    shutdown: bool,
-    /// CFRunLoopRef of the read thread (as usize), 0 until the thread is up.
+struct ThreadState {
+    /// `CFRunLoopRef` of the read thread (as usize), 0 until the thread is up.
     run_loop: usize,
     /// The read thread finished scheduling the device.
     ready: bool,
-    /// Wakers of pending `read_async` futures; drained (and woken) by the
-    /// IOKit callbacks whenever a report arrives or the device goes away.
-    wakers: Vec<Waker>,
 }
 
 impl Shared {
-    /// Lock the state, recovering from poisoning: none of the critical
-    /// sections can leave the queue in an inconsistent state.
-    fn lock_state(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    fn new() -> Self {
+        Shared {
+            queue: ReportQueue::new("device read thread is shut down"),
+            ..Default::default()
+        }
+    }
+
+    /// Lock the thread state, recovering from poisoning: neither field can be
+    /// left inconsistent by the two short critical sections that touch them.
+    fn lock_thread(&self) -> MutexGuard<'_, ThreadState> {
+        self.thread.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -533,19 +572,7 @@ unsafe extern "C" fn input_report_callback(
     // stays valid until the callback is unregistered (MacDevice::drop).
     let shared = &*(context as *const Shared);
     let data = std::slice::from_raw_parts(report, report_length as usize).to_vec();
-    let wakers = {
-        let mut state = shared.lock_state();
-        state.reports.push_back(data);
-        if state.reports.len() > MAX_QUEUED_REPORTS {
-            state.reports.pop_front();
-        }
-        shared.cond.notify_all();
-        std::mem::take(&mut state.wakers)
-    };
-    // Wake outside the lock so no executor code ever runs while it is held.
-    for waker in wakers {
-        waker.wake();
-    }
+    shared.queue.push(data);
 }
 
 /// `IOHIDCallback` for device removal: flags the disconnect, wakes readers
@@ -557,29 +584,35 @@ unsafe extern "C" fn removal_callback(
 ) {
     // SAFETY: see input_report_callback.
     let shared = &*(context as *const Shared);
-    let wakers = {
-        let mut state = shared.lock_state();
-        state.disconnected = true;
-        shared.cond.notify_all();
-        if state.run_loop != 0 {
-            CFRunLoopStop(state.run_loop as CFRunLoopRef);
-        }
-        std::mem::take(&mut state.wakers)
-    };
-    // Wake outside the lock so no executor code ever runs while it is held.
-    for waker in wakers {
-        waker.wake();
+    shared.queue.set_disconnected();
+    let thread = shared.lock_thread();
+    if thread.run_loop != 0 {
+        CFRunLoopStop(thread.run_loop as CFRunLoopRef);
     }
 }
 
 /// No-op `perform` for the keep-alive run-loop source (see [`read_thread`]).
 extern "C" fn keepalive_perform(_info: *const c_void) {}
 
+/// A CoreFoundation reference handed to the read thread.
+///
+/// `IOHIDDeviceRef` and `CFStringRef` are raw pointers, so they are not `Send`
+/// on their own. The device handle owns both and joins the thread in `Drop`
+/// before releasing either, so the thread never observes a dangling reference;
+/// this states that where the invariant lives instead of laundering the
+/// pointers through `usize`.
+#[derive(Clone, Copy)]
+struct SendRef<T>(*mut T);
+
+// SAFETY: see the type docs. The referenced objects outlive the thread, and
+// the IOKit calls the thread makes with them are thread-safe.
+unsafe impl<T> Send for SendRef<T> {}
+
 /// Read-thread body: schedules the device on this thread's run loop and pumps
 /// the private mode until shutdown or disconnection.
-fn read_thread(device: usize, mode: usize, shared: Arc<Shared>) {
-    let device = device as IOHIDDeviceRef;
-    let mode = mode as CFStringRef;
+fn read_thread(device: SendRef<c_void>, mode: SendRef<c_void>, shared: Arc<Shared>) {
+    let device: IOHIDDeviceRef = device.0;
+    let mode = mode.0 as CFStringRef;
     // SAFETY: the device and mode refs outlive the thread (Drop joins it
     // before releasing them); run loop calls target this thread's loop.
     unsafe {
@@ -607,28 +640,24 @@ fn read_thread(device: usize, mode: usize, shared: Arc<Shared>) {
         CFRunLoopAddSource(run_loop, keepalive, mode);
 
         {
-            let mut state = shared.lock_state();
-            state.run_loop = run_loop as usize;
-            state.ready = true;
-            shared.cond.notify_all();
+            let mut thread = shared.lock_thread();
+            thread.run_loop = run_loop as usize;
+            thread.ready = true;
+            shared.ready_cond.notify_all();
         }
         loop {
-            {
-                let state = shared.lock_state();
-                if state.shutdown || state.disconnected {
-                    break;
-                }
+            if shared.queue.is_shutdown() || shared.queue.is_disconnected() {
+                break;
             }
             // Pump the private mode in long slices; the loop is broken by
             // CFRunLoopStop on close/removal (-> Stopped). The keep-alive source
             // above prevents a transiently-empty mode from returning Finished.
             let code = CFRunLoopRunInMode(mode, 1000.0, 0);
             if code == kCFRunLoopRunFinished || code == kCFRunLoopRunStopped {
-                let mut state = shared.lock_state();
-                if !state.shutdown {
+                if !shared.queue.is_shutdown() {
                     // The run loop died without an orderly close: treat it as
                     // a disconnect.
-                    state.disconnected = true;
+                    shared.queue.set_disconnected();
                 }
                 break;
             }
@@ -638,50 +667,40 @@ fn read_thread(device: usize, mode: usize, shared: Arc<Shared>) {
         CFRunLoopRemoveSource(run_loop, keepalive, mode);
         CFRelease(keepalive as CFTypeRef);
 
-        // Wake any threads blocked in read()/read_timeout() and any pending
-        // read_async futures (the run loop may have died without the removal
-        // callback firing).
-        let wakers = {
-            let mut state = shared.lock_state();
-            // This thread's run loop is ending; clear the stored pointer so a
-            // later `Drop` doesn't `CFRunLoopStop` an address CoreFoundation may
-            // have already reused for another device's read thread.
-            state.run_loop = 0;
-            shared.cond.notify_all();
-            std::mem::take(&mut state.wakers)
-        };
-        for waker in wakers {
-            waker.wake();
-        }
+        // This thread's run loop is ending; clear the stored pointer so a
+        // later `Drop` doesn't `CFRunLoopStop` an address CoreFoundation may
+        // have already reused for another device's read thread.
+        shared.lock_thread().run_loop = 0;
+        // Wake any pending read_async futures: the run loop may have died
+        // without the removal callback firing.
+        shared.queue.wake_parked();
     }
 }
 
 pub(crate) struct MacDevice {
     device: IOHIDDeviceRef,
-    /// Options the device was opened with; IOHIDDeviceClose wants them back.
+    /// Options the device was opened with; `IOHIDDeviceClose` wants them back.
     open_options: IOOptionBits,
     /// Private run loop mode (`HIDRA_%p`), so input reports are not
     /// dispatched by unrelated default-mode run loop activity.
     run_loop_mode: CFStringRef,
-    /// Buffer IOKit writes incoming reports into. Kept as a raw allocation
-    /// because IOKit holds the pointer while the callback is registered; it
+    /// Buffer `IOKit` writes incoming reports into. Kept as a raw allocation
+    /// because `IOKit` holds the pointer while the callback is registered; it
     /// is reboxed and freed in Drop after the read thread is joined.
     input_buf: *mut u8,
     input_buf_len: usize,
     shared: Arc<Shared>,
     read_thread: Option<thread::JoinHandle<()>>,
-    // Part of the backend contract; the wrapper now reads input via
-    // `read_async`, so the blocking-mode state is unused on this path.
-    #[allow(dead_code)]
-    blocking: AtomicBool,
 }
 
-// SAFETY: IOHIDDeviceRef supports concurrent use for the calls made here,
+// SAFETY: `IOHIDDeviceRef` supports concurrent use for the calls made here,
 // SetReport/GetReport/GetProperty from user threads while the read thread
 // pumps the run loop. All mutable
 // Rust-side state (report queue, flags) is behind a Mutex; the input buffer
 // is only touched by IOKit on the read thread.
 unsafe impl Send for MacDevice {}
+// SAFETY: as above, `&MacDevice` exposes only the thread-safe IOKit calls and
+// mutex-guarded state, so sharing a reference across threads is sound.
 unsafe impl Sync for MacDevice {}
 
 impl MacDevice {
@@ -726,7 +745,7 @@ impl MacDevice {
                 kCFStringEncodingUTF8,
             );
 
-            let shared = Arc::new(Shared::default());
+            let shared = Arc::new(Shared::new());
             // Valid for the callbacks' whole lifetime: Drop unregisters them
             // before `shared` is dropped.
             let context = Arc::as_ptr(&shared) as *mut c_void;
@@ -741,8 +760,8 @@ impl MacDevice {
 
             let thread = thread::Builder::new().name("hidra-hid-read".into()).spawn({
                 let shared = Arc::clone(&shared);
-                let device = device as usize;
-                let mode = run_loop_mode as usize;
+                let device = SendRef(device);
+                let mode = SendRef(run_loop_mode as *mut c_void);
                 move || read_thread(device, mode, shared)
             });
             let thread = match thread {
@@ -770,11 +789,11 @@ impl MacDevice {
             // Wait for the read thread to schedule the device (startup
             // barrier).
             {
-                let mut state = shared.lock_state();
-                while !state.ready {
-                    state = shared
-                        .cond
-                        .wait(state)
+                let mut thread = shared.lock_thread();
+                while !thread.ready {
+                    thread = shared
+                        .ready_cond
+                        .wait(thread)
                         .unwrap_or_else(PoisonError::into_inner);
                 }
             }
@@ -787,13 +806,12 @@ impl MacDevice {
                 input_buf_len,
                 shared,
                 read_thread: Some(thread),
-                blocking: AtomicBool::new(true),
             })
         }
     }
 
     fn disconnected(&self) -> bool {
-        self.shared.lock_state().disconnected
+        self.shared.queue.is_disconnected()
     }
 
     /// Common implementation of `write` and `send_feature_report`:
@@ -809,7 +827,7 @@ impl MacDevice {
             return Err(HidError::Disconnected);
         }
         let report_id = data[0];
-        let payload = if report_id == 0 { &data[1..] } else { data };
+        let payload = payload_after_report_id(data);
         // SAFETY: payload outlives the synchronous call.
         let ret = unsafe {
             IOHIDDeviceSetReport(
@@ -870,111 +888,50 @@ impl MacDevice {
         }
         Ok(returned)
     }
+}
 
-    pub fn write(&self, data: &[u8]) -> HidResult<usize> {
+impl HidDeviceBackend for MacDevice {
+    fn write(&self, data: &[u8]) -> HidResult<usize> {
         self.set_report(IOHID_REPORT_TYPE_OUTPUT, data)
     }
 
-    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
-    pub fn read(&self, buf: &mut [u8]) -> HidResult<usize> {
-        let timeout = if self.blocking.load(Ordering::Relaxed) {
-            -1
-        } else {
-            0
-        };
-        self.read_timeout(buf, timeout)
-    }
-
-    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
-    pub fn read_timeout(&self, buf: &mut [u8], timeout_ms: i32) -> HidResult<usize> {
-        if buf.is_empty() {
-            return Err(HidError::InvalidData {
-                message: "read buffer must not be empty".into(),
-            });
-        }
-        let deadline =
-            (timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(timeout_ms as u64));
-        let mut state = self.shared.lock_state();
-        loop {
-            if let Some(report) = state.reports.pop_front() {
-                let len = report.len().min(buf.len());
-                buf[..len].copy_from_slice(&report[..len]);
-                return Ok(len);
-            }
-            // Queue drained: a disconnect now means no data will ever come.
-            if state.disconnected {
-                return Err(HidError::Disconnected);
-            }
-            if state.shutdown {
-                return Err(HidError::backend("device read thread is shut down"));
-            }
-            state = match deadline {
-                // timeout_ms == 0: poll.
-                None if timeout_ms == 0 => return Ok(0),
-                // timeout_ms < 0: block until data or disconnect.
-                None => self
-                    .shared
-                    .cond
-                    .wait(state)
-                    .unwrap_or_else(PoisonError::into_inner),
-                Some(deadline) => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Ok(0);
-                    }
-                    self.shared
-                        .cond
-                        .wait_timeout(state, deadline - now)
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .0
-                }
-            };
-        }
-    }
-
-    /// Read one input report without ever returning `Ok(0)`: resolves when a
-    /// report is popped from the queue, fails with [`HidError::Disconnected`]
-    /// once the device goes away and the queue is drained. Wake-ups come from
-    /// the IOKit callbacks on the read thread (raw [`Waker`]s, no executor
-    /// assumed).
-    pub fn read_async<'a>(&'a self, buf: &'a mut [u8]) -> ReadAsync<'a> {
+    /// Wake-ups come from the `IOKit` callbacks on the read thread (raw
+    /// [`Waker`]s, no executor assumed).
+    fn read_async<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> impl std::future::Future<Output = HidResult<usize>> + Send + 'a {
         ReadAsync { dev: self, buf }
     }
 
-    #[allow(dead_code)] // part of the backend contract; wrapper reads via read_async
-    pub fn set_blocking_mode(&self, blocking: bool) -> HidResult<()> {
-        self.blocking.store(blocking, Ordering::Relaxed);
-        Ok(())
-    }
-
-    pub fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
+    fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
         self.set_report(IOHID_REPORT_TYPE_FEATURE, data).map(|_| ())
     }
 
-    pub fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize> {
+    fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize> {
         self.get_report(IOHID_REPORT_TYPE_FEATURE, buf)
     }
 
-    pub fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize> {
+    fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize> {
         self.get_report(IOHID_REPORT_TYPE_INPUT, buf)
     }
 
-    pub fn get_manufacturer_string(&self) -> HidResult<Option<String>> {
+    fn get_manufacturer_string(&self) -> HidResult<Option<String>> {
         // SAFETY: self.device is open for the lifetime of self.
         Ok(unsafe { string_property(self.device, KEY_MANUFACTURER) })
     }
 
-    pub fn get_product_string(&self) -> HidResult<Option<String>> {
+    fn get_product_string(&self) -> HidResult<Option<String>> {
         // SAFETY: self.device is open for the lifetime of self.
         Ok(unsafe { string_property(self.device, KEY_PRODUCT) })
     }
 
-    pub fn get_serial_number_string(&self) -> HidResult<Option<String>> {
+    fn get_serial_number_string(&self) -> HidResult<Option<String>> {
         // SAFETY: self.device is open for the lifetime of self.
         Ok(unsafe { string_property(self.device, KEY_SERIAL_NUMBER) })
     }
 
-    pub fn get_indexed_string(&self, _index: u32) -> HidResult<Option<String>> {
+    fn get_indexed_string(&self, _index: u32) -> HidResult<Option<String>> {
         // On macOS, USB string descriptor tables are
         // not reachable through IOHIDDevice. The `nusb` feature backend
         // supports it.
@@ -984,7 +941,7 @@ impl MacDevice {
         })
     }
 
-    pub fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize> {
+    fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize> {
         // SAFETY: the property reference follows the Get rule (not owned) and
         // its bytes are copied out before any other CF call.
         unsafe {
@@ -1001,7 +958,7 @@ impl MacDevice {
         }
     }
 
-    pub fn get_device_info(&self) -> HidResult<DeviceInfo> {
+    fn get_device_info(&self) -> HidResult<DeviceInfo> {
         // SAFETY: self.device is open for the lifetime of self.
         let mut infos = unsafe { device_infos(self.device) };
         // device_infos always yields the primary-usage entry first, which is
@@ -1017,10 +974,8 @@ impl Drop for MacDevice {
         // read thread is joined before the device/mode refs are released, and
         // the input buffer is freed only after IOKit can no longer write it.
         unsafe {
-            let (disconnected, run_loop) = {
-                let state = self.shared.lock_state();
-                (state.disconnected, state.run_loop)
-            };
+            let disconnected = self.shared.queue.is_disconnected();
+            let run_loop = self.shared.lock_thread().run_loop;
             let context = Arc::as_ptr(&self.shared) as *mut c_void;
             if !disconnected {
                 // Disconnect the callbacks and move the device off the read
@@ -1046,11 +1001,7 @@ impl Drop for MacDevice {
                     );
                 }
             }
-            {
-                let mut state = self.shared.lock_state();
-                state.shutdown = true;
-                self.shared.cond.notify_all();
-            }
+            self.shared.queue.set_shutdown();
             if run_loop != 0 {
                 CFRunLoopStop(run_loop as CFRunLoopRef);
                 CFRunLoopWakeUp(run_loop as CFRunLoopRef);
@@ -1076,7 +1027,7 @@ impl Drop for MacDevice {
 /// Cancel-safe: a report is only popped from the queue inside `poll`, so
 /// dropping the future before completion loses nothing, the report stays
 /// queued for the next read. A waker left behind by a dropped future causes
-/// at most one spurious wake-up; the callbacks drain the whole waker list on
+/// at most one spurious wake-up; the queue drains its whole waker list on
 /// every wake, so stale entries never accumulate.
 pub(crate) struct ReadAsync<'a> {
     dev: &'a MacDevice,
@@ -1091,33 +1042,7 @@ impl std::future::Future for ReadAsync<'_> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let this = self.get_mut();
-        if this.buf.is_empty() {
-            return std::task::Poll::Ready(Err(HidError::InvalidData {
-                message: "read buffer must not be empty".into(),
-            }));
-        }
-        let mut state = this.dev.shared.lock_state();
-        if let Some(report) = state.reports.pop_front() {
-            let len = report.len().min(this.buf.len());
-            this.buf[..len].copy_from_slice(&report[..len]);
-            return std::task::Poll::Ready(Ok(len));
-        }
-        // Queue drained: a disconnect now means no data will ever come.
-        if state.disconnected {
-            return std::task::Poll::Ready(Err(HidError::Disconnected));
-        }
-        if state.shutdown {
-            return std::task::Poll::Ready(Err(HidError::backend(
-                "device read thread is shut down",
-            )));
-        }
-        // Registering under the same lock the callbacks take closes the gap
-        // between the checks above and the registration: no report or
-        // disconnect can slip in unobserved.
-        if !state.wakers.iter().any(|w| w.will_wake(cx.waker())) {
-            state.wakers.push(cx.waker().clone());
-        }
-        std::task::Poll::Pending
+        this.dev.shared.queue.poll_read(this.buf, cx)
     }
 }
 

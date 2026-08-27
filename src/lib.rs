@@ -8,8 +8,8 @@
 //! | Platform | Backend |
 //! |----------|---------|
 //! | Linux    | `hidraw` device nodes + sysfs enumeration |
-//! | Windows  | `hid.dll` / SetupAPI via `windows-sys` declarations |
-//! | macOS    | IOHIDManager via direct framework FFI |
+//! | Windows  | `hid.dll` / `SetupAPI` via `windows-sys` declarations |
+//! | macOS    | `IOHIDManager` via direct framework FFI |
 //! | Any (feature `nusb`) | USB interrupt/control transfers via [nusb] |
 //! | WebAssembly | [WebHID](https://wicg.github.io/webhid/) via `web-sys` |
 //!
@@ -18,7 +18,7 @@
 //! it blocking with `.wait()`, or `.await` it under any async runtime (no
 //! executor dependency, wake-ups are plain `Waker`s like nusb).
 //!
-//! On `wasm32` the same [`Hidra`] / [`HidDevice`] types are backed by WebHID;
+//! On `wasm32` the same [`Hidra`] / [`HidDevice`] types are backed by `WebHID`;
 //! there is no blocking mode, so always `.await` their futures (no `.wait()`).
 //! Discovery is WebHID-shaped: `Hidra::request_device` shows the browser's
 //! device chooser (filtered with `DeviceFilter`) and `Hidra::get_devices`
@@ -42,8 +42,6 @@
 //!
 //! [nusb]: https://docs.rs/nusb
 
-#![deny(missing_docs)]
-
 pub mod descriptor;
 mod device_info;
 mod error;
@@ -60,9 +58,6 @@ mod backend;
 mod maybe_future;
 #[cfg(not(target_arch = "wasm32"))]
 pub use maybe_future::MaybeFuture;
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
-pub(crate) mod test_util;
 
 /// WebHID-only public surface: the device filter for `Hidra::request_device`,
 /// the listener handle returned by the event hooks, and the buffered input
@@ -83,7 +78,6 @@ pub struct ApiVersion {
 
 /// Library version (`hid_version` equivalent).
 pub const fn version() -> ApiVersion {
-    // Parsed from CARGO_PKG_VERSION_* at compile time.
     const fn parse(s: &str) -> u16 {
         let bytes = s.as_bytes();
         let mut v = 0u16;
@@ -116,7 +110,7 @@ pub use web::{HidDevice, Hidra};
 mod native {
     use core::future::Future;
 
-    use crate::backend::{PlatformApi, PlatformDevice};
+    use crate::backend::{HidBackend, HidDeviceBackend, PlatformApi, PlatformDevice};
     use crate::{DeviceInfo, HidResult};
 
     /// Entry point to the library; owns backend state and the cached device
@@ -127,6 +121,17 @@ mod native {
     pub struct Hidra {
         backend: PlatformApi,
         device_list: Vec<DeviceInfo>,
+    }
+
+    // The platform backends hold raw OS handles that have no useful `Debug`;
+    // report the cached device count instead, which is what a caller
+    // inspecting a `Hidra` actually wants to see.
+    impl core::fmt::Debug for Hidra {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("Hidra")
+                .field("devices", &self.device_list.len())
+                .finish_non_exhaustive()
+        }
     }
 
     impl Hidra {
@@ -231,6 +236,12 @@ mod native {
     /// shared across threads.
     pub struct HidDevice {
         backend: PlatformDevice,
+    }
+
+    impl core::fmt::Debug for HidDevice {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("HidDevice").finish_non_exhaustive()
+        }
     }
 
     impl HidDevice {
@@ -386,18 +397,33 @@ mod native {
 /// (`HID_API_MAX_REPORT_DESCRIPTOR_SIZE`).
 pub const MAX_REPORT_DESCRIPTOR_SIZE: usize = 4096;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    /// `Hidra` and `HidDevice` are documented as shareable across threads.
+    /// The `HidBackend`/`HidDeviceBackend` bounds make that hold for whichever
+    /// backend is selected; this pins it for the public wrappers too.
+    #[test]
+    fn public_handles_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<super::Hidra>();
+        assert_send_sync::<super::HidDevice>();
+        assert_send_sync::<super::HidError>();
+        assert_send_sync::<super::DeviceInfo>();
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 mod web {
     use core::cell::RefCell;
     use core::future::Future;
 
     use crate::backend::webhid::{
-        CollectionInfo, DeviceFilter, EventListenerHandle, InputReportStream, WebHidApi,
-        WebHidDevice,
+        DeviceFilter, EventListenerHandle, InputReportStream, WebHidApi, WebHidDevice,
     };
+    use crate::report_info::CollectionInfo;
     use crate::{DeviceInfo, HidResult};
 
-    /// Entry point to the library, backed by WebHID (`navigator.hid`).
+    /// Entry point to the library, backed by `WebHID` (`navigator.hid`).
     ///
     /// Discovery is WebHID-shaped rather than native-HID-shaped: the browser only
     /// ever exposes devices the user has granted access to, so there is no
@@ -408,6 +434,12 @@ mod web {
         backend: WebHidApi,
     }
 
+    impl core::fmt::Debug for Hidra {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("Hidra").finish_non_exhaustive()
+        }
+    }
+
     // These I/O methods return `impl Future` to mirror the native `Hidra` /
     // `HidDevice` signatures exactly (native backs them with `Blocking`, not an
     // async block), so the `manual_async_fn` suggestion does not apply.
@@ -416,8 +448,8 @@ mod web {
         /// Bind to `window.navigator.hid`.
         ///
         /// Fails with [`HidError::Initialization`](crate::HidError::Initialization)
-        /// when WebHID is unavailable (no window, a non-secure context, or a
-        /// browser without WebHID support).
+        /// when `WebHID` is unavailable (no window, a non-secure context, or a
+        /// browser without `WebHID` support).
         pub fn new() -> HidResult<Self> {
             Ok(Hidra {
                 backend: WebHidApi::new()?,
@@ -464,13 +496,13 @@ mod web {
                 .on_disconnect(move |dev| f(HidDevice::new(dev)))
         }
 
-        /// The underlying `navigator.hid` object (WebHID escape hatch).
+        /// The underlying `navigator.hid` object (`WebHID` escape hatch).
         pub fn raw(&self) -> &web_sys::Hid {
             self.backend.raw()
         }
     }
 
-    /// An HID device exposed by the browser, backed by WebHID.
+    /// An HID device exposed by the browser, backed by `WebHID`.
     ///
     /// Unlike a native HID library the handle exists before the device is opened, so
     /// call [`open`](Self::open) before transferring reports.
@@ -478,6 +510,14 @@ mod web {
         backend: WebHidDevice,
         /// Lazily started on the first [`read`](Self::read); reused thereafter.
         stream: RefCell<Option<InputReportStream>>,
+    }
+
+    impl core::fmt::Debug for HidDevice {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("HidDevice")
+                .field("opened", &self.backend.opened())
+                .finish_non_exhaustive()
+        }
     }
 
     #[allow(clippy::manual_async_fn)]
@@ -636,7 +676,7 @@ mod web {
 
         /// Start an independent buffered input-report stream. Most callers
         /// should use [`read`](Self::read) instead; this is exposed for the
-        /// WebHID streaming idiom.
+        /// `WebHID` streaming idiom.
         pub fn start_reading(&self) -> InputReportStream {
             self.backend.start_reading()
         }
@@ -647,7 +687,7 @@ mod web {
             self.backend.collections()
         }
 
-        /// The underlying `HIDDevice` object (WebHID escape hatch).
+        /// The underlying `HIDDevice` object (`WebHID` escape hatch).
         pub fn raw(&self) -> &web_sys::HidDevice {
             self.backend.raw()
         }

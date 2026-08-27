@@ -7,14 +7,14 @@
 //! browser-parsed view of the report descriptor.
 //!
 //! [`reconstruct_descriptor`] turns that view back into raw descriptor bytes
-//! using [`crate::descriptor::DescriptorBuilder`]. The WebHID backend uses it
+//! using [`crate::descriptor::DescriptorBuilder`]. The `WebHID` backend uses it
 //! to implement `report_descriptor()` (browsers never expose the original
 //! bytes), but the types are plain data and compiled on every target, so the
 //! reconstruction can also be used and tested off-browser.
 
 use crate::descriptor::{CollectionKind, DescriptorBuilder, MainFlags, ReportKind};
 
-/// Unit system of a report item, mirroring WebHID's `HIDUnitSystem`
+/// Unit system of a report item, mirroring `WebHID`'s `HIDUnitSystem`
 /// (the low nibble of a HID `Unit` item).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum UnitSystem {
@@ -49,7 +49,7 @@ impl UnitSystem {
     }
 }
 
-/// One collection node, mirroring WebHID's `HIDCollectionInfo`.
+/// One collection node, mirroring `WebHID`'s `HIDCollectionInfo`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct CollectionInfo {
     /// Usage page of the collection's usage.
@@ -69,7 +69,7 @@ pub struct CollectionInfo {
     pub feature_reports: Vec<ReportInfo>,
 }
 
-/// One report of a single direction, mirroring WebHID's `HIDReportInfo`.
+/// One report of a single direction, mirroring `WebHID`'s `HIDReportInfo`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ReportInfo {
     /// Report ID; `0` when the device does not use numbered reports.
@@ -78,7 +78,7 @@ pub struct ReportInfo {
     pub items: Vec<ReportItemInfo>,
 }
 
-/// One Input/Output/Feature main item, mirroring WebHID's `HIDReportItem`.
+/// One Input/Output/Feature main item, mirroring `WebHID`'s `HIDReportItem`.
 ///
 /// Usages are 32-bit extended usages: usage page in the high 16 bits, usage
 /// ID in the low 16, matching [`crate::descriptor::Usage`].
@@ -194,9 +194,9 @@ impl ReportItemInfo {
             | nibble(self.unit_factor_luminous_intensity_exponent) << 24
     }
 
-    /// [`MainFlags`] bits for the Input/Output/Feature item this describes.
-    pub fn main_flags(&self) -> u32 {
-        let mut flags = 0;
+    /// [`MainFlags`] for the Input/Output/Feature item this describes.
+    pub fn main_flags(&self) -> MainFlags {
+        let mut flags = MainFlags::NONE;
         if self.is_constant {
             flags |= MainFlags::CONSTANT;
         }
@@ -241,14 +241,14 @@ pub fn uses_report_ids(collections: &[CollectionInfo]) -> bool {
     })
 }
 
-/// Reconstruct a raw HID report descriptor from WebHID collection data.
+/// Reconstruct a raw HID report descriptor from `WebHID` collection data.
 ///
 /// Browsers never expose the descriptor bytes a device reported, only the
 /// parsed [`CollectionInfo`] tree; this re-encodes that tree with
 /// [`DescriptorBuilder`]. The result parses back with
 /// [`crate::descriptor::ReportDescriptor`] to the same report IDs, sizes,
 /// flags and usages, but is not byte-identical to the original descriptor
-/// (item order and encodings are normalized, and anything WebHID does not
+/// (item order and encodings are normalized, and anything `WebHID` does not
 /// model, designators, strings, delimiters, push/pop, is lost).
 pub fn reconstruct_descriptor(collections: &[CollectionInfo]) -> Vec<u8> {
     let mut builder = DescriptorBuilder::new();
@@ -317,7 +317,7 @@ mod tests {
     use super::*;
     use crate::descriptor::{ReportDescriptor, ReportKind, Usage};
 
-    /// Boot keyboard as WebHID would report it: one application collection,
+    /// Boot keyboard as `WebHID` would report it: one application collection,
     /// unnumbered input and output reports.
     fn keyboard() -> Vec<CollectionInfo> {
         vec![CollectionInfo {

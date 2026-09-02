@@ -203,6 +203,33 @@ fn read_report_descriptor_unclaimed(
     None
 }
 
+#[cfg(not(target_os = "windows"))]
+fn device_control_out(device: &nusb::Device, request: ControlOut<'_>) -> Result<(), TransferError> {
+    device.control_out(request, TRANSFER_TIMEOUT).wait()?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn device_control_in(device: &nusb::Device, request: ControlIn) -> Result<Vec<u8>, TransferError> {
+    device.control_in(request, TRANSFER_TIMEOUT).wait()
+}
+
+#[cfg(target_os = "windows")]
+fn device_control_out(
+    _device: &nusb::Device,
+    _request: ControlOut<'_>,
+) -> Result<(), TransferError> {
+    Err(TransferError::InvalidArgument)
+}
+
+#[cfg(target_os = "windows")]
+fn device_control_in(
+    _device: &nusb::Device,
+    _request: ControlIn,
+) -> Result<Vec<u8>, TransferError> {
+    Err(TransferError::InvalidArgument)
+}
+
 /// Size of each interrupt IN transfer: the longest declared input report
 /// (wire format, including the report ID byte when used) or at least one
 /// packet, rounded up to a multiple of `wMaxPacketSize` as nusb requires.
@@ -469,7 +496,7 @@ impl NusbDevice {
     fn control_out_req(&self, request: ControlOut<'_>) -> Result<(), TransferError> {
         match self.interface.as_ref() {
             Some(interface) => interface.control_out(request, TRANSFER_TIMEOUT).wait()?,
-            None => self.device.control_out(request, TRANSFER_TIMEOUT).wait()?,
+            None => device_control_out(&self.device, request)?,
         };
         Ok(())
     }
@@ -478,7 +505,7 @@ impl NusbDevice {
     fn control_in_req(&self, request: ControlIn) -> Result<Vec<u8>, TransferError> {
         match self.interface.as_ref() {
             Some(interface) => interface.control_in(request, TRANSFER_TIMEOUT).wait(),
-            None => self.device.control_in(request, TRANSFER_TIMEOUT).wait(),
+            None => device_control_in(&self.device, request),
         }
     }
 

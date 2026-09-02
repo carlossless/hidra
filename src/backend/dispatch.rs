@@ -141,11 +141,7 @@ impl Backend {
 /// wherever there is one, else [`Nusb`](Backend::Nusb).
 impl Default for Backend {
     fn default() -> Self {
-        if Backend::Native.is_available() {
-            Backend::Native
-        } else {
-            Backend::Nusb
-        }
+        Backend::available().next().unwrap_or(Backend::Native)
     }
 }
 

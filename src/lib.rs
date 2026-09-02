@@ -170,14 +170,14 @@ mod native {
     #[derive(Debug, Clone)]
     pub struct HidraBuilder {
         backend: Backend,
-        enumerate: bool,
+        enumerate_on_build: bool,
     }
 
     impl Default for HidraBuilder {
         fn default() -> Self {
             HidraBuilder {
                 backend: Backend::default(),
-                enumerate: true,
+                enumerate_on_build: true,
             }
         }
     }
@@ -194,8 +194,8 @@ mod native {
         /// Defaults to `true`; pass `false` when you only need
         /// [`Hidra::open_path`].
         #[must_use]
-        pub fn enumerate(mut self, enumerate: bool) -> Self {
-            self.enumerate = enumerate;
+        pub fn enumerate_on_build(mut self, enumerate: bool) -> Self {
+            self.enumerate_on_build = enumerate;
             self
         }
 
@@ -209,7 +209,7 @@ mod native {
                 backend: DynApi::new(self.backend)?,
                 device_list: Vec::new(),
             };
-            if self.enumerate {
+            if self.enumerate_on_build {
                 api.refresh_devices()?;
             }
             Ok(api)
@@ -225,8 +225,12 @@ mod native {
 
         /// Initialize the default backend without enumerating (cheaper when
         /// you only need [`open_path`](Self::open_path)).
+        #[deprecated(
+            since = "0.0.4",
+            note = "use Hidra::builder().enumerate_on_build(false).build()"
+        )]
         pub fn new_without_enumerate() -> HidResult<Self> {
-            Self::builder().enumerate(false).build()
+            Self::builder().enumerate_on_build(false).build()
         }
 
         /// Start configuring a `Hidra`, to select a [`Backend`] other than

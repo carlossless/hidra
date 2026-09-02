@@ -244,7 +244,7 @@ pub fn run_conformance(numbered: bool, caps: &Caps, vdev: &dyn VirtualDevice) {
     // handles to one device concurrently.
     hidra::Hidra::builder()
         .backend(caps.backend)
-        .enumerate(false)
+        .enumerate_on_build(false)
         .build()
         .unwrap();
     if caps.backend == Backend::default() {
@@ -255,7 +255,10 @@ pub fn run_conformance(numbered: bool, caps: &Caps, vdev: &dyn VirtualDevice) {
             caps.backend,
             "[{lb}] Hidra::new() backend"
         );
-        hidra::Hidra::new_without_enumerate().unwrap();
+        hidra::Hidra::builder()
+            .enumerate_on_build(false)
+            .build()
+            .unwrap();
     }
     let mut api2 = hidra::Hidra::builder()
         .backend(caps.backend)

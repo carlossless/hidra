@@ -29,6 +29,7 @@ documented inline in [`provision/winuhid.ps1`](provision/winuhid.ps1) and
   locale **must** match the ISO language or Windows Setup stalls at the language
   picker.
 - **`export NIXPKGS_ALLOW_UNFREE=1`** — required to evaluate the ISO derivation.
+  Flakes only read it under `--impure`, so every command below passes that.
 - **`--option sandbox relaxed`** for anything at/above the toolchain layer: that
   stage runs `__noChroot` (needs the network to download VS Build Tools + the WDK,
   so it needs a trusted user). The base and WinUHid stages run fully sandboxed.
@@ -37,9 +38,9 @@ documented inline in [`provision/winuhid.ps1`](provision/winuhid.ps1) and
 
 ```sh
 export NIXPKGS_ALLOW_UNFREE=1
-nix build .#windows-test-vm-base                        # smoke-test the wfvm install (offline, sandboxed)
-nix build --option sandbox relaxed .#windows-test-vm    # full image (toolchain boot needs the network)
-nix run   --option sandbox relaxed .#windows-test-vm-run # boot snapshot, run the conformance test over SSH
+nix build --impure .#windows-test-vm-base                        # smoke-test the wfvm install (offline, sandboxed)
+nix build --impure --option sandbox relaxed .#windows-test-vm    # full image (toolchain boot needs the network)
+nix run   --impure --option sandbox relaxed .#windows-test-vm-run # boot snapshot, run the conformance test over SSH
 ```
 
 Iterating the driver build is cheap: the toolchain layer is cached, so only the

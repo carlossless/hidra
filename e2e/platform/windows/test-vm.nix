@@ -113,8 +113,8 @@ let
   # real payload during the (networked) provisioning boot.
   rustupInit = pkgs.fetchurl {
     name = "rustup-init.exe";
-    url = "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe";
-    sha256 = "sha256-hkeOU/dpN51/Dr+nyaqXy3bKkiM/eaoswNvuLvqsc8c=";
+    url = "https://static.rust-lang.org/rustup/archive/1.29.1/x86_64-pc-windows-msvc/rustup-init.exe";
+    sha256 = "sha256-b0vvZiYSYfy0MTG+hyC6uBfUA6Ce3sdFXDcZdLkL234=";
   };
   vsBuildTools = pkgs.fetchurl {
     name = "vs_BuildTools.exe";

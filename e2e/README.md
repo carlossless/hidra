@@ -24,18 +24,20 @@ e2e/
 
 | target | platform | virtual device | privilege / setup |
 |--------|----------|----------------|-------------------|
-| `linux-hidraw` | Linux | kernel `uhid` (hidraw backend) | root; also a descriptor-variety test |
-| `linux-nusb` | Linux | `dummy_hcd` + configfs `g_hid` (nusb backend) | root; needs USB-gadget kernel modules |
+| `linux-hidraw` | Linux | kernel `uhid` (`Backend::Native`) | root; also a descriptor-variety test |
+| `linux-nusb` | Linux | `dummy_hcd` + configfs `g_hid` (`Backend::Nusb`) | root; needs USB-gadget kernel modules |
 | `macos` | macOS | `IOHIDUserDevice` | root + SIP/AMFI off + signed entitlement — see [`platform/macos`](platform/macos/README.md) |
 | `windows` | Windows | WinUHid driver | test-signed driver — see [`platform/windows`](platform/windows/README.md) |
 | `webhid` | Linux + Chromium | `uhid` via Playwright | root; own sub-tree (wasm harness + native fixture) — see [`targets/webhid`](targets/webhid/README.md) |
-| `cynthion` | all | real USB via Cynthion + Facedancer | emulated *real* hardware, not virtual — see [`targets/cynthion`](targets/cynthion/README.md) |
+| `cynthion` | all | real USB via Cynthion + Facedancer | emulated *real* hardware, not virtual, on both backends — see [`targets/cynthion`](targets/cynthion/README.md) |
+
+Which hidra backend a suite drives is [`Caps::backend`](shared/conformance/src/lib.rs),
+picked at run time, so the whole workspace builds at once and one binary can
+cover both backends (`cynthion` does, via `HIDRA_BACKEND`).
 
 ## Running
 
-Run **per crate**, never the whole workspace at once: hidra's `nusb` feature
-switches the Linux backend, so building `linux-hidraw` and `linux-nusb` together
-unifies the feature and breaks the hidraw test.
+Run **per crate**: each needs its own privileges and virtual-device setup.
 
 ```sh
 sudo -E cargo test -p linux-hidraw    # Linux, needs /dev/uhid

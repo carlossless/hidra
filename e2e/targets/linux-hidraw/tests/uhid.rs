@@ -249,6 +249,7 @@ fn linux_caps() -> Caps {
         bus_type: conformance::BusType::Usb,
         release_number: 0x0000,
         interface_number: -1,
+        backend: conformance::Backend::Native,
     }
 }
 

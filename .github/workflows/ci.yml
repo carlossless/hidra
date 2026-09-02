@@ -38,9 +38,18 @@ jobs:
         run: cargo test --doc --features nusb
       - name: Clippy
         run: cargo clippy --all-targets --features nusb -- -D warnings
+      # Android shares the Linux hidraw backend. Lib-only `check`, so no NDK
+      # linker is needed; `--features nusb` must stay clean too, where the
+      # feature is inert (nusb has no enumeration on Android).
+      - name: Check android
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          rustup target add aarch64-linux-android
+          cargo check --target aarch64-linux-android
+          cargo check --target aarch64-linux-android --features nusb
       # Runs as root to open /dev/uhid and the virtual /dev/hidraw node;
       # HIDRA_HIDRAW_REQUIRED makes it fail rather than self-skip if uhid is absent.
-      - name: uhid integration test (hidraw backend)
+      - name: uhid integration test (native backend)
         if: matrix.os == 'ubuntu-latest'
         run: |
           # The Azure runner kernel ships uhid in linux-modules-extra, not the base image.
@@ -56,14 +65,15 @@ jobs:
       # The Azure runner kernel has no USB-gadget support (dummy_hcd absent even
       # from linux-modules-extra), so this self-skips there; runs for real on any
       # kernel with dummy_hcd.
-      - name: nusb gadget integration test (nusb backend)
+      - name: nusb gadget integration test (Backend::Nusb)
         if: matrix.os == 'ubuntu-latest'
         run: |
           if ! sudo modprobe dummy_hcd 2>/dev/null; then
             echo "::warning title=nusb E2E skipped::dummy_hcd unavailable on $(uname -r) (cloud kernel has no USB-gadget support); nusb integration test runs on kernels that ship dummy_hcd"
             exit 0
           fi
-          # linux-nusb enables the nusb backend via its dev-dependency, so no --features flag here.
+          # linux-nusb compiles the nusb backend in via its dev-dependency and
+          # selects it at run time through Caps::backend, so no --features flag here.
           cd e2e
           bin=$(cargo test -p linux-nusb --test nusb --no-run --message-format=json \
             | jq -r 'select(.reason=="compiler-artifact" and .target.name=="nusb") | .executable' \

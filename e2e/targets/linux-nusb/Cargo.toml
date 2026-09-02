@@ -4,6 +4,8 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
+# The nusb backend is compiled in beside the native one; `Caps::backend` picks
+# it at run time.
 [dev-dependencies]
 hidra = { path = "../../..", features = ["nusb"] }
-conformance = { path = "../../shared/conformance", features = ["nusb"] }
+conformance = { path = "../../shared/conformance" }

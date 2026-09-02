@@ -205,6 +205,7 @@ fn nusb_caps() -> Caps {
         bus_type: conformance::BusType::Usb,
         release_number: 0x0100,
         interface_number: 0,
+        backend: conformance::Backend::Nusb,
     }
 }
 

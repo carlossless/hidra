@@ -889,16 +889,15 @@ impl MacDevice {
 }
 
 impl HidDeviceBackend for MacDevice {
+    type Read<'a> = ReadAsync<'a>;
+
     fn write(&self, data: &[u8]) -> HidResult<usize> {
         self.set_report(IOHID_REPORT_TYPE_OUTPUT, data)
     }
 
     /// Wake-ups come from the `IOKit` callbacks on the read thread (raw
     /// [`Waker`]s, no executor assumed).
-    fn read_async<'a>(
-        &'a self,
-        buf: &'a mut [u8],
-    ) -> impl std::future::Future<Output = HidResult<usize>> + Send + 'a {
+    fn read_async<'a>(&'a self, buf: &'a mut [u8]) -> ReadAsync<'a> {
         ReadAsync { dev: self, buf }
     }
 

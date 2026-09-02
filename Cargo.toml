@@ -35,12 +35,18 @@ doc_markdown = "warn"
 
 [features]
 default = []
+# Additive: compiles the nusb USB-transport backend in *beside* the per-OS one,
+# for `Backend::Nusb` to select at run time. Enabling it anywhere in a
+# dependency graph cannot change which backend another crate ends up using.
 nusb = ["dep:nusb"]
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# nusb enumerates on these three only; on Android it exposes just the
+# from-a-file-descriptor path, which is not the shape hidra's backend needs.
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
 nusb = { version = "0.2.3", optional = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+# The hidraw backend, which Android shares with Linux.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies.windows-sys]

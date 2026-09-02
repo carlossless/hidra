@@ -1030,6 +1030,8 @@ impl WinDevice {
 }
 
 impl HidDeviceBackend for WinDevice {
+    type Read<'a> = ReadAsync<'a>;
+
     fn write(&self, data: &[u8]) -> HidResult<usize> {
         if data.is_empty() {
             return Err(HidError::InvalidData {
@@ -1106,10 +1108,7 @@ impl HidDeviceBackend for WinDevice {
     /// and fails with [`HidError::Disconnected`] when the device is removed.
     /// Wake-ups come from a one-shot thread-pool wait on the read event
     /// (`RegisterWaitForSingleObject`, raw [`Waker`]s, no executor assumed).
-    fn read_async<'a>(
-        &'a self,
-        buf: &'a mut [u8],
-    ) -> impl Future<Output = HidResult<usize>> + Send + 'a {
+    fn read_async<'a>(&'a self, buf: &'a mut [u8]) -> ReadAsync<'a> {
         ReadAsync { dev: self, buf }
     }
 

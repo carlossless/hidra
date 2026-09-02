@@ -2,7 +2,7 @@
 # Run the full conformance matrix on Linux against a real USB HID device emulated
 # by a Cynthion running Facedancer: for each report-ID mode (unnumbered, numbered)
 # (re)start device.py with the matching descriptor and run both host backends
-# (hidraw, nusb). For Windows/macOS, USB-pass the device into the VM and point
+# (native hidraw, nusb), selected at run time with HIDRA_BACKEND. For Windows/macOS, USB-pass the device into the VM and point
 # HIDRA_CYNTHION_CTRL at this host (see README).
 #
 # The Facedancer/Moondancer link wedges (LIBUSB_ERROR_TIMEOUT) if device.py is
@@ -43,33 +43,29 @@ start_device() {
   lsusb 2>/dev/null | grep -q '1209:000c' || { echo "device never enumerated"; cat "$LOG"; exit 3; }
 }
 
-bin_for() {
-  ( cd "$E2E" && cargo test -p cynthion "$@" --no-run ) >/dev/null 2>&1
-  cd "$E2E" && cargo test -p cynthion "$@" --no-run --message-format=json 2>/dev/null \
+# One binary drives both backends; HIDRA_BACKEND picks per run.
+test_bin() {
+  ( cd "$E2E" && cargo test -p cynthion --no-run ) >/dev/null 2>&1
+  cd "$E2E" && cargo test -p cynthion --no-run --message-format=json 2>/dev/null \
     | grep -o '"executable":"[^"]*cynthion-[0-9a-f]*"' | grep -v unittest | head -1 \
     | sed 's/.*"\(\/[^"]*\)"/\1/'
 }
 
-HIDRAW_BIN="$(bin_for)"
-NUSB_BIN="$(bin_for --features nusb)"
+BIN="$(test_bin)"
 
 for numbered in 0 1; do
   mode="$([ "$numbered" = 1 ] && echo numbered || echo unnumbered)"
   export HIDRA_CYNTHION_NUMBERED="$([ "$numbered" = 1 ] && echo 1 || true)"
 
-  echo "===== $mode : hidraw ====="
-  start_device "$numbered"
-  sudo -E env "PATH=$PATH" HIDRA_CYNTHION_REQUIRED=1 "HIDRA_CYNTHION_CTRL=$CTRL" \
-    "${HIDRA_CYNTHION_NUMBERED:+HIDRA_CYNTHION_NUMBERED=1}" \
-    "$HIDRAW_BIN" --test-threads=1 --nocapture
-  stop_device
-
-  echo "===== $mode : nusb ====="
-  start_device "$numbered"
-  sudo -E env "PATH=$PATH" HIDRA_CYNTHION_REQUIRED=1 "HIDRA_CYNTHION_CTRL=$CTRL" \
-    "${HIDRA_CYNTHION_NUMBERED:+HIDRA_CYNTHION_NUMBERED=1}" \
-    "$NUSB_BIN" --test-threads=1 --nocapture
-  stop_device
+  for backend in native nusb; do
+    echo "===== $mode : $backend ====="
+    start_device "$numbered"
+    sudo -E env "PATH=$PATH" HIDRA_CYNTHION_REQUIRED=1 "HIDRA_CYNTHION_CTRL=$CTRL" \
+      "HIDRA_BACKEND=$backend" \
+      "${HIDRA_CYNTHION_NUMBERED:+HIDRA_CYNTHION_NUMBERED=1}" \
+      "$BIN" --test-threads=1 --nocapture
+    stop_device
+  done
 done
 
-echo "ALL cynthion Linux runs passed (unnumbered + numbered, hidraw + nusb)."
+echo "ALL cynthion Linux runs passed (unnumbered + numbered, native + nusb)."

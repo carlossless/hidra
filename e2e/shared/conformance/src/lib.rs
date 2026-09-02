@@ -13,7 +13,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use hidra::descriptor::{CollectionKind, DescriptorBuilder, MainFlags, ReportKind};
-pub use hidra::BusType;
+pub use hidra::{Backend, BusType};
 use hidra::{HidError, MaybeFuture};
 
 pub const TEST_VID: u16 = 0x1209;
@@ -58,6 +58,9 @@ pub struct Caps {
     pub release_number: u16,
     /// Expected interface number; -1 where there is no USB interface (e.g. uhid).
     pub interface_number: i32,
+    /// Which hidra backend to run the suite against. Selected at run time, so
+    /// one test binary can cover both.
+    pub backend: Backend,
 }
 
 // Two former caps are now invariants: every backend supports write() output
@@ -80,6 +83,7 @@ impl Caps {
             bus_type: BusType::Usb,
             release_number: 0x0100,
             interface_number: 0,
+            backend: Backend::Native,
         }
     }
 }
@@ -200,7 +204,11 @@ pub fn run_conformance(numbered: bool, caps: &Caps, vdev: &dyn VirtualDevice) {
     }
     let rd = make_descriptor(numbered);
 
-    let api = hidra::Hidra::new().unwrap();
+    let api = hidra::Hidra::builder()
+        .backend(caps.backend)
+        .build()
+        .unwrap();
+    assert_eq!(api.backend(), caps.backend, "[{lb}] selected backend");
     let info = {
         let deadline = Instant::now() + Duration::from_secs(6);
         loop {
@@ -234,8 +242,25 @@ pub fn run_conformance(numbered: bool, caps: &Caps, vdev: &dyn VirtualDevice) {
     // Exercise the alternate constructors as open-and-drop before the long-lived
     // handle below: a USB interface claims once at a time, so nusb can't hold two
     // handles to one device concurrently.
-    hidra::Hidra::new_without_enumerate().unwrap();
-    let mut api2 = hidra::Hidra::new().unwrap();
+    hidra::Hidra::builder()
+        .backend(caps.backend)
+        .enumerate(false)
+        .build()
+        .unwrap();
+    if caps.backend == Backend::default() {
+        // The no-argument constructors are the same thing with the default
+        // backend; only this run can check they agree.
+        assert_eq!(
+            hidra::Hidra::new().unwrap().backend(),
+            caps.backend,
+            "[{lb}] Hidra::new() backend"
+        );
+        hidra::Hidra::new_without_enumerate().unwrap();
+    }
+    let mut api2 = hidra::Hidra::builder()
+        .backend(caps.backend)
+        .build()
+        .unwrap();
     api2.refresh_devices().unwrap();
     assert!(
         api2.device_list()
@@ -295,35 +320,58 @@ pub fn run_conformance(numbered: bool, caps: &Caps, vdev: &dyn VirtualDevice) {
         "[{lb}] get_device_info interface_number"
     );
 
-    // Option methods exist on one backend each (cfg-gated in hidra), so they run
-    // only where they compile — there, against every device incl. the real Cynthion.
-    #[cfg(all(target_os = "macos", not(feature = "nusb")))]
-    {
-        let before = api.open_exclusive();
-        api.set_open_exclusive(!before);
+    // Option methods are per-OS in hidra, so they run only where they compile —
+    // there, against every device incl. the real Cynthion. They belong to the
+    // native backend, and must say so rather than misbehave on the other one.
+    #[cfg(target_os = "macos")]
+    if caps.backend == Backend::Native {
+        let before = api.open_exclusive().unwrap();
+        api.set_open_exclusive(!before).unwrap();
         assert_eq!(
-            api.open_exclusive(),
+            api.open_exclusive().unwrap(),
             !before,
             "[{lb}] open_exclusive() did not reflect set_open_exclusive()"
         );
-        api.set_open_exclusive(before);
+        api.set_open_exclusive(before).unwrap();
         assert_eq!(
-            api.open_exclusive(),
+            api.open_exclusive().unwrap(),
             before,
             "[{lb}] open_exclusive() restore"
         );
         eprintln!("[{lb}] checked set_open_exclusive/open_exclusive round-trip");
+    } else {
+        assert!(
+            matches!(api.open_exclusive(), Err(HidError::Unsupported { .. })),
+            "[{lb}] open_exclusive() must be Unsupported off the native backend"
+        );
+        eprintln!("[{lb}] checked open_exclusive() reports Unsupported");
     }
-    #[cfg(all(target_os = "windows", not(feature = "nusb")))]
-    {
+    #[cfg(target_os = "windows")]
+    if caps.backend == Backend::Native {
         // container_id() is a 16-byte GUID; its value is device-dependent (may be
         // zeros for a root-enumerated device), so assert only the length.
         let cid = device.container_id().wait().expect("container_id");
         assert_eq!(cid.len(), 16, "[{lb}] container_id must be 16 bytes");
         eprintln!("[{lb}] container_id = {cid:02x?}");
         // Plumb set_write_timeout here; the timeout-firing check runs later.
-        device.set_write_timeout(2000);
+        device.set_write_timeout(2000).unwrap();
         eprintln!("[{lb}] set_write_timeout(2000) applied");
+    } else {
+        assert!(
+            matches!(
+                device.container_id().wait(),
+                Err(HidError::Unsupported { .. })
+            ),
+            "[{lb}] container_id() must be Unsupported off the native backend"
+        );
+        assert!(
+            matches!(
+                device.set_write_timeout(2000),
+                Err(HidError::Unsupported { .. })
+            ),
+            "[{lb}] set_write_timeout() must be Unsupported off the native backend"
+        );
+        eprintln!("[{lb}] checked container_id/set_write_timeout report Unsupported");
     }
 
     if caps.strings {
@@ -545,18 +593,18 @@ pub fn run_conformance(numbered: bool, caps: &Caps, vdev: &dyn VirtualDevice) {
     // set_write_timeout firing (Windows). Run late: a fired 1ms write can leave a
     // real device mid-transfer. A 1ms timeout makes a slow real-USB write time
     // out; a buffered virtual-device write still succeeds — accept either.
-    #[cfg(all(target_os = "windows", not(feature = "nusb")))]
-    {
+    #[cfg(target_os = "windows")]
+    if caps.backend == Backend::Native {
         let mut out = vec![if numbered { RID_OUTPUT } else { 0 }];
         out.extend_from_slice(&OUT_PAYLOAD);
-        device.set_write_timeout(1);
+        device.set_write_timeout(1).unwrap();
         let short = device.write(&out).wait();
-        device.set_write_timeout(5000);
+        device.set_write_timeout(5000).unwrap();
         device
             .write(&out)
             .wait()
             .expect("write with 5s timeout must succeed");
-        device.set_write_timeout(1000);
+        device.set_write_timeout(1000).unwrap();
         eprintln!(
             "[{lb}] set_write_timeout: 1ms write -> {}, 5s write ok",
             if short.is_ok() {
@@ -600,7 +648,10 @@ pub fn run_conformance(numbered: bool, caps: &Caps, vdev: &dyn VirtualDevice) {
 
     // Error paths last, on a throwaway handle, so a failed open can't perturb the
     // live device: opening an absent VID/PID or a bogus path must fail cleanly.
-    let probe = hidra::Hidra::new().unwrap();
+    let probe = hidra::Hidra::builder()
+        .backend(caps.backend)
+        .build()
+        .unwrap();
     assert!(
         probe.open(0xFFFF, 0xFFFF).wait().is_err(),
         "[{lb}] open() of an absent device should return an error"

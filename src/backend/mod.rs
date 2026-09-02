@@ -1,9 +1,15 @@
-//! Platform backend selection.
+//! Backend traits and backend selection.
 //!
-//! Every native backend implements [`HidBackend`] and [`HidDeviceBackend`];
-//! `PlatformApi` / `PlatformDevice` alias whichever pair the target and
-//! feature flags select, and the `native` module in `lib.rs` is written
-//! against the traits alone.
+//! Every native backend implements [`HidBackend`] and [`HidDeviceBackend`].
+//! Which one a [`crate::Hidra`] talks to is chosen at run time rather than at
+//! compile time: [`dispatch`] holds one enum variant per backend compiled into
+//! the build, and the `native` module in `lib.rs` is written against that enum
+//! and the traits alone.
+//!
+//! Backends are compiled in additively. The per-OS backend for the target is
+//! always available; the `nusb` feature *adds* the USB-transport backend
+//! beside it instead of replacing it, so enabling the feature anywhere in a
+//! dependency graph cannot silently change another crate's backend.
 
 #[cfg(not(target_arch = "wasm32"))]
 use core::future::Future;
@@ -11,7 +17,7 @@ use core::future::Future;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{DeviceInfo, HidError, HidResult};
 
-/// Enumerating and opening HID devices on one platform.
+/// Enumerating and opening HID devices through one implementation.
 ///
 /// `Send + Sync` is required rather than incidental: [`crate::Hidra`] is
 /// documented as usable from any thread, and the bound makes that a compile
@@ -66,6 +72,17 @@ pub(crate) trait HidBackend: Sized + Send + Sync {
 ///   report ID on entry; on return the buffer starts with that ID.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) trait HidDeviceBackend: Send + Sync {
+    /// The future [`read_async`](Self::read_async) returns.
+    ///
+    /// Named rather than `impl Future` so [`dispatch::DynRead`] can hold one
+    /// variant per backend; `Unpin` lets that enum project to the selected
+    /// variant without unsafe. Every backend's read future is a plain struct
+    /// borrowing the device and the caller's buffer, so the bound costs
+    /// nothing.
+    type Read<'a>: Future<Output = HidResult<usize>> + Send + Unpin + 'a
+    where
+        Self: 'a;
+
     /// Send an output report.
     fn write(&self, data: &[u8]) -> HidResult<usize>;
 
@@ -77,10 +94,7 @@ pub(crate) trait HidDeviceBackend: Send + Sync {
     /// Implementations must be cancel-safe: dropping the future may not lose
     /// an already-delivered report, it stays queued for the next read.
     /// Wake-ups are runtime-agnostic (raw `Waker`s, no executor assumed).
-    fn read_async<'a>(
-        &'a self,
-        buf: &'a mut [u8],
-    ) -> impl Future<Output = HidResult<usize>> + Send + 'a;
+    fn read_async<'a>(&'a self, buf: &'a mut [u8]) -> Self::Read<'a>;
 
     /// Send a feature report.
     fn send_feature_report(&self, data: &[u8]) -> HidResult<()>;
@@ -118,9 +132,9 @@ pub(crate) trait HidDeviceBackend: Send + Sync {
 /// placeholder the transport drops, while a nonzero ID is transmitted as the
 /// first payload byte. The USB and `IOKit` backends both need this; hidraw
 /// does not, because the kernel consumes the byte itself.
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    any(feature = "nusb", target_os = "macos")
+#[cfg(any(
+    target_os = "macos",
+    all(feature = "nusb", any(target_os = "linux", target_os = "windows"))
 ))]
 pub(crate) fn payload_after_report_id(data: &[u8]) -> &[u8] {
     if data.first() == Some(&0) {
@@ -132,9 +146,9 @@ pub(crate) fn payload_after_report_id(data: &[u8]) -> &[u8] {
 
 // Shared by the backends whose input reports arrive on a producer thread
 // (macOS and nusb); see the module docs for why Windows and hidraw do not.
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    any(feature = "nusb", target_os = "macos")
+#[cfg(any(
+    target_os = "macos",
+    all(feature = "nusb", any(target_os = "linux", target_os = "windows"))
 ))]
 pub(crate) mod queue;
 
@@ -144,28 +158,36 @@ pub(crate) mod queue;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod webhid;
 
-// With the `nusb` feature the USB-transport backend replaces the per-OS native
-// backends on every platform; otherwise the native backend for the target OS
-// is selected.
-#[cfg(all(feature = "nusb", not(target_arch = "wasm32")))]
+// The USB-transport backend, compiled in beside the per-OS one when the `nusb`
+// feature is on. The target list is nusb's own for enumeration: the feature can
+// be enabled on wasm and Android too, where nusb offers no `list_devices`.
+#[cfg(all(
+    feature = "nusb",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 pub(crate) mod nusb;
-#[cfg(all(feature = "nusb", not(target_arch = "wasm32")))]
-pub(crate) use nusb::{NusbApi as PlatformApi, NusbDevice as PlatformDevice};
 
-#[cfg(all(not(feature = "nusb"), target_os = "linux"))]
+// Android runs the same hidraw backend as Linux: same kernel, same
+// `/dev/hidraw*` nodes and sysfs.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) mod reactor;
 
-#[cfg(all(not(feature = "nusb"), target_os = "linux"))]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) mod hidraw;
-#[cfg(all(not(feature = "nusb"), target_os = "linux"))]
-pub(crate) use hidraw::{HidrawApi as PlatformApi, HidrawDevice as PlatformDevice};
 
-#[cfg(all(not(feature = "nusb"), target_os = "windows"))]
+#[cfg(target_os = "windows")]
 pub(crate) mod windows;
-#[cfg(all(not(feature = "nusb"), target_os = "windows"))]
-pub(crate) use windows::{WinApi as PlatformApi, WinDevice as PlatformDevice};
 
-#[cfg(all(not(feature = "nusb"), target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub(crate) mod macos;
-#[cfg(all(not(feature = "nusb"), target_os = "macos"))]
-pub(crate) use macos::{MacApi as PlatformApi, MacDevice as PlatformDevice};
+
+// Dead whenever both dispatch slots are filled by a real backend.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+mod unsupported;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod dispatch;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use dispatch::Backend;

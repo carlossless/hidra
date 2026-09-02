@@ -1,5 +1,6 @@
-//! USB-transport backend built on [nusb], selected for [`crate::Hidra`] when
-//! the `nusb` feature is enabled.
+//! USB-transport backend built on [nusb], compiled in by the `nusb` feature
+//! and selected at run time with
+//! [`Backend::Nusb`](crate::Backend::Nusb).
 //!
 //! Unlike the per-OS native backends, this one talks to devices with raw USB
 //! interrupt and control transfers, bypassing the OS HID stack entirely.
@@ -214,9 +215,9 @@ fn transfer_length(max_input_wire: usize, max_packet_size: usize) -> usize {
 
 // --- backend API ---------------------------------------------------------------
 
-/// Entry point for the USB backend; the platform backend behind
-/// [`crate::Hidra`] when the `nusb` feature is enabled. See the
-/// [module docs](self) for when to prefer it.
+/// Entry point for the USB backend; behind a [`crate::Hidra`] built with
+/// [`Backend::Nusb`](crate::Backend::Nusb). See the [module docs](self) for
+/// when to prefer it.
 pub(crate) struct NusbApi;
 
 impl HidBackend for NusbApi {
@@ -300,8 +301,8 @@ impl HidBackend for NusbApi {
 
 // --- device handle ---------------------------------------------------------------
 
-/// An open USB HID interface; the platform device behind
-/// [`crate::HidDevice`] when the `nusb` feature is enabled.
+/// An open USB HID interface; behind a [`crate::HidDevice`] opened through
+/// [`Backend::Nusb`](crate::Backend::Nusb).
 ///
 /// Holding this claims the interface exclusively (detached from the kernel
 /// driver on Linux); dropping it releases the interface, returning it to the
@@ -476,6 +477,8 @@ impl NusbDevice {
 }
 
 impl HidDeviceBackend for NusbDevice {
+    type Read<'a> = ReadAsync<'a>;
+
     /// Send an output report. `data[0]` is the report ID; like hidapi's
     /// libusb backend, a 0 ID byte is stripped before transmission on both
     /// the interrupt and the `SET_REPORT` control path, while a nonzero ID
@@ -538,10 +541,7 @@ impl HidDeviceBackend for NusbDevice {
     /// works under tokio, async-std, smol or a hand-rolled executor) and
     /// cancel-safe: reports are only dequeued inside `poll`, so dropping it
     /// never loses input; pending reports stay queued for the next read.
-    fn read_async<'a>(
-        &'a self,
-        buf: &'a mut [u8],
-    ) -> impl Future<Output = HidResult<usize>> + Send + 'a {
+    fn read_async<'a>(&'a self, buf: &'a mut [u8]) -> ReadAsync<'a> {
         ReadAsync {
             queue: &self.queue,
             buf,
@@ -653,7 +653,7 @@ impl Drop for NusbDevice {
 /// Cancel-safe: reports are popped from the shared queue only inside
 /// [`Future::poll`], so dropping the future before completion leaves any
 /// pending report queued for the next read.
-struct ReadAsync<'a> {
+pub(crate) struct ReadAsync<'a> {
     queue: &'a ReportQueue,
     buf: &'a mut [u8],
 }

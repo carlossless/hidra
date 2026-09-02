@@ -1,6 +1,7 @@
-# Test crates. Run per crate, never the whole workspace at once: hidra's `nusb`
-# feature switches the Linux backend, so linux-hidraw and linux-nusb must build
-# separately.
+# Test crates. The whole workspace builds at once now that hidra selects its
+# backend at run time (linux-hidraw and linux-nusb used to need separate builds,
+# because the `nusb` feature switched the backend). Running is still per crate:
+# each needs its own privileges and virtual-device setup.
 [workspace]
 resolver = "2"
 members = [

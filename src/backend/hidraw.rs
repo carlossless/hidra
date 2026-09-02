@@ -7,8 +7,6 @@ use std::fs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
-use core::future::Future;
-
 use super::{HidBackend, HidDeviceBackend};
 use crate::descriptor::ReportDescriptor;
 use crate::error::{HidError, HidResult};
@@ -377,6 +375,8 @@ impl HidrawDevice {
 }
 
 impl HidDeviceBackend for HidrawDevice {
+    type Read<'a> = ReadAsync<'a>;
+
     fn write(&self, data: &[u8]) -> HidResult<usize> {
         if data.is_empty() {
             return Err(HidError::InvalidData {
@@ -403,10 +403,7 @@ impl HidDeviceBackend for HidrawDevice {
     }
 
     /// Wake-ups come from the crate's [`reactor`](super::reactor).
-    fn read_async<'a>(
-        &'a self,
-        buf: &'a mut [u8],
-    ) -> impl Future<Output = HidResult<usize>> + Send + 'a {
+    fn read_async<'a>(&'a self, buf: &'a mut [u8]) -> ReadAsync<'a> {
         ReadAsync { dev: self, buf }
     }
 
@@ -539,7 +536,7 @@ pub(crate) struct ReadAsync<'a> {
     buf: &'a mut [u8],
 }
 
-impl std::future::Future for ReadAsync<'_> {
+impl core::future::Future for ReadAsync<'_> {
     type Output = HidResult<usize>;
 
     fn poll(

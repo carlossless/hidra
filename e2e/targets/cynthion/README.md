@@ -28,7 +28,7 @@ test*. The two can be the same machine (target port looped back) or different
 server over TCP, so it works either way.
 
 ```
-Linux (same host):   cynthion target port ── this host ── hidra (hidraw/nusb)
+Linux (same host):   cynthion target port ── this host ── hidra (native/nusb)
                      control server on 127.0.0.1:9999
 
 VM (Windows/macOS):  cynthion target ── control host ══USB passthrough══> VM ── hidra
@@ -70,7 +70,7 @@ separate run with a re-started `device.py`). `run.sh` drives the whole matrix.
 ## Running (Linux)
 
 ```sh
-sudo -E ./run.sh                      # unnumbered + numbered, hidraw + nusb
+sudo -E ./run.sh                      # unnumbered + numbered, native + nusb
 HIDRA_CYNTHION_UHUBCTL="-l 9-1.4.4 -p 1,4" sudo -E ./run.sh   # + auto power-cycle
 ```
 
@@ -79,7 +79,8 @@ HIDRA_CYNTHION_UHUBCTL="-l 9-1.4.4 -p 1,4" sudo -E ./run.sh   # + auto power-cyc
 On the control host (Linux), start `device.py` (see `run.sh` for the nix env;
 add `HIDRA_CYNTHION_NUMBERED=1` for the numbered pass), then USB-pass the
 emulated `1209:000c` device into the VM and, in the VM, run
-`cargo test -p cynthion` with `HIDRA_CYNTHION_CTRL=10.0.2.2:9999`
+`cargo test -p cynthion` with `HIDRA_CYNTHION_CTRL=10.0.2.2:9999`, an optional
+`HIDRA_BACKEND` (`native`, the default, or `nusb`)
 (the host as seen from QEMU user-mode networking) and a matching
 `HIDRA_CYNTHION_NUMBERED`. Both VMs read the device through their real OS HID
 stack; no virtual-device entitlement or WinUHid is needed (those are for the

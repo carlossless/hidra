@@ -38,15 +38,6 @@ jobs:
         run: cargo test --doc --features nusb
       - name: Clippy
         run: cargo clippy --all-targets --features nusb -- -D warnings
-      # Android shares the Linux hidraw backend. Lib-only `check`, so no NDK
-      # linker is needed; `--features nusb` must stay clean too, where the
-      # feature is inert (nusb has no enumeration on Android).
-      - name: Check android
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          rustup target add aarch64-linux-android
-          cargo check --target aarch64-linux-android
-          cargo check --target aarch64-linux-android --features nusb
       # Runs as root to open /dev/uhid and the virtual /dev/hidraw node;
       # HIDRA_HIDRAW_REQUIRED makes it fail rather than self-skip if uhid is absent.
       - name: uhid integration test (native backend)

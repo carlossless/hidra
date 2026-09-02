@@ -10,7 +10,6 @@
 //! | Linux   | `hidraw` device nodes + sysfs enumeration | USB interrupt/control transfers via [nusb] |
 //! | Windows | `hid.dll` / `SetupAPI` via `windows-sys` declarations | as above |
 //! | macOS   | `IOHIDManager` via direct framework FFI | as above |
-//! | Android | the same `hidraw` backend as Linux | — (nusb has no enumeration there) |
 //!
 //! On WebAssembly the backend is always
 //! [WebHID](https://wicg.github.io/webhid/) via `web-sys`, and [`Backend`]

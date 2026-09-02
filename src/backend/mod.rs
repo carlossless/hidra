@@ -158,21 +158,16 @@ pub(crate) mod queue;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod webhid;
 
-// The USB-transport backend, compiled in beside the per-OS one when the `nusb`
-// feature is on. The target list is nusb's own for enumeration: the feature can
-// be enabled on wasm and Android too, where nusb offers no `list_devices`.
 #[cfg(all(
     feature = "nusb",
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 pub(crate) mod nusb;
 
-// Android runs the same hidraw backend as Linux: same kernel, same
-// `/dev/hidraw*` nodes and sysfs.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
 pub(crate) mod reactor;
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
 pub(crate) mod hidraw;
 
 #[cfg(target_os = "windows")]

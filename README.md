@@ -13,7 +13,6 @@ No C library is linked. One `Hidra` / `HidDevice` regardless of backend:
 | Platform | `Backend::Native` | Notes |
 |----------|-------------------|-------|
 | Linux | `hidraw` device nodes, sysfs enumeration | no libudev dependency |
-| Android | the same `hidraw` backend as Linux | needs access to the `/dev/hidraw*` node |
 | Windows | `hid.dll` + SetupAPI (via `windows-sys` declarations) | |
 | macOS | IOHIDManager (direct framework FFI) | |
 | Browsers | [WebHID](https://wicg.github.io/webhid/) via `web-sys` | same `Hidra`/`HidDevice`, await-only; no `Backend` |
@@ -50,7 +49,7 @@ time**, per `Hidra` instance:
 
 | `Backend` | Talks to | Available when |
 |-----------|----------|----------------|
-| `Native` (default) | the OS HID stack: hidraw, `hid.dll`, IOHIDManager | Linux, Android, Windows, macOS |
+| `Native` (default) | the OS HID stack: hidraw, `hid.dll`, IOHIDManager | Linux, Windows, macOS |
 | `Nusb` | raw USB interrupt/control transfers, bypassing the OS HID stack | the `nusb` feature is on, and the target is Linux, macOS or Windows |
 
 ```rust

@@ -19,26 +19,16 @@ use core::task::{Context, Poll};
 use super::{HidBackend, HidDeviceBackend};
 use crate::{DeviceInfo, HidError, HidResult};
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
 use super::hidraw::{HidrawApi as NativeApi, HidrawDevice as NativeDevice};
 #[cfg(target_os = "macos")]
 use super::macos::{MacApi as NativeApi, MacDevice as NativeDevice};
 #[cfg(target_os = "windows")]
 use super::windows::{WinApi as NativeApi, WinDevice as NativeDevice};
 
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "windows"
-)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 use super::unsupported::Unsupported as NativeApi;
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "windows"
-)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 use super::unsupported::Unsupported as NativeDevice;
 
 #[cfg(all(
@@ -71,8 +61,8 @@ use super::unsupported::Unsupported as NusbDevice;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Backend {
-    /// The operating system's own HID stack: `hidraw` on Linux and Android,
-    /// `hid.dll` and `SetupAPI` on Windows, `IOHIDManager` on macOS.
+    /// The operating system's own HID stack: `hidraw` on Linux, `hid.dll` and
+    /// `SetupAPI` on Windows, `IOHIDManager` on macOS.
     ///
     /// Available on those targets. Devices are shared with the OS, no driver
     /// is displaced, and non-USB transports (Bluetooth, I2C, ...) work.
@@ -80,9 +70,7 @@ pub enum Backend {
     /// Raw USB interrupt and control transfers via [nusb], bypassing the OS
     /// HID stack.
     ///
-    /// Available with the `nusb` feature on Linux, macOS and Windows —
-    /// not on Android, where nusb offers no enumeration (a device arrives
-    /// there as a file descriptor from the Java USB Host API).
+    /// Available with the `nusb` feature on Linux, macOS and Windows.
     ///
     /// Sees USB devices only, and opening one claims the whole USB interface
     /// away from the OS driver until the handle is dropped, so it needs
@@ -103,7 +91,6 @@ impl Backend {
         match self {
             Backend::Native => cfg!(any(
                 target_os = "linux",
-                target_os = "android",
                 target_os = "macos",
                 target_os = "windows"
             )),

@@ -127,12 +127,7 @@ impl DeviceInfo {
     ///
     /// The Windows backend has no use for this: its driver already exposes
     /// each top-level collection as a separate device interface path.
-    #[cfg(any(
-        feature = "nusb",
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos"
-    ))]
+    #[cfg(any(feature = "nusb", target_os = "linux", target_os = "macos"))]
     pub(crate) fn per_usage(self, usages: &[(u16, u16)]) -> Vec<DeviceInfo> {
         let Some((last, rest)) = usages.split_last() else {
             return vec![self];
@@ -178,12 +173,7 @@ mod tests {
         assert!(!dev.matches(0, 0xc217));
     }
 
-    #[cfg(any(
-        feature = "nusb",
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos"
-    ))]
+    #[cfg(any(feature = "nusb", target_os = "linux", target_os = "macos"))]
     #[test]
     fn no_usages_yields_the_entry_unchanged() {
         let out = info(1, 2).per_usage(&[]);
@@ -191,12 +181,7 @@ mod tests {
         assert_eq!((out[0].usage_page(), out[0].usage()), (0, 0));
     }
 
-    #[cfg(any(
-        feature = "nusb",
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos"
-    ))]
+    #[cfg(any(feature = "nusb", target_os = "linux", target_os = "macos"))]
     #[test]
     fn one_entry_per_usage_pair_sharing_the_rest() {
         let out = info(1, 2).per_usage(&[(0x01, 0x06), (0x0c, 0x01), (0xff00, 0x01)]);

@@ -34,7 +34,7 @@ unreachable_pub = "warn"
 doc_markdown = "warn"
 
 [features]
-default = []
+default = ["nusb"]
 # Additive: compiles the nusb USB-transport backend in *beside* the per-OS one,
 # for `Backend::Nusb` to select at run time. Enabling it anywhere in a
 # dependency graph cannot change which backend another crate ends up using.

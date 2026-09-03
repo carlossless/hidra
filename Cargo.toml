@@ -2,7 +2,6 @@
 name = "hidra"
 version = "0.0.3"
 edition = "2021"
-# Set by `nusb`, which is on by default; the rest of the crate builds on 1.77.
 rust-version = "1.85"
 description = "Pure Rust HID library."
 license = "MIT"

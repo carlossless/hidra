@@ -456,11 +456,17 @@ impl NusbDevice {
             info.usage = usage;
         }
 
-        let queue = Arc::new(ReportQueue::new(if interface.is_some() {
-            "USB reader thread terminated"
-        } else {
-            "interrupt reads need a claimed interface, and another driver holds this one"
-        }));
+        let queue = Arc::new(ReportQueue::new(
+            match (interface.is_some(), in_endpoint.is_some()) {
+                (_, true) => "USB reader thread terminated",
+                (true, false) => {
+                    "this interface declares no interrupt IN endpoint; use get_input_report"
+                }
+                (false, false) => {
+                    "interrupt reads need a claimed interface, and another driver holds this one"
+                }
+            },
+        ));
         let reader = match in_endpoint {
             Some(in_endpoint) => {
                 let queue = Arc::clone(&queue);

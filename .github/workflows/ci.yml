@@ -65,12 +65,17 @@ jobs:
           fi
           # linux-nusb compiles the nusb backend in via its dev-dependency and
           # selects it at run time through Caps::backend, so no --features flag here.
+          # control_only needs usb_f_fs on top: g_hid always creates an endpoint,
+          # so it cannot produce a bNumEndpoints-0 device.
+          sudo modprobe usb_f_fs || true
           cd e2e
-          bin=$(cargo test -p linux-nusb --test nusb --no-run --message-format=json \
-            | jq -r 'select(.reason=="compiler-artifact" and .target.name=="nusb") | .executable' \
-            | grep . | tail -1)
-          echo "running: $bin"
-          sudo HIDRA_NUSB_REQUIRED=1 "$bin" --nocapture --test-threads=1
+          for t in nusb control_only; do
+            bin=$(cargo test -p linux-nusb --test "$t" --no-run --message-format=json \
+              | jq -r --arg t "$t" 'select(.reason=="compiler-artifact" and .target.name==$t) | .executable' \
+              | grep . | tail -1)
+            echo "running: $bin"
+            sudo HIDRA_NUSB_REQUIRED=1 "$bin" --nocapture --test-threads=1
+          done
 
   wasm:
     name: wasm32 / WebHID

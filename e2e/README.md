@@ -31,6 +31,12 @@ e2e/
 | `webhid` | Linux + Chromium | `uhid` via Playwright | root; own sub-tree (wasm harness + native fixture) — see [`targets/webhid`](targets/webhid/README.md) |
 | `cynthion` | all | real USB via Cynthion + Facedancer | emulated *real* hardware, not virtual, on both backends — see [`targets/cynthion`](targets/cynthion/README.md) |
 
+The WebUSB backend (`hidra::webusb`) has no target here: it exists for devices
+that declare a vendor-specific interface class, which neither `uhid` nor the
+`g_hid` gadget can present, and Chromium has no WebUSB equivalent of the
+`WebHidAllowDevicesForUrls` policy to skip the chooser. Covering it needs real
+hardware — most plausibly the `cynthion` route.
+
 Which hidra backend a suite drives is [`Caps::backend`](shared/conformance/src/lib.rs),
 picked at run time, so the whole workspace builds at once and one binary can
 cover both backends (`cynthion` does, via `HIDRA_BACKEND`).

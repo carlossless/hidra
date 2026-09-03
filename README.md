@@ -5,8 +5,8 @@
 [![docs.rs](https://docs.rs/hidra/badge.svg)](https://docs.rs/hidra)
 
 A pure-Rust HID library with a unified async API (with blocking `.wait()` on
-native targets, like nusb), a WebHID backend for WebAssembly, and standalone
-HID report-descriptor primitives.
+native targets, like nusb), WebHID and WebUSB backends for WebAssembly, and
+standalone HID report-descriptor primitives.
 
 No C library is linked. One `Hidra` / `HidDevice` regardless of backend:
 
@@ -16,9 +16,11 @@ No C library is linked. One `Hidra` / `HidDevice` regardless of backend:
 | Windows | `hid.dll` + SetupAPI (via `windows-sys` declarations) | |
 | macOS | IOHIDManager (direct framework FFI) | |
 | Browsers | [WebHID](https://wicg.github.io/webhid/) via `web-sys` | same `Hidra`/`HidDevice`, await-only; no `Backend` |
+| Browsers | [WebUSB](https://wicg.github.io/webusb/) via nusb | `hidra::webusb`, for devices WebHID will not expose |
 
 `Backend::Nusb` adds raw USB transfers via [nusb](https://docs.rs/nusb) on
-Linux, macOS and Windows — see [Backends](#backends).
+Linux, macOS and Windows; on `wasm32` the same feature adds the WebUSB backend
+— see [Backends](#backends).
 
 ## Quick start
 
@@ -81,6 +83,39 @@ and report `Unsupported` under `Nusb`.
 The `nusb` feature is additive: it compiles the second backend in beside the
 first rather than replacing it, so enabling it anywhere in a dependency graph
 cannot change which backend another crate ends up using.
+
+### WebUSB
+
+On `wasm32` the `nusb` feature adds [`hidra::webusb`], a second browser backend.
+It is not an alternative to WebHID but a complement: WebHID only surfaces
+interfaces the host recognises as HID, while Blink refuses `claimInterface` on
+the [protected classes](https://groups.google.com/a/chromium.org/g/blink-dev/c/LZXocaeCwDw),
+HID among them. The two reach disjoint sets of devices:
+
+| interface class | WebHID | WebUSB |
+|-----------------|--------|--------|
+| HID (0x03) | yes | no — `SecurityError` |
+| vendor-specific (0xFF) | no — invisible | yes |
+
+So a device that declares a vendor-specific class, yet still speaks the HID
+protocol on the wire, is reachable only through `hidra::webusb`. It has its own
+`Hidra` / `HidDevice` (browser APIs are permission-gated and chooser-driven, so
+there is no enumerate or open-by-vid-pid), and unlike the native `nusb` backend
+it does not filter for HID-class interfaces.
+
+```rust,ignore
+use hidra::webusb::{DeviceSelector, Hidra};
+
+let api = Hidra::new()?;
+let device = api
+    .request_device(&[DeviceSelector::all().with_vid_pid(0x0603, 0x1020)])
+    .await?
+    .ok_or("no device selected")?;
+let handle = device.open(None).await?;   // None: first interface
+handle.send_feature_report(&report).await?;
+```
+
+[`hidra::webusb`]: https://docs.rs/hidra/latest/wasm32-unknown-unknown/hidra/webusb/index.html
 
 ## Async and blocking
 

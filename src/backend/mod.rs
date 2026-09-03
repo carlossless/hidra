@@ -9,7 +9,9 @@
 //! Backends are compiled in additively. The per-OS backend for the target is
 //! always available; the `nusb` feature *adds* the USB-transport backend
 //! beside it instead of replacing it, so enabling the feature anywhere in a
-//! dependency graph cannot silently change another crate's backend.
+//! dependency graph cannot silently change another crate's backend. On wasm
+//! the same feature adds the `WebUSB` backend beside `WebHID`, reached through its
+//! own entry point rather than this dispatch.
 
 #[cfg(not(target_arch = "wasm32"))]
 use core::future::Future;

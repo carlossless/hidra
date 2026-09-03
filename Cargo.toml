@@ -34,8 +34,9 @@ doc_markdown = "warn"
 [features]
 default = ["nusb"]
 # Additive: compiles the nusb USB-transport backend in *beside* the per-OS one,
-# for `Backend::Nusb` to select at run time. Enabling it anywhere in a
-# dependency graph cannot change which backend another crate ends up using.
+# for `Backend::Nusb` to select at run time, and on wasm32 adds the WebUSB
+# backend beside WebHID. Enabling it anywhere in a dependency graph cannot
+# change which backend another crate ends up using.
 nusb = ["dep:nusb"]
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]

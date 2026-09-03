@@ -134,7 +134,8 @@ pub(crate) trait HidDeviceBackend: Send + Sync {
 /// does not, because the kernel consumes the byte itself.
 #[cfg(any(
     target_os = "macos",
-    all(feature = "nusb", any(target_os = "linux", target_os = "windows"))
+    all(feature = "nusb", any(target_os = "linux", target_os = "windows")),
+    all(feature = "nusb", target_arch = "wasm32")
 ))]
 pub(crate) fn payload_after_report_id(data: &[u8]) -> &[u8] {
     if data.first() == Some(&0) {
@@ -157,6 +158,11 @@ pub(crate) mod queue;
 // directly), but it belongs here as a backend.
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod webhid;
+
+// The WebUSB backend: same HID-over-USB mapping as the native nusb backend,
+// for interfaces the browser will not expose over WebHID.
+#[cfg(all(feature = "nusb", target_arch = "wasm32"))]
+pub(crate) mod webusb;
 
 #[cfg(all(
     feature = "nusb",

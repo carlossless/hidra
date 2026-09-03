@@ -87,3 +87,7 @@ features = [
     "HidReportItem",
     "HidUnitSystem",
 ]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.nusb]
+version = "0.2.7"
+optional = true

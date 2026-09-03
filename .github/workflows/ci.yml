@@ -73,7 +73,7 @@ jobs:
           sudo HIDRA_NUSB_REQUIRED=1 "$bin" --nocapture --test-threads=1
 
   wasm:
-    name: wasm32 / WebHID
+    name: wasm32 / WebHID + WebUSB
     runs-on: ubuntu-latest
     # Repeated from .cargo/config.toml because setting RUSTFLAGS here would otherwise override it.
     env:
@@ -89,6 +89,11 @@ jobs:
         run: cargo check --target wasm32-unknown-unknown
       - name: Clippy
         run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      # WebHID alone, without the WebUSB backend the `nusb` feature adds.
+      - name: Check (no default features)
+        run: cargo check --no-default-features --target wasm32-unknown-unknown
+      - name: Clippy (no default features)
+        run: cargo clippy --no-default-features --target wasm32-unknown-unknown -- -D warnings
 
   msrv:
     name: msrv (${{ matrix.os }})

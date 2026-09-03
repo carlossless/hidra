@@ -5,21 +5,44 @@
 //! hidra talks to HID devices through native OS interfaces, no C library is
 //! linked:
 //!
-//! | Target | [`Backend::Native`] | [`Backend::Nusb`] (feature `nusb`) |
-//! |--------|---------------------|------------------------------------|
-//! | Linux   | `hidraw` device nodes + sysfs enumeration | USB interrupt/control transfers via [nusb] |
-//! | Windows | `hid.dll` / `SetupAPI` via `windows-sys` declarations | as above |
-//! | macOS   | `IOHIDManager` via direct framework FFI | as above |
+#![cfg_attr(
+    not(target_arch = "wasm32"),
+    doc = "| Target | [`Backend::Native`] | [`Backend::Nusb`] (feature `nusb`) |
+|--------|---------------------|------------------------------------|
+| Linux   | `hidraw` device nodes + sysfs enumeration | USB interrupt/control transfers via [nusb] |
+| Windows | `hid.dll` / `SetupAPI` via `windows-sys` declarations | as above |
+| macOS   | `IOHIDManager` via direct framework FFI | as above |
+"
+)]
+#![cfg_attr(
+    target_arch = "wasm32",
+    doc = "| Target | Native | `nusb` (feature `nusb`) |
+|--------|--------|-------------------------|
+| Linux   | `hidraw` device nodes + sysfs enumeration | USB interrupt/control transfers via [nusb] |
+| Windows | `hid.dll` / `SetupAPI` via `windows-sys` declarations | as above |
+| macOS   | `IOHIDManager` via direct framework FFI | as above |
+"
+)]
 //!
-//! On WebAssembly the backend is always
-//! [WebHID](https://wicg.github.io/webhid/) via `web-sys`, and [`Backend`]
-//! does not exist.
+//! On WebAssembly the backend is [`WebHID`](https://wicg.github.io/webhid/) via
+//! `web-sys`, and the `Backend` selector does not exist.
 //!
-//! The two native backends coexist in one build: [`Backend`] selects between
-//! them per [`Hidra`] instance, at run time, so a program can fall back from
-//! one to the other, or drive two devices through different backends at once.
-//! [`Hidra::new`] uses [`Backend::default`] (native wherever there is one);
-//! [`Hidra::builder`] picks.
+#![cfg_attr(
+    target_arch = "wasm32",
+    doc = "Devices the browser refuses to expose over `WebHID`, because their interface
+declares a vendor-specific class rather than HID, are reachable through
+[`webusb`] instead.
+"
+)]
+#![cfg_attr(
+    not(target_arch = "wasm32"),
+    doc = "The two native backends coexist in one build: [`Backend`] selects between
+them per [`Hidra`] instance, at run time, so a program can fall back from
+one to the other, or drive two devices through different backends at once.
+[`Hidra::new`] uses [`Backend::default`] (native wherever there is one);
+[`Hidra::builder`] picks.
+"
+)]
 //!
 //! ```no_run
 //! # #[cfg(all(not(target_arch = "wasm32"), feature = "nusb"))] fn demo() -> hidra::HidResult<()> {
@@ -839,6 +862,186 @@ mod web {
 
         /// The underlying `HIDDevice` object (`WebHID` escape hatch).
         pub fn raw(&self) -> &web_sys::HidDevice {
+            self.backend.raw()
+        }
+    }
+}
+
+/// `WebUSB` entry point, for devices the browser will not expose over `WebHID`.
+///
+/// `WebHID` only surfaces interfaces the host recognises as HID. A device whose
+/// interface declares a vendor-specific class never appears there, but is still
+/// reachable over `WebUSB`, and typically still speaks the HID protocol on the
+/// wire. This module drives those devices, mapping the same report calls onto
+/// the control and interrupt transfers the native `nusb` backend uses.
+///
+/// Blink refuses `claimInterface` on the protected classes, HID (0x03) among
+/// them, so [`open`](HidDevice::open) fails for an interface the browser
+/// considers HID. That is the division of labour: `WebHID` for those, this for
+/// the rest.
+#[cfg(all(target_arch = "wasm32", feature = "nusb"))]
+pub mod webusb {
+    use crate::backend::webusb::{WebUsbApi, WebUsbDevice};
+    use crate::descriptor::ReportDescriptor;
+    use crate::{DeviceInfo, HidResult, MAX_REPORT_DESCRIPTOR_SIZE};
+
+    pub use nusb::DeviceSelector;
+
+    /// Entry point to the library, backed by `WebUSB` (`navigator.usb`).
+    ///
+    /// Discovery is browser-shaped, like [`crate::Hidra`] on wasm: only devices
+    /// the user has granted are visible, so there is no open-by-vid-pid. Call
+    /// [`request_device`](Self::request_device) to show the chooser and
+    /// [`device_list`](Self::device_list) for devices already granted.
+    pub struct Hidra {
+        backend: WebUsbApi,
+    }
+
+    impl core::fmt::Debug for Hidra {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("Hidra").finish_non_exhaustive()
+        }
+    }
+
+    impl Hidra {
+        /// Bind to `window.navigator.usb`.
+        pub fn new() -> HidResult<Self> {
+            Ok(Hidra {
+                backend: WebUsbApi::new()?,
+            })
+        }
+
+        /// Show the browser's device chooser, narrowed by `selectors`.
+        ///
+        /// An empty slice offers every device. Resolves with `None` when the
+        /// user dismisses the chooser without picking one. Must be called from
+        /// a user gesture, or the browser rejects it.
+        pub async fn request_device(
+            &self,
+            selectors: &[DeviceSelector],
+        ) -> HidResult<Option<Device>> {
+            Ok(self
+                .backend
+                .request_device(selectors)
+                .await?
+                .map(|info| Device { info }))
+        }
+
+        /// Devices the user has already granted access to, one entry per
+        /// interface.
+        pub async fn device_list(&self) -> HidResult<Vec<DeviceInfo>> {
+            self.backend.device_list().await
+        }
+    }
+
+    /// A granted device, not yet claimed. Call [`open`](Self::open) to claim an
+    /// interface and get a [`HidDevice`].
+    #[derive(Debug)]
+    pub struct Device {
+        info: nusb::DeviceInfo,
+    }
+
+    impl Device {
+        /// Claim an interface and start talking to it.
+        ///
+        /// `interface_number` selects the interface; `None` takes the first the
+        /// device exposes. Fails when the browser refuses the claim, which it
+        /// does for the protected classes.
+        pub async fn open(&self, interface_number: Option<u8>) -> HidResult<HidDevice> {
+            Ok(HidDevice {
+                backend: WebUsbDevice::open(&self.info, interface_number).await?,
+            })
+        }
+
+        /// Vendor ID.
+        pub fn vendor_id(&self) -> u16 {
+            self.info.vendor_id()
+        }
+
+        /// Product ID.
+        pub fn product_id(&self) -> u16 {
+            self.info.product_id()
+        }
+    }
+
+    /// One open device, claimed on a single interface.
+    pub struct HidDevice {
+        backend: WebUsbDevice,
+    }
+
+    impl core::fmt::Debug for HidDevice {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("HidDevice").finish_non_exhaustive()
+        }
+    }
+
+    impl HidDevice {
+        /// Send an output report.
+        ///
+        /// `data[0]` must be the report ID (0 when the device has no numbered
+        /// reports). Goes out on the interrupt OUT endpoint when the interface
+        /// has one, otherwise as `SET_REPORT(Output)`.
+        pub async fn write(&self, data: &[u8]) -> HidResult<usize> {
+            self.backend.write(data).await
+        }
+
+        /// Resolve with one input report from the interrupt IN endpoint.
+        ///
+        /// Fails with [`HidError::Unsupported`](crate::HidError::Unsupported)
+        /// on an interface without one; use
+        /// [`get_input_report`](Self::get_input_report) there.
+        pub async fn read(&self, buf: &mut [u8]) -> HidResult<usize> {
+            self.backend.read(buf).await
+        }
+
+        /// Send a feature report via `SET_REPORT(Feature)`. `data[0]` is the
+        /// report ID.
+        pub async fn send_feature_report(&self, data: &[u8]) -> HidResult<()> {
+            self.backend.send_feature_report(data).await
+        }
+
+        /// Read a feature report via `GET_REPORT(Feature)`. Set `buf[0]` to the
+        /// report ID before calling.
+        pub async fn get_feature_report(&self, buf: &mut [u8]) -> HidResult<usize> {
+            self.backend.get_feature_report(buf).await
+        }
+
+        /// Read an input report via `GET_REPORT(Input)`, without waiting for the
+        /// device to send one.
+        pub async fn get_input_report(&self, buf: &mut [u8]) -> HidResult<usize> {
+            self.backend.get_input_report(buf).await
+        }
+
+        /// Raw report descriptor.
+        ///
+        /// Fails with [`HidError::Unsupported`](crate::HidError::Unsupported)
+        /// on a vendor-class interface, which has no HID class descriptor to
+        /// read; that is the usual case here.
+        pub fn get_report_descriptor(&self, buf: &mut [u8]) -> HidResult<usize> {
+            self.backend.get_report_descriptor(buf)
+        }
+
+        /// The report descriptor as an owned buffer.
+        pub fn report_descriptor(&self) -> HidResult<Vec<u8>> {
+            let mut buf = vec![0u8; MAX_REPORT_DESCRIPTOR_SIZE];
+            let len = self.get_report_descriptor(&mut buf)?;
+            buf.truncate(len);
+            Ok(buf)
+        }
+
+        /// The report descriptor, parsed.
+        pub fn parsed_report_descriptor(&self) -> HidResult<ReportDescriptor> {
+            ReportDescriptor::parse(&self.report_descriptor()?)
+        }
+
+        /// Enumeration-style metadata for this interface.
+        pub fn get_device_info(&self) -> HidResult<DeviceInfo> {
+            Ok(self.backend.device_info())
+        }
+
+        /// The underlying `nusb` interface, for transfers outside the HID
+        /// mapping.
+        pub fn raw(&self) -> &nusb::Interface {
             self.backend.raw()
         }
     }

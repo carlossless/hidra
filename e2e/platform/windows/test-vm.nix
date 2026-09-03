@@ -3,14 +3,14 @@
 #
 # Returns four attrs (each a COW layer on the previous), exposed as flake pkgs
 # windows-test-vm{-base,-toolchain} / windows-test-vm / windows-test-vm-run:
-#   baseImage      — Win11 + SSH + tweaks + test signing. No external downloads,
+#   baseImage     , Win11 + SSH + tweaks + test signing. No external downloads,
 #                    builds from just the Windows ISO; smoke-tests the wfvm path.
-#   toolchainImage — + VC++ RT, rustup MSVC, VS Build Tools, WDK, the WDK VS
+#   toolchainImage, + VC++ RT, rustup MSVC, VS Build Tools, WDK, the WDK VS
 #                    driver-targets extension, and the signing cert. Networked
 #                    (__noChroot); the expensive, cacheable stage.
-#   image          — + build/sign/install the WinUHid driver. Offline, sandboxed,
+#   image         , + build/sign/install the WinUHid driver. Offline, sandboxed,
 #                    fast to iterate; its winuhid-build.cmd output goes to the log.
-#   run            — boots `image` in snapshot mode, pushes the current checkout
+#   run           , boots `image` in snapshot mode, pushes the current checkout
 #                    and runs `cargo test -p windows` over SSH.
 #
 # The toolchain deliberately avoids the ~12 GB EWDK ISO: the MSVC compiler comes
@@ -23,7 +23,7 @@
 # full conformance suite (`test result: ok. 1 passed`). Build the image layers
 # with `--option sandbox relaxed` (the toolchain boot needs the network).
 {
-  pkgs, # our flake's (unstable) nixpkgs — used only for fetches / source pinning
+  pkgs, # our flake's (unstable) nixpkgs, used only for fetches / source pinning
   wfvm, # wfvm.lib (makeWindowsImage / layers / utils), on wfvm's own nixpkgs pin
   self, # flake self, for the hidra source tree
   # WindowsTargetPlatformVersion for the WinUHid driver build + the Win11 SDK
@@ -96,7 +96,7 @@ let
   # Microsoft rev's the aka.ms/vs/17/release/* bootstrapper URLs in place, so a
   # hash pinned against one breaks on the next rev. Those URLs redirect to a
   # download.visualstudio.microsoft.com permalink whose second path segment is the
-  # file's own sha256 — content-addressed and immutable, so pin that instead. To
+  # file's own sha256, content-addressed and immutable, so pin that instead. To
   # move to a newer bootstrapper:
   #   curl -sIL https://aka.ms/vs/17/release/<name> | grep -i ^location
   # and take the new URL + the hash from its path.
@@ -113,8 +113,8 @@ let
   # real payload during the (networked) provisioning boot.
   rustupInit = pkgs.fetchurl {
     name = "rustup-init.exe";
-    url = "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe";
-    sha256 = "sha256-hkeOU/dpN51/Dr+nyaqXy3bKkiM/eaoswNvuLvqsc8c=";
+    url = "https://static.rust-lang.org/rustup/archive/1.29.1/x86_64-pc-windows-msvc/rustup-init.exe";
+    sha256 = "sha256-b0vvZiYSYfy0MTG+hyC6uBfUA6Ce3sdFXDcZdLkL234=";
   };
   vsBuildTools = pkgs.fetchurl {
     name = "vs_BuildTools.exe";
@@ -136,11 +136,11 @@ let
   # Both stages are hand-rolled qemu boots (modeled on wfvm's win.nix
   # finalOfflineImage) on a COW layer over the previous image.
   #
-  #   toolchainImage — installs VC++ RT, rustup, VS Build Tools, WDK, the WDK VS
+  #   toolchainImage, installs VC++ RT, rustup, VS Build Tools, WDK, the WDK VS
   #     driver-targets extension and the signing cert. Needs the internet, so it
   #     is __noChroot (build with `--option sandbox relaxed`). Expensive (~GBs of
   #     downloads) but changes rarely, so it caches and is reused.
-  #   provisionedImage — builds + signs + installs WinUHid on top. Fully offline
+  #   provisionedImage, builds + signs + installs WinUHid on top. Fully offline
   #     (restrict=on), so it runs sandboxed and re-runs fast while iterating the
   #     driver build. Its winuhid.ps1 output is captured into the nix log.
   #

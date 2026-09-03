@@ -2,16 +2,51 @@
 //!
 //! A pure-Rust HID library.
 //!
-//! hidra talks to HID devices through native OS interfaces, no C library is
-//! linked:
+//! hidra talks to HID devices through native OS interfaces:
 //!
-//! | Platform | Backend |
-//! |----------|---------|
-//! | Linux    | `hidraw` device nodes + sysfs enumeration |
-//! | Windows  | `hid.dll` / `SetupAPI` via `windows-sys` declarations |
-//! | macOS    | `IOHIDManager` via direct framework FFI |
-//! | Any (feature `nusb`) | USB interrupt/control transfers via [nusb] |
-//! | WebAssembly | [WebHID](https://wicg.github.io/webhid/) via `web-sys` |
+#![cfg_attr(
+    not(target_arch = "wasm32"),
+    doc = "| Target | [`Native`] | [`Nusb`] (feature `nusb`) |
+|--------|---------------------|------------------------------------|
+| Linux   | `hidraw` device nodes + sysfs enumeration | USB interrupt/control transfers via [nusb] |
+| Windows | `hid.dll` / `SetupAPI` via `windows-sys` declarations | as above |
+| macOS   | `IOHIDManager` via direct framework FFI | as above |
+"
+)]
+#![cfg_attr(
+    target_arch = "wasm32",
+    doc = "| Target | Native | `nusb` (feature `nusb`) |
+|--------|--------|-------------------------|
+| Linux   | `hidraw` device nodes + sysfs enumeration | USB interrupt/control transfers via [nusb] |
+| Windows | `hid.dll` / `SetupAPI` via `windows-sys` declarations | as above |
+| macOS   | `IOHIDManager` via direct framework FFI | as above |
+"
+)]
+//!
+//! On WebAssembly the backend is always
+//! [`WebHID`](https://wicg.github.io/webhid/) via `web-sys`.
+//!
+#![cfg_attr(
+    not(target_arch = "wasm32"),
+    doc = "The backend is a type parameter: [`Hidra<Native>`](Hidra) for the OS HID
+stack, [`Hidra<Nusb>`](Hidra) for raw USB. Both coexist in one build, so a
+program can drive two devices through different backends at once. A backend
+this build does not have cannot be named, so the wrong choice is a compile
+error rather than a run-time one.
+"
+)]
+//!
+//! ```no_run
+//! # #[cfg(all(not(target_arch = "wasm32"), feature = "nusb"))] fn demo() -> hidra::HidResult<()> {
+//! use hidra::{Hidra, Nusb};
+//! let native = Hidra::new()?;                    // the OS HID stack
+//! let usb = Hidra::<Nusb>::builder().build()?;  // raw USB transfers
+//! # let _ = (native, usb);
+//! # Ok(()) }
+//! ```
+//!
+//! They are different types, so a handle that holds either is the caller's to
+//! declare; `examples/backends.rs` shows the whole of it.
 //!
 //! Following nusb's model, every [`Hidra`] / [`HidDevice`] I/O method returns
 //! an `impl Future`. On native targets bring `MaybeFuture` into scope to drive
@@ -100,8 +135,18 @@ pub const fn version_str() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// The backend traits, and the backend types implementing them.
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{HidDevice, Hidra};
+pub use backend::{HidBackend, HidDeviceBackend};
+#[cfg(not(target_arch = "wasm32"))]
+pub use backend::{Native, NativeDevice};
+#[cfg(all(
+    feature = "nusb",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+pub use backend::{Nusb, NusbDevice};
+#[cfg(not(target_arch = "wasm32"))]
+pub use native::{HidDevice, Hidra, HidraBuilder};
 
 #[cfg(target_arch = "wasm32")]
 pub use web::{HidDevice, Hidra};
@@ -110,23 +155,28 @@ pub use web::{HidDevice, Hidra};
 mod native {
     use core::future::Future;
 
-    use crate::backend::{HidBackend, HidDeviceBackend, PlatformApi, PlatformDevice};
+    use crate::backend::{HidBackend, HidDeviceBackend, Native, NativeDevice};
     use crate::{DeviceInfo, HidResult};
 
     /// Entry point to the library; owns backend state and the cached device
     /// list.
     ///
-    /// There is no global state: create as many instances as
-    /// you like, from any thread.
-    pub struct Hidra {
-        backend: PlatformApi,
+    /// `B` is the backend: [`Native`] (the default) for the OS HID stack, or
+    /// [`Nusb`](crate::Nusb) for raw USB transfers. A backend this build does
+    /// not have is simply not nameable, so the wrong choice is a compile
+    /// error.
+    ///
+    /// There is no global state: create as many instances as you like, from
+    /// any thread, on either backend.
+    pub struct Hidra<B: HidBackend = Native> {
+        backend: B,
         device_list: Vec<DeviceInfo>,
     }
 
     // The platform backends hold raw OS handles that have no useful `Debug`;
-    // report the cached device count instead, which is what a caller
-    // inspecting a `Hidra` actually wants to see.
-    impl core::fmt::Debug for Hidra {
+    // report the selected backend and the cached device count instead, which
+    // is what a caller inspecting a `Hidra` actually wants to see.
+    impl<B: HidBackend> core::fmt::Debug for Hidra<B> {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             f.debug_struct("Hidra")
                 .field("devices", &self.device_list.len())
@@ -134,21 +184,82 @@ mod native {
         }
     }
 
-    impl Hidra {
-        /// Initialize the backend and enumerate all connected HID devices.
-        pub fn new() -> HidResult<Self> {
-            let mut api = Self::new_without_enumerate()?;
-            api.refresh_devices()?;
-            Ok(api)
+    /// Configures a [`Hidra`]: whether to enumerate up front, and on which
+    /// backend.
+    ///
+    /// ```no_run
+    /// # fn demo() -> hidra::HidResult<()> {
+    /// use hidra::{Hidra, Nusb};
+    /// let api = Hidra::<Nusb>::builder().build()?;
+    /// # let _ = api; Ok(()) }
+    /// ```
+    #[derive(Debug, Clone)]
+    pub struct HidraBuilder<B: HidBackend = Native> {
+        enumerate_on_build: bool,
+        backend: core::marker::PhantomData<B>,
+    }
+
+    impl<B: HidBackend> Default for HidraBuilder<B> {
+        fn default() -> Self {
+            HidraBuilder {
+                enumerate_on_build: true,
+                backend: core::marker::PhantomData,
+            }
+        }
+    }
+
+    impl<B: HidBackend> HidraBuilder<B> {
+        /// Whether [`build`](Self::build) enumerates connected devices.
+        /// Defaults to `true`; pass `false` when you only need
+        /// [`Hidra::open_path`].
+        #[must_use]
+        pub fn enumerate_on_build(mut self, enumerate: bool) -> Self {
+            self.enumerate_on_build = enumerate;
+            self
         }
 
-        /// Initialize the backend without enumerating (cheaper when you only
-        /// need [`open_path`](Self::open_path)).
-        pub fn new_without_enumerate() -> HidResult<Self> {
-            Ok(Hidra {
-                backend: PlatformApi::new()?,
+        /// Initialize the backend.
+        pub fn build(self) -> HidResult<Hidra<B>> {
+            let mut api = Hidra {
+                backend: B::new()?,
                 device_list: Vec::new(),
-            })
+            };
+            if self.enumerate_on_build {
+                api.refresh_devices()?;
+            }
+            Ok(api)
+        }
+    }
+
+    /// Constructors for the default backend.
+    ///
+    /// These are on `Hidra<Native>` rather than the generic impl for the same
+    /// reason `HashMap::new` is: a default type parameter does not drive
+    /// inference, so `Hidra::new()` would otherwise need a turbofish. Other
+    /// backends go through [`builder`](Hidra::builder).
+    impl Hidra<Native> {
+        /// Initialize the default backend and enumerate all connected HID
+        /// devices.
+        pub fn new() -> HidResult<Self> {
+            Self::builder().build()
+        }
+
+        /// Initialize the default backend without enumerating (cheaper when
+        /// you only need [`open_path`](Self::open_path)).
+        #[deprecated(
+            since = "0.0.4",
+            note = "use Hidra::builder().enumerate_on_build(false).build()"
+        )]
+        pub fn new_without_enumerate() -> HidResult<Self> {
+            Self::builder().enumerate_on_build(false).build()
+        }
+    }
+
+    impl<B: HidBackend> Hidra<B> {
+        /// Start configuring a `Hidra`.
+        #[must_use]
+        pub fn builder() -> HidraBuilder<B> {
+            HidraBuilder::default()
         }
 
         /// Re-enumerate connected devices, refreshing
@@ -176,7 +287,7 @@ mod native {
             &self,
             vendor_id: u16,
             product_id: u16,
-        ) -> impl Future<Output = HidResult<HidDevice>> + '_ {
+        ) -> impl Future<Output = HidResult<HidDevice<B::Device>>> + '_ {
             crate::maybe_future::Blocking::new(move || {
                 Ok(HidDevice {
                     backend: self.backend.open(vendor_id, product_id, None)?,
@@ -191,7 +302,7 @@ mod native {
             vendor_id: u16,
             product_id: u16,
             serial_number: &'a str,
-        ) -> impl Future<Output = HidResult<HidDevice>> + 'a {
+        ) -> impl Future<Output = HidResult<HidDevice<B::Device>>> + 'a {
             crate::maybe_future::Blocking::new(move || {
                 Ok(HidDevice {
                     backend: self
@@ -206,7 +317,7 @@ mod native {
         pub fn open_path<'a>(
             &'a self,
             path: &'a str,
-        ) -> impl Future<Output = HidResult<HidDevice>> + 'a {
+        ) -> impl Future<Output = HidResult<HidDevice<B::Device>>> + 'a {
             crate::maybe_future::Blocking::new(move || {
                 Ok(HidDevice {
                     backend: self.backend.open_path(path)?,
@@ -215,11 +326,15 @@ mod native {
         }
     }
 
-    /// macOS-specific options.
-    #[cfg(all(target_os = "macos", not(feature = "nusb")))]
-    impl Hidra {
-        /// Whether subsequently opened devices are seized exclusively.
-        /// Defaults to shared (non-exclusive) access.
+    /// macOS-specific options, on [`Native`] only.
+    ///
+    /// `Nusb` claims the USB interface outright and has no shared mode to
+    /// configure, so it does not carry these at all.
+    #[cfg(target_os = "macos")]
+    impl Hidra<Native> {
+        /// Whether subsequently opened devices are seized exclusively
+        /// (`hid_darwin_set_open_exclusive`). Defaults to shared
+        /// (non-exclusive) access.
         pub fn set_open_exclusive(&self, exclusive: bool) {
             self.backend.set_open_exclusive(exclusive);
         }
@@ -232,19 +347,19 @@ mod native {
 
     /// An open HID device. Closed on drop.
     ///
-    /// All methods take `&self`; the handle is `Send + Sync` and may be
-    /// shared across threads.
-    pub struct HidDevice {
-        backend: PlatformDevice,
+    /// `D` follows from the [`Hidra`] that opened it. All methods take
+    /// `&self`; the handle is `Send + Sync` and may be shared across threads.
+    pub struct HidDevice<D: HidDeviceBackend = NativeDevice> {
+        backend: D,
     }
 
-    impl core::fmt::Debug for HidDevice {
+    impl<D: HidDeviceBackend> core::fmt::Debug for HidDevice<D> {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             f.debug_struct("HidDevice").finish_non_exhaustive()
         }
     }
 
-    impl HidDevice {
+    impl<D: HidDeviceBackend> HidDevice<D> {
         /// Send an output report (`hid_write`).
         ///
         /// `data[0]` must be the report ID (0 when the device has no
@@ -376,9 +491,13 @@ mod native {
         }
     }
 
-    /// Windows-specific extensions (`hid_winapi_*` equivalents).
-    #[cfg(all(target_os = "windows", not(feature = "nusb")))]
-    impl HidDevice {
+    /// Windows-specific extensions (`hid_winapi_*` equivalents), on
+    /// [`NativeDevice`] only.
+    ///
+    /// `Nusb` goes nowhere near the Windows HID stack these come from, so it
+    /// does not carry them at all.
+    #[cfg(target_os = "windows")]
+    impl HidDevice<NativeDevice> {
         /// The container ID GUID grouping this interface with its siblings
         /// (`hid_winapi_get_container_id`), as 16 little-endian GUID bytes.
         pub fn container_id(&self) -> impl Future<Output = HidResult<[u8; 16]>> + '_ {
@@ -388,7 +507,7 @@ mod native {
         /// Set the timeout for `write` in milliseconds
         /// (`hid_winapi_set_write_timeout`). Defaults to 1000 ms.
         pub fn set_write_timeout(&self, timeout_ms: u32) {
-            self.backend.set_write_timeout(timeout_ms)
+            self.backend.set_write_timeout(timeout_ms);
         }
     }
 }
@@ -409,6 +528,22 @@ mod tests {
         assert_send_sync::<super::HidDevice>();
         assert_send_sync::<super::HidError>();
         assert_send_sync::<super::DeviceInfo>();
+    }
+
+    /// Both backends satisfy the same bounds, so a caller can be generic over
+    /// them without the wrapper types diverging.
+    #[cfg(feature = "nusb")]
+    #[test]
+    fn both_backends_are_usable_generically() {
+        fn assert_backend<B: super::HidBackend>() {}
+        assert_backend::<super::Native>();
+        assert_backend::<super::Nusb>();
+        fn assert_handles<B: super::HidBackend>() {
+            fn send_sync<T: Send + Sync>() {}
+            send_sync::<super::Hidra<B>>();
+        }
+        assert_handles::<super::Native>();
+        assert_handles::<super::Nusb>();
     }
 }
 

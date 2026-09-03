@@ -2,21 +2,26 @@
 name = "hidra"
 version = "0.0.3"
 edition = "2021"
-# Applies to the default feature set (the per-OS backends and WebHID). Turning
-# on `nusb` raises the effective floor to whatever nusb itself requires (1.85
-# as of nusb 0.2.7); cargo reports that on its own.
-rust-version = "1.77"
+rust-version = "1.85"
 description = "Pure Rust HID library."
 license = "MIT"
 repository = "https://github.com/carlossless/hidra"
 keywords = ["hid", "usb", "webhid", "hidraw"]
 categories = ["hardware-support", "api-bindings", "wasm"]
+# A whitelist: `cargo package` picks up untracked files too.
+include = ["src/**/*", "examples/**/*", "README.md", "LICENSE"]
 
-# Build docs for the native and wasm/WebHID backends; WebHID needs the unstable web-sys cfg.
+# Backends are per-target: a target missing here loses its API from the docs.
+# WebHID needs the unstable web-sys cfg.
 [package.metadata.docs.rs]
 all-features = true
 default-target = "x86_64-unknown-linux-gnu"
-targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "wasm32-unknown-unknown",
+]
 rustc-args = ["--cfg=web_sys_unstable_apis"]
 rustdoc-args = ["--cfg=web_sys_unstable_apis"]
 
@@ -34,11 +39,13 @@ unreachable_pub = "warn"
 doc_markdown = "warn"
 
 [features]
-default = []
+default = ["nusb"]
+# Additive: compiled in beside the per-OS backend, never replacing it, so
+# enabling it cannot change which backend another crate gets.
 nusb = ["dep:nusb"]
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-nusb = { version = "0.2.3", optional = true }
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
+nusb = { version = "0.2.7", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

@@ -1,4 +1,4 @@
-//! Standalone `uhid` virtual HID device — the fixture Chrome sees via WebHID for
+//! Standalone `uhid` virtual HID device, the fixture Chrome sees via WebHID for
 //! the Playwright test. Streams a known input report, answers GET_REPORT with a
 //! canned payload, and prints a line per output report so the browser side can
 //! prove `write()` reached the device.

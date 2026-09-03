@@ -271,6 +271,7 @@ fn windows_caps() -> Caps {
         bus_type: conformance::BusType::Unknown,
         release_number: 0x0001,
         interface_number: -1,
+        backend: conformance::Backend::Native,
     }
 }
 
@@ -304,7 +305,7 @@ fn windows_virtual_conformance() {
     for numbered in [false, true] {
         match WinUHidDevice::create(&api, numbered) {
             Some(dev) => {
-                run_conformance(numbered, &caps, &dev);
+                run_conformance::<hidra::Native>(numbered, &caps, &dev);
                 drop(dev);
             }
             None => {

@@ -2,7 +2,7 @@
 
 Validates the **Windows HID backend** (`hid.dll` + SetupAPI) against a
 userland-created virtual HID device via [WinUHid](https://github.com/cgutman/WinUHid)
-— a Windows analog of Linux `uhid`. The test loads `WinUHid.dll` at runtime,
+- a Windows analog of Linux `uhid`. The test loads `WinUHid.dll` at runtime,
 creates the virtual device, services its input/output/feature events on a thread,
 and hidra enumerates and drives it.
 
@@ -21,14 +21,15 @@ documented inline in [`provision/winuhid.ps1`](provision/winuhid.ps1) and
 - **`x86_64-linux` host with `/dev/kvm`** and a Nix that exposes the `kvm` system
   feature (wfvm builds the image by running QEMU inside the build).
 - **The Windows 11 ISO added to the store** (an unfree `requireFile`, pinned in
-  `test-vm.nix` — currently `Win11_25H2_EnglishInternational_x64_v2.iso`):
+  `test-vm.nix`, currently `Win11_25H2_EnglishInternational_x64_v2.iso`):
   ```sh
   nix-store --add-fixed sha256 Win11_25H2_EnglishInternational_x64_v2.iso
   ```
-  Override `windowsImage` (name + sha256) and `locale` for a different ISO — the
+  Override `windowsImage` (name + sha256) and `locale` for a different ISO, the
   locale **must** match the ISO language or Windows Setup stalls at the language
   picker.
-- **`export NIXPKGS_ALLOW_UNFREE=1`** — required to evaluate the ISO derivation.
+- **`export NIXPKGS_ALLOW_UNFREE=1`**, required to evaluate the ISO derivation.
+  Flakes only read it under `--impure`, so every command below passes that.
 - **`--option sandbox relaxed`** for anything at/above the toolchain layer: that
   stage runs `__noChroot` (needs the network to download VS Build Tools + the WDK,
   so it needs a trusted user). The base and WinUHid stages run fully sandboxed.
@@ -37,9 +38,9 @@ documented inline in [`provision/winuhid.ps1`](provision/winuhid.ps1) and
 
 ```sh
 export NIXPKGS_ALLOW_UNFREE=1
-nix build .#windows-test-vm-base                        # smoke-test the wfvm install (offline, sandboxed)
-nix build --option sandbox relaxed .#windows-test-vm    # full image (toolchain boot needs the network)
-nix run   --option sandbox relaxed .#windows-test-vm-run # boot snapshot, run the conformance test over SSH
+nix build --impure .#windows-test-vm-base                        # smoke-test the wfvm install (offline, sandboxed)
+nix build --impure --option sandbox relaxed .#windows-test-vm    # full image (toolchain boot needs the network)
+nix run   --impure --option sandbox relaxed .#windows-test-vm-run # boot snapshot, run the conformance test over SSH
 ```
 
 Iterating the driver build is cheap: the toolchain layer is cached, so only the
@@ -77,7 +78,7 @@ provisioning boot or driving a VM by hand (e.g. a QuickEMU Win11 guest).
 3. Sign and install: create a self-signed CodeSigning cert, `certutil -f -addstore
    Root` and `-addstore TrustedPublisher`, `signtool sign` the `.dll`, `inf2cat`,
    then `signtool sign` **only** the `.cat` (never re-touch the `.dll` after
-   cataloging — it breaks the catalog's hash and Windows silently rejects the
+   cataloging, it breaks the catalog's hash and Windows silently rejects the
    package), then `devcon install WinUHidDriver.inf "Root\WinUHid"` (`devcon` lives
    under the WDK `Tools\` dir, not `bin\`). The device appears as "WinUHid Virtual
    HID Enumerator" (`ROOT\SYSTEM\xxxx`, Class = System).
@@ -88,7 +89,7 @@ provisioning boot or driving a VM by hand (e.g. a QuickEMU Win11 guest).
 environment.
 
 - `SetupBuildEnv.cmd amd64` provides the tools and `INCLUDE` but leaves `LIB`
-  short — also set:
+  short, also set:
   ```
   set LIB=<Kits>\Lib\10.0.26100.0\um\x64;<Kits>\Lib\10.0.26100.0\ucrt\x64;<VC>\lib\x64;%LIB%
   ```
@@ -102,7 +103,7 @@ environment.
 ### Manual VM provisioning (QuickEMU, pre-wfvm)
 
 - QuickEMU Windows 11 Pro; enable OpenSSH in the guest. (wfvm enables OpenSSH
-  automatically — user `wfvm`, host port 2022.)
+  automatically, user `wfvm`, host port 2022.)
 - The default disk (~16 GB) is too small: stop the VM, `qemu-img resize disk.qcow2
   96G`, relaunch, `Resize-Partition` C: to max. (wfvm sizes to 96 GB up front.)
 

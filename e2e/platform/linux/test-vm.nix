@@ -81,6 +81,7 @@ in
     "dummy_hcd"
     "libcomposite"
     "usb_f_hid"
+    "usb_f_fs"
     "configfs"
   ];
 

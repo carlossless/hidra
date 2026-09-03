@@ -6,12 +6,12 @@ a `uhid` device read through headless Chromium).
 
 Codified in [`test-vm.nix`](test-vm.nix): `nix run .#test-vm` (interactive, log in
 as root, `run-hidra-tests`) or headless CI (auto-run + poweroff, results on the
-serial console) via the `hidra.autorun` kernel param — see the file header. Any
+serial console) via the `hidra.autorun` kernel param, see the file header. Any
 distro works given the same modules, toolchain, and privileges.
 
 ## Kernel modules
 
-Load these, and make sure the running kernel actually ships them — cloud/CI
+Load these, and make sure the running kernel actually ships them, cloud/CI
 kernels often omit the USB-gadget ones (`dummy_hcd` is the usual missing one):
 
 ```
@@ -31,7 +31,7 @@ open the resulting `/dev/hidrawN` node and raw USB device.
 - **WebHID / wasm32:** the `wasm32-unknown-unknown` target, `wasm-pack`, Node.js +
   `npm` (install with `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1`), Chromium, and `xvfb`.
   The `wasm-bindgen` CLI version must **exactly match** the `wasm-bindgen` crate
-  hidra depends on (currently **`0.2.126`** — distro packages are frequently too
+  hidra depends on (currently **`0.2.126`**, distro packages are frequently too
   old; `cargo install wasm-bindgen-cli --version 0.2.126`). A mismatched CLI emits
   broken glue.
 
@@ -45,7 +45,7 @@ old headless shell cannot access HID); add `--no-sandbox` when it runs as root.
 ## Gotchas
 
 - **uhid vs nusb build:** the `nusb` feature *switches* the Linux backend, so build
-  and run `linux-hidraw` and `linux-nusb` in **separate** cargo invocations —
+  and run `linux-hidraw` and `linux-nusb` in **separate** cargo invocations,
   compiling both together unifies the feature and the uhid test ends up on the USB
   backend.
 - **NixOS build host:** Rust ≥1.90's bundled `rust-lld` may fail to run when

@@ -1,7 +1,7 @@
 # Builds and ad-hoc-signs the e2e/macos virtual-HID test binary with the
 # restricted com.apple.developer.hid.virtual.device entitlement. Running it needs
 # a real macOS kernel booted SIP-off + amfi_get_out_of_my_way (see
-# ../../targets/macos/tests/macos.rs) — an unrestricted host, never a hosted CI runner.
+# ../../targets/macos/tests/macos.rs), an unrestricted host, never a hosted CI runner.
 {
   pkgs,
   self,

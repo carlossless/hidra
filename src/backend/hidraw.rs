@@ -7,8 +7,6 @@ use std::fs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
-use core::future::Future;
-
 use super::{HidBackend, HidDeviceBackend};
 use crate::descriptor::ReportDescriptor;
 use crate::error::{HidError, HidResult};
@@ -243,7 +241,9 @@ fn device_infos(hid_dev_dir: &Path, dev_path: &str) -> Option<Vec<DeviceInfo>> {
 
 // --- backend API -------------------------------------------------------------
 
-pub(crate) struct HidrawApi;
+/// The Linux `hidraw` backend: device nodes plus sysfs enumeration.
+#[derive(Debug)]
+pub struct HidrawApi;
 
 impl HidBackend for HidrawApi {
     type Device = HidrawDevice;
@@ -289,7 +289,9 @@ impl HidBackend for HidrawApi {
 
 // --- device handle ------------------------------------------------------------
 
-pub(crate) struct HidrawDevice {
+/// An open hidraw device node.
+#[derive(Debug)]
+pub struct HidrawDevice {
     fd: OwnedFd,
     /// Metadata read from sysfs at open time.
     ///
@@ -377,6 +379,8 @@ impl HidrawDevice {
 }
 
 impl HidDeviceBackend for HidrawDevice {
+    type Read<'a> = ReadAsync<'a>;
+
     fn write(&self, data: &[u8]) -> HidResult<usize> {
         if data.is_empty() {
             return Err(HidError::InvalidData {
@@ -385,7 +389,7 @@ impl HidDeviceBackend for HidrawDevice {
         }
         // The kernel always treats `data[0]` as the report number (0 for
         // devices without numbered reports) and consumes it itself, so the
-        // buffer is passed verbatim, leading 0 included — matching the
+        // buffer is passed verbatim, leading 0 included, matching the
         // hidraw contract (Documentation/hid/hidraw.rst). Stripping the 0
         // would shift the payload and reject minimal 2-byte writes with EINVAL.
         let res = loop {
@@ -402,11 +406,8 @@ impl HidDeviceBackend for HidrawDevice {
         Ok(res)
     }
 
-    /// Wake-ups come from the crate's [`reactor`](super::reactor).
-    fn read_async<'a>(
-        &'a self,
-        buf: &'a mut [u8],
-    ) -> impl Future<Output = HidResult<usize>> + Send + 'a {
+    /// Wake-ups come from the crate's epoll reactor.
+    fn read_async<'a>(&'a self, buf: &'a mut [u8]) -> ReadAsync<'a> {
         ReadAsync { dev: self, buf }
     }
 
@@ -534,12 +535,14 @@ impl Drop for HidrawDevice {
 /// Cancel-safe: dropping it before completion leaves any pending report in
 /// the kernel's hidraw queue (the read syscall only happens when the fd is
 /// already readable).
-pub(crate) struct ReadAsync<'a> {
+/// The future [`HidrawDevice::read_async`] returns.
+#[derive(Debug)]
+pub struct ReadAsync<'a> {
     dev: &'a HidrawDevice,
     buf: &'a mut [u8],
 }
 
-impl std::future::Future for ReadAsync<'_> {
+impl core::future::Future for ReadAsync<'_> {
     type Output = HidResult<usize>;
 
     fn poll(

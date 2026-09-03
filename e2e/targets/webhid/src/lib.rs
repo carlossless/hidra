@@ -20,7 +20,7 @@ pub async fn run_webhid_test() -> Result<String, JsValue> {
     let api = Hidra::new().map_err(jerr)?;
 
     // The `WebHidAllowDevicesForUrls` policy pre-grants our fixture, so it shows
-    // up in get_devices() directly — no chooser/user-gesture needed.
+    // up in get_devices() directly, no chooser/user-gesture needed.
     let devices = api.get_devices().await.map_err(jerr)?;
     let dev = devices.into_iter().next().ok_or_else(|| {
         JsValue::from_str("fixture device not in get_devices() (policy applied?)")
@@ -89,7 +89,7 @@ pub async fn run_webhid_test() -> Result<String, JsValue> {
     log.push("send_feature=ok".into());
 
     // WebHID exposes no raw descriptor; hidra reconstructs one from the browser's
-    // parsed collections — must be non-empty.
+    // parsed collections, must be non-empty.
     let rd = dev.report_descriptor().await.map_err(jerr)?;
     if rd.is_empty() {
         return Err(JsValue::from_str("report_descriptor empty"));

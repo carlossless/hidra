@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Facedancer HID device for the hidra conformance suite — emulates a *real*
+"""Facedancer HID device for the hidra conformance suite, emulates a *real*
 USB HID device (Cynthion + Facedancer gateware) with the shared conformance
 identity (VID 0x1209 / PID 0x000c, "hidra-conformance").
 

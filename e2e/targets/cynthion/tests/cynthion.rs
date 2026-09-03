@@ -1,5 +1,5 @@
 //! Conformance suite against a *real* USB HID device emulated by a Cynthion
-//! running Facedancer (`device.py`) — the host under test sees genuine USB HID.
+//! running Facedancer (`device.py`), the host under test sees genuine USB HID.
 //!
 //! Run `device.py` on the Cynthion's host, then point `HIDRA_CYNTHION_CTRL` at
 //! its control server (default 127.0.0.1:9999; from a VM the host IP, e.g.
@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::sync::Mutex;
 
-use conformance::{run_conformance, Caps, VirtualDevice};
+use conformance::{run_conformance, Backend, Caps, VirtualDevice};
 
 fn ctrl_addr() -> String {
     std::env::var("HIDRA_CYNTHION_CTRL").unwrap_or_else(|_| "127.0.0.1:9999".to_string())
@@ -93,7 +93,18 @@ fn numbered() -> bool {
     std::env::var("HIDRA_CYNTHION_NUMBERED").is_ok()
 }
 
-fn cynthion_caps(numbered: bool) -> Caps {
+/// Which hidra backend to drive the same physical device through. Both are
+/// compiled in, so one binary covers the matrix; `run.sh` sets this per run.
+fn backend() -> Backend {
+    match std::env::var("HIDRA_BACKEND").as_deref() {
+        Ok("nusb") => Backend::Nusb,
+        Ok("native") | Err(_) => Backend::Native,
+        Ok(other) => panic!("HIDRA_BACKEND: no backend named {other:?}"),
+    }
+}
+
+fn cynthion_caps(numbered: bool, backend: Backend) -> Caps {
+    let nusb = backend == Backend::Nusb;
     Caps {
         numbered,
         strings: true,
@@ -105,15 +116,16 @@ fn cynthion_caps(numbered: bool) -> Caps {
         // Not on nusb: a Facedancer disconnect leaves the device half-removed and
         // nusb's claimed-interface read hangs instead of observing removal (nusb's
         // own disconnect path is covered by the g_hid gadget test).
-        disconnect: !cfg!(feature = "nusb"),
+        disconnect: !nusb,
         // Only hidraw lacks USB string-descriptor access; nusb reads them over the control pipe.
-        indexed_string_unsupported: cfg!(target_os = "linux") && !cfg!(feature = "nusb"),
+        indexed_string_unsupported: cfg!(target_os = "linux") && !nusb,
         // nusb enumeration is non-invasive (usage only known on open); OS HID
         // backends provide the parsed descriptor at enumerate.
-        usage_at_enumerate: !cfg!(feature = "nusb"),
+        usage_at_enumerate: !nusb,
         bus_type: conformance::BusType::Usb,
         release_number: 0x0100,
         interface_number: 0,
+        backend,
     }
 }
 
@@ -140,9 +152,14 @@ fn cynthion_conformance() {
         }
     };
     let numbered = numbered();
-    let caps = cynthion_caps(numbered);
+    let backend = backend();
+    let caps = cynthion_caps(numbered, backend);
 
     dev.cmd("reset");
-    run_conformance(numbered, &caps, &dev);
-    eprintln!("PASS: cynthion (real USB HID) conformance test");
+    // The backend is a type, so the run-time choice picks the instantiation.
+    match caps.backend {
+        Backend::Native => run_conformance::<hidra::Native>(numbered, &caps, &dev),
+        Backend::Nusb => run_conformance::<hidra::Nusb>(numbered, &caps, &dev),
+    }
+    eprintln!("PASS: cynthion (real USB HID) conformance test on the {backend} backend");
 }

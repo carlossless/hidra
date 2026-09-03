@@ -4,7 +4,7 @@
 # so the driver build iterates without re-installing the toolchain.
 #
 # Everything runs as external commands from PowerShell (no nested `.cmd`), so all
-# output is captured by the caller's `> C:\wu.log 2>&1` — invoking a `.cmd` that
+# output is captured by the caller's `> C:\wu.log 2>&1`, invoking a `.cmd` that
 # `call`s vcvars through the wfvm SSH helper drops the session (rc=255).
 #
 # No WDK-vsix registration: testing whether the WDK MSI alone gives Build Tools
@@ -108,7 +108,7 @@ $pkg = $inf.DirectoryName
 Write-Host "driver package: $pkg"
 
 # Regenerate the catalog so it hashes the built (unsigned) driver files, then
-# sign ONLY the .cat. Do NOT embed-sign the .dll afterwards — that changes the
+# sign ONLY the .cat. Do NOT embed-sign the .dll afterwards, that changes the
 # dll and breaks the catalog's hash, so Windows silently rejects the package
 # (the earlier "devcon returns 0 but driver never lands in the store" bug).
 Write-Host "== catalog + sign (.cat only, trusted 'WFVM WinUHid Test' cert) =="

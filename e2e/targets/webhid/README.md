@@ -1,21 +1,21 @@
 # WebHID backend conformance test
 
 End-to-end test of hidra's **WebHID** backend, running in **Chromium on Linux**
-driven by **Playwright** — the browser analog of the native `e2e/targets/*` crates.
+driven by **Playwright**, the browser analog of the native `e2e/targets/*` crates.
 
 Two crates live here, as separate cargo workspaces so the wasm build's
 `.cargo/config` (which pins the wasm target) doesn't cascade into the native
 fixture:
 
-1. **`fixture/`** — a native crate that creates a `uhid` virtual HID device with
+1. **`fixture/`**, a native crate that creates a `uhid` virtual HID device with
    the shared conformance identity (`1209:000c`, product `hidra-conformance`),
    streams a known input report, answers GET_REPORT, and logs any output /
    set-feature reports it receives.
-2. **`src/lib.rs`** — a `wasm-bindgen` harness (`run_webhid_test`) that drives
+2. **`src/lib.rs`**, a `wasm-bindgen` harness (`run_webhid_test`) that drives
    hidra's WebHID backend against that device (`get_devices` → `open` → device
    info → collections → `read` → `get_feature_report` → `write` →
    `send_feature_report`, asserting payloads).
-3. **`webhid_run.mjs`** — serves `index.html` + the wasm on a fixed port, launches
+3. **`webhid_run.mjs`**, serves `index.html` + the wasm on a fixed port, launches
    Chromium (headed, under Xvfb), reads the harness result.
 
 Device permission is pre-granted with no chooser via the
@@ -45,6 +45,6 @@ XVFB_RUN=$(nix build nixpkgs#xvfb-run --no-link --print-out-paths)/bin/xvfb-run 
 ```
 
 Or `nix run .#test-vm` (with `hidra.autorun`) to run this plus the uhid and nusb
-suites in a reproducible NixOS VM — see
+suites in a reproducible NixOS VM, see
 [`../../platform/linux/test-vm.nix`](../../platform/linux/test-vm.nix). A
 successful run prints `WEBHID_RESULT_OK PASS: …` and exits 0.

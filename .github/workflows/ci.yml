@@ -40,7 +40,7 @@ jobs:
         run: cargo clippy --all-targets --features nusb -- -D warnings
       # Runs as root to open /dev/uhid and the virtual /dev/hidraw node;
       # HIDRA_HIDRAW_REQUIRED makes it fail rather than self-skip if uhid is absent.
-      - name: uhid integration test (hidraw backend)
+      - name: uhid integration test (native backend)
         if: matrix.os == 'ubuntu-latest'
         run: |
           # The Azure runner kernel ships uhid in linux-modules-extra, not the base image.
@@ -56,20 +56,25 @@ jobs:
       # The Azure runner kernel has no USB-gadget support (dummy_hcd absent even
       # from linux-modules-extra), so this self-skips there; runs for real on any
       # kernel with dummy_hcd.
-      - name: nusb gadget integration test (nusb backend)
+      - name: nusb gadget integration test (Backend::Nusb)
         if: matrix.os == 'ubuntu-latest'
         run: |
           if ! sudo modprobe dummy_hcd 2>/dev/null; then
             echo "::warning title=nusb E2E skipped::dummy_hcd unavailable on $(uname -r) (cloud kernel has no USB-gadget support); nusb integration test runs on kernels that ship dummy_hcd"
             exit 0
           fi
-          # linux-nusb enables the nusb backend via its dev-dependency, so no --features flag here.
+          # linux-nusb compiles the nusb backend in via its dev-dependency and
+          # selects it at run time through Caps::backend, so no --features flag here.
+          # control_only needs usb_f_fs: g_hid cannot make a 0-endpoint device.
+          sudo modprobe usb_f_fs || true
           cd e2e
-          bin=$(cargo test -p linux-nusb --test nusb --no-run --message-format=json \
-            | jq -r 'select(.reason=="compiler-artifact" and .target.name=="nusb") | .executable' \
-            | grep . | tail -1)
-          echo "running: $bin"
-          sudo HIDRA_NUSB_REQUIRED=1 "$bin" --nocapture --test-threads=1
+          for t in nusb control_only; do
+            bin=$(cargo test -p linux-nusb --test "$t" --no-run --message-format=json \
+              | jq -r --arg t "$t" 'select(.reason=="compiler-artifact" and .target.name==$t) | .executable' \
+              | grep . | tail -1)
+            echo "running: $bin"
+            sudo HIDRA_NUSB_REQUIRED=1 "$bin" --nocapture --test-threads=1
+          done
 
   wasm:
     name: wasm32 / WebHID
@@ -88,6 +93,11 @@ jobs:
         run: cargo check --target wasm32-unknown-unknown
       - name: Clippy
         run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      # The docs job is native-only, so wasm doc links go unchecked there.
+      - name: Docs
+        run: cargo doc --no-deps --target wasm32-unknown-unknown
+        env:
+          RUSTDOCFLAGS: --cfg=web_sys_unstable_apis -D warnings
 
   msrv:
     name: msrv (${{ matrix.os }})
@@ -100,13 +110,9 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
-          # Keep in sync with `rust-version` in Cargo.toml. Default features
-          # only: the optional `nusb` backend has a higher floor of its own.
-          toolchain: "1.77"
+          # Keep in sync with `rust-version` in Cargo.toml.
+          toolchain: "1.85"
       - uses: Swatinem/rust-cache@v2
-      # The committed lockfile is v4, which 1.77's cargo cannot read; resolve
-      # afresh with the current cargo, then compile with 1.77.
-      - run: cargo +stable generate-lockfile
       - run: cargo check --all-targets
 
   fmt:

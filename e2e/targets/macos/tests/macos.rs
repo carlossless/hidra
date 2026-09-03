@@ -212,8 +212,8 @@ struct MacDevice {
 }
 
 impl MacDevice {
-    /// Cancel, wait for the cancel handler to fire, then release — IOKit's
-    /// required teardown order — exactly once.
+    /// Cancel, wait for the cancel handler to fire, then release, IOKit's
+    /// required teardown order, exactly once.
     fn teardown(&self) {
         if self.torn_down.swap(true, Ordering::SeqCst) {
             return;
@@ -306,6 +306,7 @@ fn macos_caps() -> Caps {
         bus_type: conformance::BusType::Unknown,
         release_number: 0x0000,
         interface_number: -1,
+        backend: conformance::Backend::Native,
     }
 }
 
@@ -340,7 +341,7 @@ fn macos_conformance() {
     for numbered in [false, true] {
         match MacDevice::create(numbered) {
             Some(dev) => {
-                run_conformance(numbered, &caps, &dev);
+                run_conformance::<hidra::Native>(numbered, &caps, &dev);
                 drop(dev);
                 wait_gone();
             }

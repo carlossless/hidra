@@ -476,7 +476,8 @@ fn query_device_info(handle: HANDLE, path: &str, bus_type: BusType) -> DeviceInf
 
 // --- backend API -------------------------------------------------------------
 
-pub(crate) struct WinApi;
+/// The Windows `hid.dll` / `SetupAPI` backend.
+pub struct WinApi;
 
 impl HidBackend for WinApi {
     type Device = WinDevice;
@@ -665,7 +666,8 @@ struct WriteState {
     buf: Vec<u8>,
 }
 
-pub(crate) struct WinDevice {
+/// An open Windows HID handle.
+pub struct WinDevice {
     read: Mutex<ReadState>,
     /// Waker hand-off for `read_async`; see [`ReadWake`] for the lifecycle.
     wake: Arc<ReadWake>,
@@ -997,7 +999,7 @@ impl WinDevice {
     /// `hid_winapi_get_container_id`: the `DEVPKEY_Device_ContainerId` GUID
     /// of the devnode behind this interface, as 16 bytes in the GUID's
     /// in-memory (little-endian fields) layout.
-    pub(crate) fn container_id(&self) -> HidResult<[u8; 16]> {
+    pub fn container_id(&self) -> HidResult<[u8; 16]> {
         let (list, devinfo) = devnode_for_interface(&self.path)?;
         let mut guid: GUID = unsafe { core::mem::zeroed() };
         let mut prop_type: DEVPROPTYPE = 0;
@@ -1024,12 +1026,14 @@ impl WinDevice {
     }
 
     /// `hid_winapi_set_write_timeout`.
-    pub(crate) fn set_write_timeout(&self, timeout_ms: u32) {
+    pub fn set_write_timeout(&self, timeout_ms: u32) {
         self.write_timeout_ms.store(timeout_ms, Ordering::Relaxed);
     }
 }
 
 impl HidDeviceBackend for WinDevice {
+    type Read<'a> = ReadAsync<'a>;
+
     fn write(&self, data: &[u8]) -> HidResult<usize> {
         if data.is_empty() {
             return Err(HidError::InvalidData {
@@ -1106,10 +1110,7 @@ impl HidDeviceBackend for WinDevice {
     /// and fails with [`HidError::Disconnected`] when the device is removed.
     /// Wake-ups come from a one-shot thread-pool wait on the read event
     /// (`RegisterWaitForSingleObject`, raw [`Waker`]s, no executor assumed).
-    fn read_async<'a>(
-        &'a self,
-        buf: &'a mut [u8],
-    ) -> impl Future<Output = HidResult<usize>> + Send + 'a {
+    fn read_async<'a>(&'a self, buf: &'a mut [u8]) -> ReadAsync<'a> {
         ReadAsync { dev: self, buf }
     }
 
@@ -1279,7 +1280,8 @@ impl Drop for WinDevice {
 /// drop may leave the one-shot thread-pool wait armed with a stale waker; it
 /// fires at most once as a spurious (or no-op) wake and is unregistered on the
 /// next registration, or blockingly in `WinDevice`'s `Drop`.
-pub(crate) struct ReadAsync<'a> {
+/// The future [`WinDevice::read_async`] returns.
+pub struct ReadAsync<'a> {
     dev: &'a WinDevice,
     buf: &'a mut [u8],
 }
@@ -1670,6 +1672,24 @@ fn emit_main(b: &mut DescriptorBuilder, kind: ReportKind, flags: MainFlags) {
     };
 }
 
+impl core::fmt::Debug for WinApi {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WinApi").finish()
+    }
+}
+
+impl core::fmt::Debug for WinDevice {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WinDevice").finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Debug for ReadAsync<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ReadAsync").finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1730,7 +1750,7 @@ mod tests {
         // byte, so the returned length is used as-is.
         assert_eq!(WinDevice::get_report_len(0x05, 8, 64), 8);
         // Unnumbered report (leading 0): Windows omits the ID byte from the
-        // count, so add it back — this is the off-by-one the old code applied
+        // count, so add it back, this is the off-by-one the old code applied
         // unconditionally.
         assert_eq!(WinDevice::get_report_len(0, 8, 64), 9);
         // Never exceed the caller's buffer.

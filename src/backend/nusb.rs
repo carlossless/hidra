@@ -1,5 +1,5 @@
-//! USB-transport backend built on [nusb], selected for [`crate::Hidra`] when
-//! the `nusb` feature is enabled.
+//! USB-transport backend built on [nusb], compiled in by the `nusb` feature
+//! and selected as the [`Nusb`](crate::Nusb) type parameter.
 //!
 //! Unlike the per-OS native backends, this one talks to devices with raw USB
 //! interrupt and control transfers, bypassing the OS HID stack entirely.
@@ -202,6 +202,33 @@ fn read_report_descriptor_unclaimed(
     None
 }
 
+#[cfg(not(target_os = "windows"))]
+fn device_control_out(device: &nusb::Device, request: ControlOut<'_>) -> Result<(), TransferError> {
+    device.control_out(request, TRANSFER_TIMEOUT).wait()?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn device_control_in(device: &nusb::Device, request: ControlIn) -> Result<Vec<u8>, TransferError> {
+    device.control_in(request, TRANSFER_TIMEOUT).wait()
+}
+
+#[cfg(target_os = "windows")]
+fn device_control_out(
+    _device: &nusb::Device,
+    _request: ControlOut<'_>,
+) -> Result<(), TransferError> {
+    Err(TransferError::InvalidArgument)
+}
+
+#[cfg(target_os = "windows")]
+fn device_control_in(
+    _device: &nusb::Device,
+    _request: ControlIn,
+) -> Result<Vec<u8>, TransferError> {
+    Err(TransferError::InvalidArgument)
+}
+
 /// Size of each interrupt IN transfer: the longest declared input report
 /// (wire format, including the report ID byte when used) or at least one
 /// packet, rounded up to a multiple of `wMaxPacketSize` as nusb requires.
@@ -214,10 +241,12 @@ fn transfer_length(max_input_wire: usize, max_packet_size: usize) -> usize {
 
 // --- backend API ---------------------------------------------------------------
 
-/// Entry point for the USB backend; the platform backend behind
-/// [`crate::Hidra`] when the `nusb` feature is enabled. See the
-/// [module docs](self) for when to prefer it.
-pub(crate) struct NusbApi;
+/// Entry point for the USB backend; behind a [`crate::Hidra`] built with
+/// [`Nusb`](crate::Nusb). See the module docs for
+/// when to prefer it.
+/// The raw-USB backend: HID reports over nusb transfers.
+#[derive(Debug)]
+pub struct NusbApi;
 
 impl HidBackend for NusbApi {
     type Device = NusbDevice;
@@ -300,16 +329,19 @@ impl HidBackend for NusbApi {
 
 // --- device handle ---------------------------------------------------------------
 
-/// An open USB HID interface; the platform device behind
-/// [`crate::HidDevice`] when the `nusb` feature is enabled.
+/// An open USB HID interface; behind a [`crate::HidDevice`] opened through
+/// [`Nusb`](crate::Nusb).
 ///
 /// Holding this claims the interface exclusively (detached from the kernel
 /// driver on Linux); dropping it releases the interface, returning it to the
-/// OS. All methods take `&self`; the handle is `Send + Sync`.
-pub(crate) struct NusbDevice {
+/// OS; a refused claim degrades the handle to control-only, losing only
+/// interrupt reads. All methods take `&self`; the handle is `Send + Sync`.
+/// A USB interface claimed for HID transfers.
+pub struct NusbDevice {
     /// Keeps the device open; also used for string descriptor requests.
     device: nusb::Device,
-    interface: Interface,
+    /// `None` on a control-only handle, whose transfers go through `device`.
+    interface: Option<Interface>,
     interface_number: u8,
     /// Enumeration-style metadata captured at open time.
     info: DeviceInfo,
@@ -329,16 +361,27 @@ impl NusbDevice {
             message: format!("opening USB device: {e}"),
         })?;
         // Detaches the kernel driver on Linux; plain claim elsewhere.
-        let interface = device
-            .detach_and_claim_interface(interface_number)
-            .wait()
-            .map_err(|e| HidError::OpenFailed {
-                message: format!("claiming interface {interface_number}: {e}"),
-            })?;
+        // macOS never releases keyboard/pointer interfaces, and ep0 needs no claim.
+        let interface = match device.detach_and_claim_interface(interface_number).wait() {
+            Ok(interface) => Some(interface),
+            #[cfg(not(target_os = "windows"))]
+            Err(_) => None,
+            // WinUSB routes control transfers through the interface handle.
+            #[cfg(target_os = "windows")]
+            Err(e) => {
+                return Err(HidError::OpenFailed {
+                    message: format!("claiming interface {interface_number}: {e}"),
+                })
+            }
+        };
 
         // Probe the report descriptor once: it determines report
         // ID usage / input sizes and backs `get_report_descriptor`.
-        let report_descriptor = read_report_descriptor(&interface).unwrap_or_default();
+        let report_descriptor = match interface.as_ref() {
+            Some(interface) => read_report_descriptor(interface),
+            None => read_report_descriptor_unclaimed(&device, interface_number),
+        }
+        .unwrap_or_default();
         let parsed = ReportDescriptor::parse(&report_descriptor).ok();
         let max_input_wire = parsed
             .as_ref()
@@ -349,38 +392,48 @@ impl NusbDevice {
         // 1.11 §4.4 mandates an interrupt IN endpoint, but control-only devices
         // that declare bNumEndpoints 0 exist in the wild and are perfectly
         // usable through GET_REPORT/SET_REPORT on the control pipe.
-        let mut in_address = None;
-        let mut out_address = None;
-        let alt0 = interface
-            .descriptors()
-            .find(|d| d.alternate_setting() == 0)
-            .or_else(|| interface.descriptor());
-        if let Some(desc) = alt0 {
-            for ep in desc.endpoints() {
-                if ep.transfer_type() != TransferType::Interrupt {
-                    continue;
+        let (in_endpoint, out_endpoint) = match interface.as_ref() {
+            Some(interface) => {
+                let mut in_address = None;
+                let mut out_address = None;
+                let alt0 = interface
+                    .descriptors()
+                    .find(|d| d.alternate_setting() == 0)
+                    .or_else(|| interface.descriptor());
+                if let Some(desc) = alt0 {
+                    for ep in desc.endpoints() {
+                        if ep.transfer_type() != TransferType::Interrupt {
+                            continue;
+                        }
+                        match ep.direction() {
+                            Direction::In if in_address.is_none() => {
+                                in_address = Some(ep.address())
+                            }
+                            Direction::Out if out_address.is_none() => {
+                                out_address = Some(ep.address())
+                            }
+                            _ => {}
+                        }
+                    }
                 }
-                match ep.direction() {
-                    Direction::In if in_address.is_none() => in_address = Some(ep.address()),
-                    Direction::Out if out_address.is_none() => out_address = Some(ep.address()),
-                    _ => {}
-                }
+                let in_endpoint: Option<Endpoint<Interrupt, In>> = in_address
+                    .map(|address| {
+                        interface.endpoint(address).map_err(|e| {
+                            HidError::backend(format!("opening interrupt IN endpoint: {e}"))
+                        })
+                    })
+                    .transpose()?;
+                let out_endpoint = match out_address {
+                    Some(address) => Some(Mutex::new(
+                        interface.endpoint::<Interrupt, Out>(address).map_err(|e| {
+                            HidError::backend(format!("opening interrupt OUT endpoint: {e}"))
+                        })?,
+                    )),
+                    None => None,
+                };
+                (in_endpoint, out_endpoint)
             }
-        }
-        let in_endpoint: Option<Endpoint<Interrupt, In>> = in_address
-            .map(|address| {
-                interface
-                    .endpoint(address)
-                    .map_err(|e| HidError::backend(format!("opening interrupt IN endpoint: {e}")))
-            })
-            .transpose()?;
-        let out_endpoint = match out_address {
-            Some(address) => Some(Mutex::new(
-                interface.endpoint::<Interrupt, Out>(address).map_err(|e| {
-                    HidError::backend(format!("opening interrupt OUT endpoint: {e}"))
-                })?,
-            )),
-            None => None,
+            None => (None, None),
         };
 
         let transfer_len = match in_endpoint.as_ref() {
@@ -405,7 +458,17 @@ impl NusbDevice {
             info.usage = usage;
         }
 
-        let queue = Arc::new(ReportQueue::new("USB reader thread terminated"));
+        let queue = Arc::new(ReportQueue::new(
+            match (interface.is_some(), in_endpoint.is_some()) {
+                (_, true) => "USB reader thread terminated",
+                (true, false) => {
+                    "this interface declares no interrupt IN endpoint; use get_input_report"
+                }
+                (false, false) => {
+                    "interrupt reads need a claimed interface, and another driver holds this one"
+                }
+            },
+        ));
         let reader = match in_endpoint {
             Some(in_endpoint) => {
                 let queue = Arc::clone(&queue);
@@ -437,6 +500,23 @@ impl NusbDevice {
         })
     }
 
+    /// Control transfer to this interface, through the claim if there is one, else ep0.
+    fn control_out_req(&self, request: ControlOut<'_>) -> Result<(), TransferError> {
+        match self.interface.as_ref() {
+            Some(interface) => interface.control_out(request, TRANSFER_TIMEOUT).wait()?,
+            None => device_control_out(&self.device, request)?,
+        };
+        Ok(())
+    }
+
+    /// [`control_out_req`](Self::control_out_req)'s IN counterpart.
+    fn control_in_req(&self, request: ControlIn) -> Result<Vec<u8>, TransferError> {
+        match self.interface.as_ref() {
+            Some(interface) => interface.control_in(request, TRANSFER_TIMEOUT).wait(),
+            None => device_control_in(&self.device, request),
+        }
+    }
+
     /// `GET_REPORT` shared by feature and input reports. `buf[0]` carries the
     /// report ID on entry; for ID 0 the returned data is written at
     /// `buf[1..]` so the ID stays in byte 0.
@@ -455,19 +535,14 @@ impl NusbDevice {
         let offset = usize::from(report_number == 0);
         let length = (buf.len() - offset).min(usize::from(u16::MAX)) as u16;
         let data = self
-            .interface
-            .control_in(
-                ControlIn {
-                    control_type: ControlType::Class,
-                    recipient: Recipient::Interface,
-                    request: HID_GET_REPORT,
-                    value: (report_type << 8) | u16::from(report_number),
-                    index: u16::from(self.interface_number),
-                    length,
-                },
-                TRANSFER_TIMEOUT,
-            )
-            .wait()
+            .control_in_req(ControlIn {
+                control_type: ControlType::Class,
+                recipient: Recipient::Interface,
+                request: HID_GET_REPORT,
+                value: (report_type << 8) | u16::from(report_number),
+                index: u16::from(self.interface_number),
+                length,
+            })
             .map_err(|e| transfer_error(operation, e))?;
         let len = data.len().min(buf.len() - offset);
         buf[offset..offset + len].copy_from_slice(&data[..len]);
@@ -476,6 +551,8 @@ impl NusbDevice {
 }
 
 impl HidDeviceBackend for NusbDevice {
+    type Read<'a> = ReadAsync<'a>;
+
     /// Send an output report. `data[0]` is the report ID; like hidapi's
     /// libusb backend, a 0 ID byte is stripped before transmission on both
     /// the interrupt and the `SET_REPORT` control path, while a nonzero ID
@@ -506,20 +583,15 @@ impl HidDeviceBackend for NusbDevice {
             None => {
                 // No interrupt OUT endpoint: use SET_REPORT(Output), like
                 // hidapi.
-                self.interface
-                    .control_out(
-                        ControlOut {
-                            control_type: ControlType::Class,
-                            recipient: Recipient::Interface,
-                            request: HID_SET_REPORT,
-                            value: (REPORT_TYPE_OUTPUT << 8) | u16::from(report_number),
-                            index: u16::from(self.interface_number),
-                            data: payload,
-                        },
-                        TRANSFER_TIMEOUT,
-                    )
-                    .wait()
-                    .map_err(|e| transfer_error("SET_REPORT (output)", e))?;
+                self.control_out_req(ControlOut {
+                    control_type: ControlType::Class,
+                    recipient: Recipient::Interface,
+                    request: HID_SET_REPORT,
+                    value: (REPORT_TYPE_OUTPUT << 8) | u16::from(report_number),
+                    index: u16::from(self.interface_number),
+                    data: payload,
+                })
+                .map_err(|e| transfer_error("SET_REPORT (output)", e))?;
                 Ok(data.len())
             }
         }
@@ -538,10 +610,7 @@ impl HidDeviceBackend for NusbDevice {
     /// works under tokio, async-std, smol or a hand-rolled executor) and
     /// cancel-safe: reports are only dequeued inside `poll`, so dropping it
     /// never loses input; pending reports stay queued for the next read.
-    fn read_async<'a>(
-        &'a self,
-        buf: &'a mut [u8],
-    ) -> impl Future<Output = HidResult<usize>> + Send + 'a {
+    fn read_async<'a>(&'a self, buf: &'a mut [u8]) -> ReadAsync<'a> {
         ReadAsync {
             queue: &self.queue,
             buf,
@@ -558,20 +627,15 @@ impl HidDeviceBackend for NusbDevice {
         }
         let report_number = data[0];
         let payload = payload_after_report_id(data);
-        self.interface
-            .control_out(
-                ControlOut {
-                    control_type: ControlType::Class,
-                    recipient: Recipient::Interface,
-                    request: HID_SET_REPORT,
-                    value: (REPORT_TYPE_FEATURE << 8) | u16::from(report_number),
-                    index: u16::from(self.interface_number),
-                    data: payload,
-                },
-                TRANSFER_TIMEOUT,
-            )
-            .wait()
-            .map_err(|e| transfer_error("SET_REPORT (feature)", e))?;
+        self.control_out_req(ControlOut {
+            control_type: ControlType::Class,
+            recipient: Recipient::Interface,
+            request: HID_SET_REPORT,
+            value: (REPORT_TYPE_FEATURE << 8) | u16::from(report_number),
+            index: u16::from(self.interface_number),
+            data: payload,
+        })
+        .map_err(|e| transfer_error("SET_REPORT (feature)", e))?;
         Ok(())
     }
 
@@ -653,7 +717,8 @@ impl Drop for NusbDevice {
 /// Cancel-safe: reports are popped from the shared queue only inside
 /// [`Future::poll`], so dropping the future before completion leaves any
 /// pending report queued for the next read.
-struct ReadAsync<'a> {
+/// The future [`NusbDevice::read_async`] returns.
+pub struct ReadAsync<'a> {
     queue: &'a ReportQueue,
     buf: &'a mut [u8],
 }
@@ -708,6 +773,20 @@ fn reader_loop(
         }
     }
     queue.set_shutdown();
+}
+
+impl core::fmt::Debug for NusbDevice {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("NusbDevice")
+            .field("interface_number", &self.interface_number)
+            .finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Debug for ReadAsync<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ReadAsync").finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

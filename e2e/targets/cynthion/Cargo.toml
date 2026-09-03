@@ -6,9 +6,8 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
+# Both backends are compiled in; HIDRA_BACKEND selects one per run, so a single
+# binary covers the hidraw/nusb matrix against the same physical device.
 [dev-dependencies]
-hidra = { path = "../../.." }
+hidra = { path = "../../..", features = ["nusb"] }
 conformance = { path = "../../shared/conformance" }
-
-[features]
-nusb = ["hidra/nusb", "conformance/nusb"]

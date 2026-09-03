@@ -4,19 +4,19 @@
 [![crates.io](https://img.shields.io/crates/v/hidra.svg)](https://crates.io/crates/hidra)
 [![docs.rs](https://docs.rs/hidra/badge.svg)](https://docs.rs/hidra)
 
-A pure-Rust HID library with a unified async API (with blocking `.wait()` on
-native targets, like nusb), a WebHID backend for WebAssembly, and standalone
-HID report-descriptor primitives.
+A pure-Rust HID library: one async API across Linux, Windows, macOS and the
+browser, with blocking `.wait()` on native targets, plus standalone HID
+report-descriptor primitives.
 
-No C library is linked. One `Hidra` / `HidDevice` regardless of backend:
-
-| Platform | Backend | Notes |
-|----------|---------|-------|
+| Platform | `Native` | Notes |
+|----------|-------------------|-------|
 | Linux | `hidraw` device nodes, sysfs enumeration | no libudev dependency |
 | Windows | `hid.dll` + SetupAPI (via `windows-sys` declarations) | |
 | macOS | IOHIDManager (direct framework FFI) | |
-| any platform [nusb](https://docs.rs/nusb) supports | raw USB transfers via nusb | optional `nusb` feature, swaps in a pure-Rust USB transport |
-| Browsers | [WebHID](https://wicg.github.io/webhid/) via `web-sys` | same `Hidra`/`HidDevice`, await-only |
+| Browsers | [WebHID](https://wicg.github.io/webhid/) via `web-sys` | same types, await-only |
+
+`Nusb` adds raw USB transfers via [nusb](https://docs.rs/nusb) on the
+three native targets, see [Backends](#backends).
 
 ## Quick start
 
@@ -40,29 +40,61 @@ let len = device.read(&mut buf).wait()?;          // one input report
 
 See `examples/` for runnable versions (`cargo run --example enumerate`).
 
+## Backends
+
+The backend is a type parameter, so the choice is made at the call site and a
+backend this build does not have cannot be named:
+
+| Type | Talks to | Exists when |
+|------|----------|-------------|
+| `Native` (default) | the OS HID stack: hidraw, `hid.dll`, IOHIDManager | Linux, Windows, macOS |
+| `Nusb` | raw USB interrupt/control transfers, bypassing the OS HID stack | the `nusb` feature is on, and the target is Linux, macOS or Windows |
+
+```rust
+use hidra::{Hidra, Nusb};
+
+let native = Hidra::new()?;                    // the OS HID stack
+let usb = Hidra::<Nusb>::builder().build()?;   // raw USB transfers
+```
+
+`Hidra::new()` is on `Hidra<Native>` for the same reason `HashMap::new` is on
+the `RandomState` impl: a default type parameter does not drive inference, so
+it would otherwise need a turbofish. Other backends go through `builder()`.
+
+The two are different types, so a variable that holds either is yours to
+declare; `examples/backends.rs` is a complete one in about thirty lines,
+forwarding only the methods that program uses.
+
+Reach for `Nusb` when the OS HID stack has no node for a device, restricts it,
+or must be taken out of the way; `get_indexed_string` needs it too. It sees
+**USB devices only**, **claims the whole interface** while open, and needs
+raw-USB permissions (udev rules on Linux, a WinUSB-compatible driver on
+Windows). The per-OS extensions (`set_open_exclusive` on macOS, `container_id`
+and `set_write_timeout` on Windows) are inherent to `Native`, so calling one
+through `Nusb` is a compile error rather than a run-time `Unsupported`.
+
+The `nusb` feature is additive: the second backend is compiled in beside the
+first, so enabling it cannot change which backend another crate ends up using.
+
 ## Async and blocking
 
-Following nusb's design, every `Hidra` / `HidDevice` method returns an
-`impl Future`. Drive it either way:
+Following nusb's design, those futures drive either way:
 
-- `.await` it in any async runtime (the futures are runtime-agnostic: plain
-  `Waker` wake-ups, no tokio/async-std dependency).
-- `.wait()` it to block the current thread (a tiny built-in executor). This
-  is the `MaybeFuture` extension trait, available on native targets only;
-  `wasm32` cannot block, so there you must `.await`.
+- `.await` in any async runtime: runtime-agnostic (plain `Waker` wake-ups, no
+  tokio/async-std dependency).
+- `.wait()` to block the current thread, via the `MaybeFuture` extension trait.
+  Native only; `wasm32` cannot block, so there you must `.await`.
 
 ```rust,ignore
 let len = device.read(&mut buf).await?;          // async
 let len = device.read(&mut buf).wait()?;         // blocking (native)
 ```
 
-Input reads genuinely wait on the OS (a `poll(2)` reactor on Linux,
-overlapped-event waits on Windows, the IOHIDManager callback queue on macOS,
-nusb's own I/O with the `nusb` feature, `inputreport` events on WebHID).
-`read` resolves with exactly one input report (never empty); for a timeout
-use your runtime's combinator (e.g. `tokio::time::timeout`). On unplug it
-fails with `HidError::Disconnected`, and the read future is cancel-safe:
-dropping it never loses a report. Writes and feature reports complete
-promptly; their futures simply run the synchronous OS call when polled.
+Reads genuinely wait on the OS (`poll(2)` on Linux, overlapped events on
+Windows, the IOHIDManager queue on macOS, nusb's I/O under `Nusb`,
+`inputreport` on WebHID). `read` resolves with exactly one report, never empty,
+and is cancel-safe: dropping the future never loses one. On unplug it fails
+with `HidError::Disconnected`; for a timeout use your runtime's combinator.
+Writes and feature reports run the synchronous OS call when polled.
 
 [`MaybeFuture`]: https://docs.rs/hidra/latest/hidra/trait.MaybeFuture.html

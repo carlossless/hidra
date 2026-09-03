@@ -428,7 +428,8 @@ unsafe fn device_infos(device: IOHIDDeviceRef) -> Vec<DeviceInfo> {
 
 // --- backend API -----------------------------------------------------------------
 
-pub(crate) struct MacApi {
+/// The macOS `IOHIDManager` backend.
+pub struct MacApi {
     /// Whether `open`/`open_path` seize the device
     /// (`hid_darwin_set_open_exclusive`). Defaults to shared.
     open_exclusive: AtomicBool,
@@ -439,12 +440,12 @@ pub(crate) struct MacApi {
 
 impl MacApi {
     /// `hid_darwin_set_open_exclusive` equivalent.
-    pub(crate) fn set_open_exclusive(&self, exclusive: bool) {
+    pub fn set_open_exclusive(&self, exclusive: bool) {
         self.open_exclusive.store(exclusive, Ordering::Relaxed);
     }
 
     /// `hid_darwin_get_open_exclusive` equivalent.
-    pub(crate) fn open_exclusive(&self) -> bool {
+    pub fn open_exclusive(&self) -> bool {
         self.open_exclusive.load(Ordering::Relaxed)
     }
 }
@@ -675,7 +676,8 @@ fn read_thread(device: SendRef<c_void>, mode: SendRef<c_void>, shared: Arc<Share
     }
 }
 
-pub(crate) struct MacDevice {
+/// An open `IOHIDDevice`.
+pub struct MacDevice {
     device: IOHIDDeviceRef,
     /// Options the device was opened with; `IOHIDDeviceClose` wants them back.
     open_options: IOOptionBits,
@@ -889,16 +891,15 @@ impl MacDevice {
 }
 
 impl HidDeviceBackend for MacDevice {
+    type Read<'a> = ReadAsync<'a>;
+
     fn write(&self, data: &[u8]) -> HidResult<usize> {
         self.set_report(IOHID_REPORT_TYPE_OUTPUT, data)
     }
 
     /// Wake-ups come from the `IOKit` callbacks on the read thread (raw
     /// [`Waker`]s, no executor assumed).
-    fn read_async<'a>(
-        &'a self,
-        buf: &'a mut [u8],
-    ) -> impl std::future::Future<Output = HidResult<usize>> + Send + 'a {
+    fn read_async<'a>(&'a self, buf: &'a mut [u8]) -> ReadAsync<'a> {
         ReadAsync { dev: self, buf }
     }
 
@@ -1027,7 +1028,8 @@ impl Drop for MacDevice {
 /// queued for the next read. A waker left behind by a dropped future causes
 /// at most one spurious wake-up; the queue drains its whole waker list on
 /// every wake, so stale entries never accumulate.
-pub(crate) struct ReadAsync<'a> {
+/// The future [`MacDevice::read_async`] returns.
+pub struct ReadAsync<'a> {
     dev: &'a MacDevice,
     buf: &'a mut [u8],
 }
@@ -1041,6 +1043,24 @@ impl std::future::Future for ReadAsync<'_> {
     ) -> std::task::Poll<Self::Output> {
         let this = self.get_mut();
         this.dev.shared.queue.poll_read(this.buf, cx)
+    }
+}
+
+impl core::fmt::Debug for MacApi {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MacApi").finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Debug for MacDevice {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MacDevice").finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Debug for ReadAsync<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ReadAsync").finish_non_exhaustive()
     }
 }
 

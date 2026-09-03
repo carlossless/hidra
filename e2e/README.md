@@ -29,13 +29,8 @@ e2e/
 | `macos` | macOS | `IOHIDUserDevice` | root + SIP/AMFI off + signed entitlement — see [`platform/macos`](platform/macos/README.md) |
 | `windows` | Windows | WinUHid driver | test-signed driver — see [`platform/windows`](platform/windows/README.md) |
 | `webhid` | Linux + Chromium | `uhid` via Playwright | root; own sub-tree (wasm harness + native fixture) — see [`targets/webhid`](targets/webhid/README.md) |
+| `webusb` | Linux + Chromium | vendor-class FunctionFS gadget via Playwright | root; the interface must not be HID-class, so `usb_f_hid` will not do — see [`targets/webusb`](targets/webusb/README.md) |
 | `cynthion` | all | real USB via Cynthion + Facedancer | emulated *real* hardware, not virtual, on both backends — see [`targets/cynthion`](targets/cynthion/README.md) |
-
-The WebUSB backend (`hidra::webusb`) has no target here: it exists for devices
-that declare a vendor-specific interface class, which neither `uhid` nor the
-`g_hid` gadget can present, and Chromium has no WebUSB equivalent of the
-`WebHidAllowDevicesForUrls` policy to skip the chooser. Covering it needs real
-hardware — most plausibly the `cynthion` route.
 
 Which hidra backend a suite drives is [`Caps::backend`](shared/conformance/src/lib.rs),
 picked at run time, so the whole workspace builds at once and one binary can
@@ -51,6 +46,7 @@ sudo -E cargo test -p linux-nusb      # Linux, needs dummy_hcd
 cargo test -p macos                   # macOS: sign + run as root (platform/macos)
 cargo test -p windows                 # Windows: needs the WinUHid driver (platform/windows)
 cd targets/webhid && ./run.sh         # WebHID via Playwright/Xvfb/Chromium
+cd targets/webusb && ./run.sh         # WebUSB via Playwright/Xvfb/Chromium
 ./targets/cynthion/run.sh             # real USB via Cynthion (targets/cynthion)
 ```
 

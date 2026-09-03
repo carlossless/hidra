@@ -927,10 +927,19 @@ pub mod webusb {
                 .map(|info| Device { info }))
         }
 
-        /// Devices the user has already granted access to, one entry per
-        /// interface.
-        pub async fn device_list(&self) -> HidResult<Vec<DeviceInfo>> {
-            self.backend.device_list().await
+        /// Devices the user has already granted access to.
+        ///
+        /// Unlike the chooser, this needs no user gesture, so it is the way in
+        /// for a device granted ahead of time (a `WebUsbAllowDevicesForUrls`
+        /// policy, or an earlier `request_device` the browser remembered).
+        pub async fn device_list(&self) -> HidResult<Vec<Device>> {
+            Ok(self
+                .backend
+                .device_list()
+                .await?
+                .into_iter()
+                .map(|info| Device { info })
+                .collect())
         }
     }
 
@@ -961,6 +970,16 @@ pub mod webusb {
         /// Product ID.
         pub fn product_id(&self) -> u16 {
             self.info.product_id()
+        }
+
+        /// Serial number string, if the device reports one.
+        pub fn serial_number(&self) -> Option<&str> {
+            self.info.serial_number()
+        }
+
+        /// Product string, if the device reports one.
+        pub fn product_string(&self) -> Option<&str> {
+            self.info.product_string()
         }
     }
 

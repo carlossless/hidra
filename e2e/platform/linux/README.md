@@ -1,8 +1,9 @@
 # Linux testing VM
 
-Covers all three Linux paths against software virtual devices: **hidraw** (kernel
+Covers all four Linux paths against software virtual devices: **hidraw** (kernel
 `uhid`), **nusb** (`dummy_hcd` + configfs `g_hid` gadget), and **WebHID** (wasm32,
-a `uhid` device read through headless Chromium).
+a `uhid` device read through headless Chromium), plus **WebUSB** (wasm32, a
+vendor-class FunctionFS gadget claimed through Chromium).
 
 Codified in [`test-vm.nix`](test-vm.nix): `nix run .#test-vm` (interactive, log in
 as root, `run-hidra-tests`) or headless CI (auto-run + poweroff, results on the
@@ -17,6 +18,7 @@ kernels often omit the USB-gadget ones (`dummy_hcd` is the usual missing one):
 ```
 uhid                                       # hidraw path: /dev/uhid
 dummy_hcd libcomposite usb_f_hid configfs  # nusb path: virtual USB gadget
+usb_f_fs                                   # WebUSB path: vendor-class FunctionFS gadget
 ```
 
 ## Privileges

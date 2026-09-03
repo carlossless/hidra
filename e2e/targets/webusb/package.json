@@ -1,0 +1,12 @@
+{
+  "name": "hidra-webusb-test",
+  "private": true,
+  "type": "module",
+  "description": "Playwright WebUSB conformance driver for hidra",
+  "scripts": {
+    "test": "node webusb_run.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0"
+  }
+}

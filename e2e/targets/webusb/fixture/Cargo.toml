@@ -1,0 +1,16 @@
+# Native fixture: a vendor-class USB gadget (dummy_hcd + configfs FunctionFS)
+# for the WebUSB conformance harness to talk to.
+[package]
+name = "webusb-ffs-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "webusb_ffs_fixture"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[workspace]

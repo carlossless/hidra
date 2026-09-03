@@ -76,17 +76,11 @@ impl WebUsbApi {
     }
 
     /// Devices the user has already granted access to.
-    pub(crate) async fn device_list(&self) -> HidResult<Vec<DeviceInfo>> {
+    pub(crate) async fn device_list(&self) -> HidResult<Vec<nusb::DeviceInfo>> {
         let devices = nusb::list_devices()
             .await
             .map_err(|e| HidError::backend(format!("navigator.usb.getDevices: {e}")))?;
-        Ok(devices
-            .flat_map(|dev| {
-                dev.interfaces()
-                    .map(|i| device_info(&dev, i.interface_number()))
-                    .collect::<Vec<_>>()
-            })
-            .collect())
+        Ok(devices.collect())
     }
 
     /// Show the browser's device chooser, resolving with the granted device.

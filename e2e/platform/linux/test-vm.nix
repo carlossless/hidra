@@ -69,6 +69,12 @@ let
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 ${pkgs.nodejs_22}/bin/npm install
       ./run.sh   # builds the fixture crate itself
 
+      echo "==================== WebUSB (Chromium + Playwright) ===================="
+      cd /root/hidra/e2e/targets/webusb
+      wasm-pack build --target web --dev
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 ${pkgs.nodejs_22}/bin/npm install
+      ./run.sh   # builds the fixture crate itself
+
       echo "==================== ALL HIDRA LINUX TESTS PASSED ===================="
     '';
   };
@@ -81,6 +87,7 @@ in
     "dummy_hcd"
     "libcomposite"
     "usb_f_hid"
+    "usb_f_fs"
     "configfs"
   ];
 

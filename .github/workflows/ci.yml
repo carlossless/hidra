@@ -89,6 +89,12 @@ jobs:
         run: cargo check --target wasm32-unknown-unknown
       - name: Clippy
         run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      # The docs job only builds the native target, so a doc link to a
+      # native-only item breaks wasm docs without CI noticing.
+      - name: Docs
+        run: cargo doc --no-deps --target wasm32-unknown-unknown
+        env:
+          RUSTDOCFLAGS: --cfg=web_sys_unstable_apis -D warnings
 
   msrv:
     name: msrv (${{ matrix.os }})

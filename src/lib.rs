@@ -5,21 +5,38 @@
 //! hidra talks to HID devices through native OS interfaces, no C library is
 //! linked:
 //!
-//! | Target | [`Backend::Native`] | [`Backend::Nusb`] (feature `nusb`) |
-//! |--------|---------------------|------------------------------------|
-//! | Linux   | `hidraw` device nodes + sysfs enumeration | USB interrupt/control transfers via [nusb] |
-//! | Windows | `hid.dll` / `SetupAPI` via `windows-sys` declarations | as above |
-//! | macOS   | `IOHIDManager` via direct framework FFI | as above |
+#![cfg_attr(
+    not(target_arch = "wasm32"),
+    doc = "| Target | [`Backend::Native`] | [`Backend::Nusb`] (feature `nusb`) |
+|--------|---------------------|------------------------------------|
+| Linux   | `hidraw` device nodes + sysfs enumeration | USB interrupt/control transfers via [nusb] |
+| Windows | `hid.dll` / `SetupAPI` via `windows-sys` declarations | as above |
+| macOS   | `IOHIDManager` via direct framework FFI | as above |
+"
+)]
+#![cfg_attr(
+    target_arch = "wasm32",
+    doc = "| Target | Native | `nusb` (feature `nusb`) |
+|--------|--------|-------------------------|
+| Linux   | `hidraw` device nodes + sysfs enumeration | USB interrupt/control transfers via [nusb] |
+| Windows | `hid.dll` / `SetupAPI` via `windows-sys` declarations | as above |
+| macOS   | `IOHIDManager` via direct framework FFI | as above |
+"
+)]
 //!
 //! On WebAssembly the backend is always
-//! [WebHID](https://wicg.github.io/webhid/) via `web-sys`, and [`Backend`]
-//! does not exist.
+//! [`WebHID`](https://wicg.github.io/webhid/) via `web-sys`, and the `Backend`
+//! selector does not exist.
 //!
-//! The two native backends coexist in one build: [`Backend`] selects between
-//! them per [`Hidra`] instance, at run time, so a program can fall back from
-//! one to the other, or drive two devices through different backends at once.
-//! [`Hidra::new`] uses [`Backend::default`] (native wherever there is one);
-//! [`Hidra::builder`] picks.
+#![cfg_attr(
+    not(target_arch = "wasm32"),
+    doc = "The two native backends coexist in one build: [`Backend`] selects between
+them per [`Hidra`] instance, at run time, so a program can fall back from
+one to the other, or drive two devices through different backends at once.
+[`Hidra::new`] uses [`Backend::default`] (native wherever there is one);
+[`Hidra::builder`] picks.
+"
+)]
 //!
 //! ```no_run
 //! # #[cfg(all(not(target_arch = "wasm32"), feature = "nusb"))] fn demo() -> hidra::HidResult<()> {

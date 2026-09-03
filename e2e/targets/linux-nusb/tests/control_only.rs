@@ -1,17 +1,11 @@
-//! hidra's `nusb` backend against a HID device with **no endpoints at all**.
+//! hidra's `nusb` backend against a HID device with no endpoints.
 //!
-//! HID 1.11 §4.4 mandates an interrupt IN endpoint, but control-only devices
-//! that declare `bNumEndpoints` 0 exist in the wild and are perfectly usable
-//! through GET_REPORT/SET_REPORT on the control pipe. The Sinowealth ISP
-//! bootloaders are exactly that shape, and the backend's fallback for them was
-//! going untested: `g_hid` always creates an interrupt IN endpoint, so the
-//! `nusb` conformance test cannot produce this device.
+//! Control-only devices that declare `bNumEndpoints` 0 exist, the Sinowealth
+//! ISP bootloaders among them. `g_hid` always creates an interrupt IN endpoint
+//! and so cannot produce one; FunctionFS can, at the price of servicing the
+//! interface's control requests here.
 //!
-//! FunctionFS can, because userspace supplies the descriptors verbatim, at the
-//! price of servicing the interface's control requests by hand.
-//!
-//! Needs root; self-skips otherwise unless `HIDRA_NUSB_REQUIRED=1` forces a
-//! failure. Run: `sudo -E $(rustup which cargo) test -p linux-nusb`.
+//! Needs root; self-skips otherwise unless `HIDRA_NUSB_REQUIRED=1`.
 #![cfg(target_os = "linux")]
 
 use std::ffi::CString;
@@ -56,8 +50,7 @@ fn w(path: &str, val: &str) -> std::io::Result<()> {
 /// Interface descriptor only: HID class, and deliberately no endpoints.
 fn function_descriptors(report_desc_len: usize) -> Vec<u8> {
     let mut d = vec![9, 0x04, 0, 0, 0, 0x03, 0x00, 0x00, 1];
-    // The HID class descriptor still declares the report descriptor, which is
-    // how the backend learns its length before asking for it.
+    // The backend reads the report descriptor length from here before asking.
     let len = report_desc_len as u16;
     d.extend_from_slice(&[
         9,
@@ -319,7 +312,6 @@ fn nusb_control_only_device() {
         .build()
         .expect("open nusb backend");
 
-    // Enumeration must still find it: no endpoints does not mean no device.
     let deadline = Instant::now() + Duration::from_secs(5);
     let info = loop {
         let found = api
@@ -354,7 +346,6 @@ fn nusb_control_only_device() {
         got.len()
     );
 
-    // Feature reports are the whole API on a device like this.
     let mut buf = vec![0u8; 1 + FEAT_PAYLOAD.len()];
     buf[0] = RID_FEATURE;
     let n = dev
@@ -379,8 +370,6 @@ fn nusb_control_only_device() {
     );
     eprintln!("send_feature_report: SET_REPORT(Feature) reached the device");
 
-    // With no interrupt OUT endpoint, write has to fall back to
-    // SET_REPORT(Output) rather than fail.
     let mut out = vec![RID_FEATURE];
     out.extend_from_slice(&OUT_PAYLOAD);
     dev.write(&out)
@@ -393,8 +382,6 @@ fn nusb_control_only_device() {
     );
     eprintln!("write: fell back to SET_REPORT(Output)");
 
-    // And with no interrupt IN endpoint, read must refuse rather than block
-    // forever waiting for a report that can never arrive.
     let started = Instant::now();
     let mut inbuf = [0u8; 64];
     let err = dev

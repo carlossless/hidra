@@ -9,13 +9,11 @@ license = "MIT"
 repository = "https://github.com/carlossless/hidra"
 keywords = ["hid", "usb", "webhid", "hidraw"]
 categories = ["hardware-support", "api-bindings", "wasm"]
-# A whitelist, because `cargo package` also picks up untracked files: anything
-# left lying in the tree would otherwise be published.
+# A whitelist: `cargo package` picks up untracked files too.
 include = ["src/**/*", "examples/**/*", "README.md", "LICENSE"]
 
-# Every backend is per-target, so a target missing here means its public API
-# (container_id and set_write_timeout on Windows, set_open_exclusive on macOS)
-# is absent from the rendered docs. WebHID needs the unstable web-sys cfg.
+# Backends are per-target: a target missing here loses its API from the docs.
+# WebHID needs the unstable web-sys cfg.
 [package.metadata.docs.rs]
 all-features = true
 default-target = "x86_64-unknown-linux-gnu"
@@ -43,9 +41,8 @@ doc_markdown = "warn"
 
 [features]
 default = ["nusb"]
-# Additive: compiles the nusb USB-transport backend in *beside* the per-OS one,
-# for `Backend::Nusb` to select at run time. Enabling it anywhere in a
-# dependency graph cannot change which backend another crate ends up using.
+# Additive: compiled in beside the per-OS backend, never replacing it, so
+# enabling it cannot change which backend another crate gets.
 nusb = ["dep:nusb"]
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]

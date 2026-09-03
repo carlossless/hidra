@@ -1,10 +1,8 @@
-//! Backend traits and backend selection.
+//! Backend traits and the types implementing them.
 //!
-//! Every native backend implements [`HidBackend`] and [`HidDeviceBackend`].
-//! Which one a [`crate::Hidra`] talks to is chosen at run time rather than at
-//! compile time: [`dispatch`] holds one enum variant per backend compiled into
-//! the build, and the `native` module in `lib.rs` is written against that enum
-//! and the traits alone.
+//! Every native backend implements [`HidBackend`] and [`HidDeviceBackend`];
+//! [`crate::Hidra`] is generic over the pair, so which one a program talks to
+//! is a type it names rather than a value it passes.
 //!
 //! Backends are compiled in additively. The per-OS backend for the target is
 //! always available; the `nusb` feature *adds* the USB-transport backend

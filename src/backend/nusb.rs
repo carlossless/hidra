@@ -1,6 +1,5 @@
 //! USB-transport backend built on [nusb], compiled in by the `nusb` feature
-//! and selected at run time with
-//! [`Nusb`](crate::Nusb).
+//! and selected as the [`Nusb`](crate::Nusb) type parameter.
 //!
 //! Unlike the per-OS native backends, this one talks to devices with raw USB
 //! interrupt and control transfers, bypassing the OS HID stack entirely.

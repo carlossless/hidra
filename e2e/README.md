@@ -24,16 +24,17 @@ e2e/
 
 | target | platform | virtual device | privilege / setup |
 |--------|----------|----------------|-------------------|
-| `linux-hidraw` | Linux | kernel `uhid` (`Backend::Native`) | root; also a descriptor-variety test |
-| `linux-nusb` | Linux | `dummy_hcd` + configfs `g_hid` (`Backend::Nusb`) | root; needs USB-gadget kernel modules |
+| `linux-hidraw` | Linux | kernel `uhid` (`Native`) | root; also a descriptor-variety test |
+| `linux-nusb` | Linux | `dummy_hcd` + configfs `g_hid` (`Nusb`) | root; needs USB-gadget kernel modules |
 | `macos` | macOS | `IOHIDUserDevice` | root + SIP/AMFI off + signed entitlement — see [`platform/macos`](platform/macos/README.md) |
 | `windows` | Windows | WinUHid driver | test-signed driver — see [`platform/windows`](platform/windows/README.md) |
 | `webhid` | Linux + Chromium | `uhid` via Playwright | root; own sub-tree (wasm harness + native fixture) — see [`targets/webhid`](targets/webhid/README.md) |
 | `cynthion` | all | real USB via Cynthion + Facedancer | emulated *real* hardware, not virtual, on both backends — see [`targets/cynthion`](targets/cynthion/README.md) |
 
-Which hidra backend a suite drives is [`Caps::backend`](shared/conformance/src/lib.rs),
-picked at run time, so the whole workspace builds at once and one binary can
-cover both backends (`cynthion` does, via `HIDRA_BACKEND`).
+The backend a suite drives is the type parameter it passes to
+`run_conformance`; [`Caps::backend`](shared/conformance/src/lib.rs) only says
+which expectations apply. One binary can still cover both — `cynthion` reads
+`HIDRA_BACKEND` and picks the instantiation.
 
 ## Running
 

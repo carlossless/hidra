@@ -8,7 +8,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     # Reproducible Windows 11 VM builder (M-Labs). Pins its own nixpkgs (23.11);
-    # we deliberately do NOT `follows` it — makeWindowsImage is only tested against
+    # we deliberately do NOT `follows` it, makeWindowsImage is only tested against
     # that pin, and it always evaluates its layers with its own pkgs regardless.
     wfvm = {
       url = "git+https://git.m-labs.hk/m-labs/wfvm";

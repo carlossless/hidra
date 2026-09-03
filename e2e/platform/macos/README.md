@@ -3,7 +3,7 @@
 Validates the **IOHIDManager** backend against a real `IOHIDUserDevice`
 virtual HID device. Creating that virtual device uses the restricted
 `com.apple.developer.hid.virtual.device` entitlement, which the kernel only
-honors with AMFI relaxed — so this runs in a VM with SIP and AMFI disabled, not
+honors with AMFI relaxed, so this runs in a VM with SIP and AMFI disabled, not
 on a stock machine.
 
 Verified on macOS Sequoia 15.7.7 and Tahoe 26.5.2 (x86_64 VMs) and natively on
@@ -20,7 +20,7 @@ macOS 26.5.1 **Apple Silicon (arm64)**.
 On **Intel / VMs**, use `csr-active-config = 0x0FFF` plus the same
 `amfi_get_out_of_my_way=1` boot-arg (see below).
 
-> **If the signed binary dies with `Killed: 9`**, AMFI is still enforcing —
+> **If the signed binary dies with `Killed: 9`**, AMFI is still enforcing,
 > the code is fine. Confirm with:
 >
 > ```sh
@@ -29,7 +29,7 @@ On **Intel / VMs**, use `csr-active-config = 0x0FFF` plus the same
 > # AMFI: bailing out because of restricted entitlements.
 > ```
 >
-> Isolate it in seconds — build `int main(){return 42;}` and run it as root
+> Isolate it in seconds, build `int main(){return 42;}` and run it as root
 > three ways: unsigned, ad-hoc signed, and ad-hoc signed **+ entitlement**.
 > Only the last one dying means the security config, not your code, is at
 > fault. On Intel/VMs that's a partial SIP (`csr-active-config != 0x0FFF`); on
@@ -53,7 +53,7 @@ On **Intel / VMs**, use `csr-active-config = 0x0FFF` plus the same
 
 ## Disabling SIP / AMFI
 
-SIP and AMFI cannot be changed from inside a running macOS — with NVRAM
+SIP and AMFI cannot be changed from inside a running macOS, with NVRAM
 Protections on, `sudo nvram csr-active-config=…` fails with
 `(iokit/common) not permitted`. Edit the OpenCore `EFI/OC/config.plist`
 **offline**, with the VM shut down (back the image up first):

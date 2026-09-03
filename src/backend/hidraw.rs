@@ -389,7 +389,7 @@ impl HidDeviceBackend for HidrawDevice {
         }
         // The kernel always treats `data[0]` as the report number (0 for
         // devices without numbered reports) and consumes it itself, so the
-        // buffer is passed verbatim, leading 0 included — matching the
+        // buffer is passed verbatim, leading 0 included, matching the
         // hidraw contract (Documentation/hid/hidraw.rst). Stripping the 0
         // would shift the payload and reject minimal 2-byte writes with EINVAL.
         let res = loop {

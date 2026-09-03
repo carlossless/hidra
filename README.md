@@ -16,7 +16,7 @@ report-descriptor primitives.
 | Browsers | [WebHID](https://wicg.github.io/webhid/) via `web-sys` | same types, await-only |
 
 `Nusb` adds raw USB transfers via [nusb](https://docs.rs/nusb) on the
-three native targets — see [Backends](#backends).
+three native targets, see [Backends](#backends).
 
 ## Quick start
 
@@ -62,7 +62,7 @@ the `RandomState` impl: a default type parameter does not drive inference, so
 it would otherwise need a turbofish. Other backends go through `builder()`.
 
 The two are different types, so a variable that holds either is yours to
-declare — `examples/backends.rs` is a complete one in about thirty lines,
+declare; `examples/backends.rs` is a complete one in about thirty lines,
 forwarding only the methods that program uses.
 
 Reach for `Nusb` when the OS HID stack has no node for a device, restricts it,
@@ -80,7 +80,7 @@ first, so enabling it cannot change which backend another crate ends up using.
 
 Following nusb's design, those futures drive either way:
 
-- `.await` in any async runtime — runtime-agnostic (plain `Waker` wake-ups, no
+- `.await` in any async runtime: runtime-agnostic (plain `Waker` wake-ups, no
   tokio/async-std dependency).
 - `.wait()` to block the current thread, via the `MaybeFuture` extension trait.
   Native only; `wasm32` cannot block, so there you must `.await`.

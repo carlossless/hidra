@@ -1750,7 +1750,7 @@ mod tests {
         // byte, so the returned length is used as-is.
         assert_eq!(WinDevice::get_report_len(0x05, 8, 64), 8);
         // Unnumbered report (leading 0): Windows omits the ID byte from the
-        // count, so add it back — this is the off-by-one the old code applied
+        // count, so add it back, this is the off-by-one the old code applied
         // unconditionally.
         assert_eq!(WinDevice::get_report_len(0, 8, 64), 9);
         // Never exceed the caller's buffer.

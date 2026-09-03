@@ -1,5 +1,5 @@
 //! Conformance suite against a *real* USB HID device emulated by a Cynthion
-//! running Facedancer (`device.py`) — the host under test sees genuine USB HID.
+//! running Facedancer (`device.py`), the host under test sees genuine USB HID.
 //!
 //! Run `device.py` on the Cynthion's host, then point `HIDRA_CYNTHION_CTRL` at
 //! its control server (default 127.0.0.1:9999; from a VM the host IP, e.g.

@@ -145,7 +145,7 @@ impl UhidDevice {
                         Some(UHID_GET_REPORT) => {
                             // id@4 (u32), rnum@8. Real USB HID prefixes GET_REPORT
                             // results to hidraw with the report number (byte 0, even
-                            // 0 when unnumbered — confirmed against hardware via
+                            // 0 when unnumbered, confirmed against hardware via
                             // Cynthion); emulate: rnum followed by the primed body.
                             let id = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
                             let rnum = buf[8];

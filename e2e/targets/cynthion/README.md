@@ -2,20 +2,20 @@
 
 This crate runs the shared conformance suite against a **real USB HID device**
 emulated by a [Cynthion](https://greatscottgadgets.com/cynthion/) running
-[Facedancer](https://github.com/greatscottgadgets/facedancer) — the most
+[Facedancer](https://github.com/greatscottgadgets/facedancer), the most
 authentic target available, since the host under test sees genuine USB hardware
 enumerated by its real HID stack (not a software virtual device).
 
 ## Pieces
 
-- **`device.py`** — the Facedancer device: emulates VID `0x1209` / PID `0x000c`,
+- **`device.py`**, the Facedancer device: emulates VID `0x1209` / PID `0x000c`,
   product `hidra-conformance`, the standard 8-byte input/output/feature vendor
   report descriptor (byte-identical to `conformance::make_descriptor(false)`).
   It also runs a small **TCP control server** so the device side can be driven
   remotely:
   `inject <hex>` (input report), `prime <hex>` (GET_REPORT payload),
   `output?` / `setfeature?` (last received), `reset`.
-- **`tests/cynthion.rs`** — a `VirtualDevice` that drives the device over that
+- **`tests/cynthion.rs`**, a `VirtualDevice` that drives the device over that
   control channel (`HIDRA_CYNTHION_CTRL`, default `127.0.0.1:9999`) while hidra
   talks to the real USB device, then runs `run_conformance`.
 
@@ -48,7 +48,7 @@ The suite runs in both report-ID modes. Verified passing on all three OSes:
 
 Every run also hits the shared suite's **concurrency** stress (the `Send + Sync`
 handle hammered by writes + get_feature from several threads), **odd/oversized
-input robustness** (no panic), and — over real USB — **disconnect** (Facedancer
+input robustness** (no panic), and, over real USB, **disconnect** (Facedancer
 drops the device; hidra's pending read resolves `Disconnected`). The Windows run
 additionally shows **`set_write_timeout` actually firing**: a 1ms timeout makes a
 real-USB write time out. The Windows/macOS runs also exercise the platform-only
@@ -58,10 +58,10 @@ on Windows, `set_open_exclusive()`/`open_exclusive()` on macOS.
 Two real-USB caveats: disconnect + `set_write_timeout`-firing **wedge the
 Facedancer emulation afterward**, so each Windows/macOS run needs a fresh
 `device.py`; and the **nusb** backend over the real Cynthion is flaky (nusb's
-usbhid detach/claim wedges Moondancer) — the stable real-USB path is hidraw.
+usbhid detach/claim wedges Moondancer), the stable real-USB path is hidraw.
 
 `feature`/`input_get` GET_REPORT are skipped on the Linux `g_hid` gadget, and
-strings on WinUHid — both virtual-device limitations, not real-Cynthion ones.
+strings on WinUHid, both virtual-device limitations, not real-Cynthion ones.
 
 **Numbered mode.** Set `HIDRA_CYNTHION_NUMBERED=1` on *both* `device.py` and the
 test (a real device's descriptor is fixed at enumeration, so each mode is a
@@ -86,7 +86,7 @@ emulated `1209:000c` device into the VM and, in the VM, run
 stack; no virtual-device entitlement or WinUHid is needed (those are for the
 *virtual*-device tests).
 
-**USB passthrough gotcha — speed detection.** QEMU's `usb-host` must present the
+**USB passthrough gotcha, speed detection.** QEMU's `usb-host` must present the
 device to the guest at its true **full speed (12 Mb/s)**. Two things break this:
 - **QEMU < 11 misdetects it as low-speed (1.5 Mb/s)** over the Cynthion's nested
   loopback hub chain. macOS/Windows then reject the device (a 64-byte `ep0` is
@@ -104,7 +104,7 @@ the device doesn't appear, `pnputil /restart-device` the xHCI controller.
 
 **macOS** (OSX-KVM): the libvirt domain misdetects the speed, so boot the *same*
 disks via a **direct** `qemu-system` command instead (see
-`OSX-KVM/OpenCore-Boot-cynthion.sh` — QEMU 11, `usb-host` on a dedicated
+`OSX-KVM/OpenCore-Boot-cynthion.sh`, QEMU 11, `usb-host` on a dedicated
 `qemu-xhci`, hostfwd `:2223→22`). Then run the test binary **as root**
 (`IOHIDDeviceOpen` returns `kIOReturnNotPrivileged`, `0xe00002c1`, otherwise).
 
@@ -113,7 +113,7 @@ To power-cycle a wedged Cynthion (Facedancer `LIBUSB_ERROR_TIMEOUT`), use
 
 A key finding this hardware surfaced: for a **real** USB HID device, Linux's
 hidraw returns `get_feature_report`/`get_input_report` **with** the leading
-`0x00` report-ID byte (like Windows/macOS) — the "bare body" seen with the
+`0x00` report-ID byte (like Windows/macOS), the "bare body" seen with the
 `uhid` software device is a uhid-emulation artifact, not real USB behavior.
 Because every real backend prepends the report-number byte, the conformance
 harness asserts the `[report-number, body]` framing unconditionally (there is

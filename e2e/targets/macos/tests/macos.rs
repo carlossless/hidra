@@ -212,8 +212,8 @@ struct MacDevice {
 }
 
 impl MacDevice {
-    /// Cancel, wait for the cancel handler to fire, then release — IOKit's
-    /// required teardown order — exactly once.
+    /// Cancel, wait for the cancel handler to fire, then release, IOKit's
+    /// required teardown order, exactly once.
     fn teardown(&self) {
         if self.torn_down.swap(true, Ordering::SeqCst) {
             return;

@@ -84,7 +84,7 @@ pub struct Caps {
 
 // Two former caps are now invariants: every backend supports write() output
 // reports and returns get_feature/get_input as [report-number, body] (0x00 when
-// unnumbered) — verified against real USB hardware via a Cynthion on both the
+// unnumbered), verified against real USB hardware via a Cynthion on both the
 // hidraw and nusb backends.
 
 impl Caps {
@@ -325,7 +325,7 @@ pub fn run_conformance<B: hidra::HidBackend>(
         "[{lb}] get_device_info interface_number"
     );
 
-    // Option methods are per-OS in hidra, so they run only where they compile —
+    // Option methods are per-OS in hidra, so they run only where they compile,
     // there, against every device incl. the real Cynthion. They belong to the
     // native backend, and must say so rather than misbehave on the other one.
     #[cfg(target_os = "macos")]
@@ -597,7 +597,7 @@ pub fn run_conformance<B: hidra::HidBackend>(
 
     // set_write_timeout firing (Windows). Run late: a fired 1ms write can leave a
     // real device mid-transfer. A 1ms timeout makes a slow real-USB write time
-    // out; a buffered virtual-device write still succeeds — accept either.
+    // out; a buffered virtual-device write still succeeds, accept either.
     #[cfg(target_os = "windows")]
     if caps.backend == Backend::Native {
         let mut out = vec![if numbered { RID_OUTPUT } else { 0 }];

@@ -31,9 +31,7 @@ fn main() -> HidResult<()> {
         let count = api
             .device_list()
             .filter(|d| {
-                target.map_or(true, |(vid, pid)| {
-                    d.vendor_id() == vid && d.product_id() == pid
-                })
+                target.is_none_or(|(vid, pid)| d.vendor_id() == vid && d.product_id() == pid)
             })
             .count();
         println!("{backend}: {count} device(s)");

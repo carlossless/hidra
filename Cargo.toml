@@ -2,10 +2,8 @@
 name = "hidra"
 version = "0.0.3"
 edition = "2021"
-# Applies to the default feature set (the per-OS backends and WebHID). Turning
-# on `nusb` raises the effective floor to whatever nusb itself requires (1.85
-# as of nusb 0.2.7); cargo reports that on its own.
-rust-version = "1.77"
+# Set by `nusb`, which is on by default; the rest of the crate builds on 1.77.
+rust-version = "1.85"
 description = "Pure Rust HID library."
 license = "MIT"
 repository = "https://github.com/carlossless/hidra"
@@ -41,7 +39,7 @@ default = ["nusb"]
 nusb = ["dep:nusb"]
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
-nusb = { version = "0.2.3", optional = true }
+nusb = { version = "0.2.7", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

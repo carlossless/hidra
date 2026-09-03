@@ -9,12 +9,22 @@ license = "MIT"
 repository = "https://github.com/carlossless/hidra"
 keywords = ["hid", "usb", "webhid", "hidraw"]
 categories = ["hardware-support", "api-bindings", "wasm"]
+# A whitelist, because `cargo package` also picks up untracked files: anything
+# left lying in the tree would otherwise be published.
+include = ["src/**/*", "examples/**/*", "README.md", "LICENSE"]
 
-# Build docs for the native and wasm/WebHID backends; WebHID needs the unstable web-sys cfg.
+# Every backend is per-target, so a target missing here means its public API
+# (container_id and set_write_timeout on Windows, set_open_exclusive on macOS)
+# is absent from the rendered docs. WebHID needs the unstable web-sys cfg.
 [package.metadata.docs.rs]
 all-features = true
 default-target = "x86_64-unknown-linux-gnu"
-targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "wasm32-unknown-unknown",
+]
 rustc-args = ["--cfg=web_sys_unstable_apis"]
 rustdoc-args = ["--cfg=web_sys_unstable_apis"]
 

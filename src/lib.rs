@@ -2,8 +2,7 @@
 //!
 //! A pure-Rust HID library.
 //!
-//! hidra talks to HID devices through native OS interfaces, no C library is
-//! linked:
+//! hidra talks to HID devices through native OS interfaces:
 //!
 #![cfg_attr(
     not(target_arch = "wasm32"),

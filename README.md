@@ -6,7 +6,7 @@
 
 A pure-Rust HID library: one async API across Linux, Windows, macOS and the
 browser, with blocking `.wait()` on native targets, plus standalone HID
-report-descriptor primitives. No C library is linked.
+report-descriptor primitives.
 
 | Platform | `Backend::Native` | Notes |
 |----------|-------------------|-------|

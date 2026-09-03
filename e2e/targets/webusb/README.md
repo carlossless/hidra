@@ -25,6 +25,20 @@ does not cascade into the native fixture:
 3. **`webusb_run.mjs`** — serves `index.html` + the wasm on a fixed port,
    launches Chromium (headed, under Xvfb), reads the harness result.
 
+## Device shapes
+
+[`run.sh`](run.sh) runs the harness three times, rebuilding the gadget between
+each, because the degenerate shapes are the ones with their own code paths:
+
+| variant | gadget | what it pins down |
+|---------|--------|-------------------|
+| `full` | 2 interrupt endpoints, report descriptor | the ordinary path |
+| `control-only` | `bNumEndpoints` 0 | every report goes over the control pipe: `write` falls back to `SET_REPORT(Output)`, `read` must refuse instead of hanging, and `get_input_report` remains the way to poll |
+| `no-report-descriptor` | endpoints, `GET_DESCRIPTOR(Report)` stalls | `report_descriptor` reports `Unsupported` rather than handing back an empty buffer |
+
+`control-only` is not hypothetical: it is the shape of the Sinowealth ISP
+bootloaders, which sinowisp drives entirely through feature reports.
+
 ## Why `device_list` and not the chooser
 
 `navigator.usb.requestDevice()` always opens a picker and needs a user gesture,

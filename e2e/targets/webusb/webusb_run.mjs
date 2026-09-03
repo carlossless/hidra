@@ -51,7 +51,8 @@ const PORT = 8098;
 
 async function main() {
   const server = await startServer();
-  const url = `http://localhost:${PORT}/index.html`;
+  const variant = process.env.VARIANT || "full";
+  const url = `http://localhost:${PORT}/index.html?variant=${variant}`;
 
   const browser = await chromium.launch({
     executablePath: process.env.CHROMIUM || undefined,

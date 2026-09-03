@@ -17,7 +17,8 @@
       document.getElementById("run").addEventListener("click", async () => {
         result.textContent = "running";
         try {
-          const summary = await run_webusb_test();
+          const variant = new URLSearchParams(location.search).get("variant") || "full";
+          const summary = await run_webusb_test(variant);
           result.textContent = summary;
           window.__hidraResult = { ok: true, summary };
         } catch (e) {

@@ -51,20 +51,54 @@ const HID_SET_REPORT: u8 = 0x09;
 const GET_DESCRIPTOR: u8 = 0x06;
 const DESCRIPTOR_TYPE_HID_REPORT: u8 = 0x22;
 
-/// One interface descriptor plus two interrupt endpoints, FS and HS alike.
-fn function_descriptors() -> Vec<u8> {
-    let mut d = Vec::new();
-    // interface: 2 endpoints, class 0xFF (vendor-specific) — the whole point.
-    d.extend_from_slice(&[9, 0x04, 0, 0, 2, 0xFF, 0x00, 0x00, 1]);
-    // EP1 IN, interrupt, 64 bytes
-    d.extend_from_slice(&[7, 0x05, 0x81, 0x03, 64, 0, 4]);
-    // EP2 OUT, interrupt, 64 bytes
-    d.extend_from_slice(&[7, 0x05, 0x02, 0x03, 64, 0, 4]);
+/// Which shape of device to present.
+#[derive(Clone, Copy, PartialEq)]
+enum Variant {
+    /// Two interrupt endpoints and a report descriptor.
+    Full,
+    /// `bNumEndpoints` 0: every report has to go over the control pipe.
+    ControlOnly,
+    /// Endpoints, but `GET_DESCRIPTOR(Report)` stalls — the usual shape for a
+    /// vendor-class interface, which owes no HID class descriptor.
+    NoReportDescriptor,
+}
+
+impl Variant {
+    fn from_arg(arg: Option<&str>) -> Self {
+        match arg {
+            None | Some("full") => Variant::Full,
+            Some("control-only") => Variant::ControlOnly,
+            Some("no-report-descriptor") => Variant::NoReportDescriptor,
+            Some(other) => panic!("unknown variant {other}"),
+        }
+    }
+
+    fn has_endpoints(self) -> bool {
+        self != Variant::ControlOnly
+    }
+
+    fn has_report_descriptor(self) -> bool {
+        self != Variant::NoReportDescriptor
+    }
+}
+
+/// One interface descriptor, plus two interrupt endpoints unless the variant
+/// is control-only, FS and HS alike.
+fn function_descriptors(variant: Variant) -> Vec<u8> {
+    let endpoints = if variant.has_endpoints() { 2 } else { 0 };
+    // interface: class 0xFF (vendor-specific) — the whole point.
+    let mut d = vec![9, 0x04, 0, 0, endpoints, 0xFF, 0x00, 0x00, 1];
+    if variant.has_endpoints() {
+        // EP1 IN, interrupt, 64 bytes
+        d.extend_from_slice(&[7, 0x05, 0x81, 0x03, 64, 0, 4]);
+        // EP2 OUT, interrupt, 64 bytes
+        d.extend_from_slice(&[7, 0x05, 0x02, 0x03, 64, 0, 4]);
+    }
     d
 }
 
-fn descriptor_blob() -> Vec<u8> {
-    let descs = function_descriptors();
+fn descriptor_blob(variant: Variant) -> Vec<u8> {
+    let descs = function_descriptors(variant);
     let flags = FUNCTIONFS_HAS_FS_DESC | FUNCTIONFS_HAS_HS_DESC | FUNCTIONFS_ALL_CTRL_RECIP;
     // head (12) + fs_count (4) + hs_count (4) + both descriptor sets
     let length = 12 + 4 + 4 + descs.len() * 2;
@@ -73,8 +107,9 @@ fn descriptor_blob() -> Vec<u8> {
     blob.extend_from_slice(&FUNCTIONFS_DESCRIPTORS_MAGIC_V2.to_le_bytes());
     blob.extend_from_slice(&(length as u32).to_le_bytes());
     blob.extend_from_slice(&flags.to_le_bytes());
-    blob.extend_from_slice(&3u32.to_le_bytes()); // fs: interface + 2 endpoints
-    blob.extend_from_slice(&3u32.to_le_bytes()); // hs: same
+    let count = if variant.has_endpoints() { 3u32 } else { 1u32 };
+    blob.extend_from_slice(&count.to_le_bytes()); // fs
+    blob.extend_from_slice(&count.to_le_bytes()); // hs
     blob.extend_from_slice(&descs);
     blob.extend_from_slice(&descs);
     blob
@@ -217,7 +252,7 @@ fn bind_udc() {
 }
 
 /// Service ep0: the control requests the host aims at our interface.
-fn ep0_loop(mut ep0: File) {
+fn ep0_loop(mut ep0: File, variant: Variant) {
     let mut event = [0u8; 12];
     loop {
         match ep0.read(&mut event) {
@@ -240,21 +275,31 @@ fn ep0_loop(mut ep0: File) {
                 let request = event[1];
                 let value = u16::from_le_bytes([event[2], event[3]]);
                 let length = u16::from_le_bytes([event[6], event[7]]) as usize;
-                handle_setup(&mut ep0, request_type, request, value, length);
+                handle_setup(&mut ep0, variant, request_type, request, value, length);
             }
             _ => {}
         }
     }
 }
 
-fn handle_setup(ep0: &mut File, request_type: u8, request: u8, value: u16, length: usize) {
+fn handle_setup(
+    ep0: &mut File,
+    variant: Variant,
+    request_type: u8,
+    request: u8,
+    value: u16,
+    length: usize,
+) {
     let to_host = request_type & 0x80 != 0;
     let report_id = (value & 0xFF) as u8;
     let report_type = value >> 8;
 
     match (to_host, request) {
         // GET_DESCRIPTOR(Report) — standard, interface recipient.
-        (true, GET_DESCRIPTOR) if report_type == u16::from(DESCRIPTOR_TYPE_HID_REPORT) => {
+        (true, GET_DESCRIPTOR)
+            if report_type == u16::from(DESCRIPTOR_TYPE_HID_REPORT)
+                && variant.has_report_descriptor() =>
+        {
             let desc = report_descriptor();
             let n = desc.len().min(length);
             let _ = ep0.write(&desc[..n]);
@@ -287,6 +332,8 @@ fn handle_setup(ep0: &mut File, request_type: u8, request: u8, value: u16, lengt
 }
 
 fn main() {
+    let arg = std::env::args().nth(1);
+    let variant = Variant::from_arg(arg.as_deref());
     setup_gadget();
     mount_ffs();
 
@@ -295,49 +342,55 @@ fn main() {
         .write(true)
         .open(format!("{FFS_MOUNT}/ep0"))
         .expect("open ep0");
-    ep0.write_all(&descriptor_blob())
+    ep0.write_all(&descriptor_blob(variant))
         .expect("write descriptors");
     ep0.write_all(&strings_blob()).expect("write strings");
 
     bind_udc();
 
-    // The endpoint files only appear once the descriptors are accepted.
-    let ep1 = OpenOptions::new()
-        .write(true)
-        .open(format!("{FFS_MOUNT}/ep1"))
-        .expect("open ep1");
-    let ep2 = OpenOptions::new()
-        .read(true)
-        .open(format!("{FFS_MOUNT}/ep2"))
-        .expect("open ep2");
-
-    thread::spawn(move || ep0_loop(ep0));
-
-    // Interrupt IN: keep an input report available for the harness to read.
-    thread::spawn(move || {
-        let mut ep1 = ep1;
-        let mut report = Vec::with_capacity(1 + IN_PAYLOAD.len());
-        report.push(RID_INPUT);
-        report.extend_from_slice(&IN_PAYLOAD);
-        loop {
-            if ep1.write(&report).is_err() {
-                thread::sleep(Duration::from_millis(100));
-            }
-        }
+    // The endpoint files only appear once the descriptors are accepted, and
+    // only for the variants that declared any.
+    let endpoints = variant.has_endpoints().then(|| {
+        let ep1 = OpenOptions::new()
+            .write(true)
+            .open(format!("{FFS_MOUNT}/ep1"))
+            .expect("open ep1");
+        let ep2 = OpenOptions::new()
+            .read(true)
+            .open(format!("{FFS_MOUNT}/ep2"))
+            .expect("open ep2");
+        (ep1, ep2)
     });
 
-    // Interrupt OUT: log whatever the harness writes.
-    thread::spawn(move || {
-        let mut ep2 = ep2;
-        let mut buf = [0u8; 64];
-        loop {
-            match ep2.read(&mut buf) {
-                Ok(n) if n > 0 => println!("OUTPUT {:02x?}", &buf[..n]),
-                Ok(_) => {}
-                Err(_) => thread::sleep(Duration::from_millis(100)),
+    thread::spawn(move || ep0_loop(ep0, variant));
+
+    if let Some((ep1, ep2)) = endpoints {
+        // Interrupt IN: keep an input report available for the harness to read.
+        thread::spawn(move || {
+            let mut ep1 = ep1;
+            let mut report = Vec::with_capacity(1 + IN_PAYLOAD.len());
+            report.push(RID_INPUT);
+            report.extend_from_slice(&IN_PAYLOAD);
+            loop {
+                if ep1.write(&report).is_err() {
+                    thread::sleep(Duration::from_millis(100));
+                }
             }
-        }
-    });
+        });
+
+        // Interrupt OUT: log whatever the harness writes.
+        thread::spawn(move || {
+            let mut ep2 = ep2;
+            let mut buf = [0u8; 64];
+            loop {
+                match ep2.read(&mut buf) {
+                    Ok(n) if n > 0 => println!("OUTPUT {:02x?}", &buf[..n]),
+                    Ok(_) => {}
+                    Err(_) => thread::sleep(Duration::from_millis(100)),
+                }
+            }
+        });
+    }
 
     println!("READY");
     loop {

@@ -17,8 +17,12 @@ fn jerr<E: std::fmt::Display>(e: E) -> JsValue {
     JsValue::from_str(&format!("{e}"))
 }
 
+/// `variant` mirrors the fixture: "full", "control-only" or
+/// "no-report-descriptor".
 #[wasm_bindgen]
-pub async fn run_webusb_test() -> Result<String, JsValue> {
+pub async fn run_webusb_test(variant: String) -> Result<String, JsValue> {
+    let endpoints = variant != "control-only";
+    let has_descriptor = variant != "no-report-descriptor";
     let api = Hidra::new().map_err(jerr)?;
     let mut log = Vec::<String>::new();
 
@@ -54,12 +58,21 @@ pub async fn run_webusb_test() -> Result<String, JsValue> {
     }
     log.push(format!("interface_number={}", info.interface_number()));
 
-    // GET_DESCRIPTOR(Report) over the vendor-class interface.
-    let descriptor = dev.report_descriptor().map_err(jerr)?;
-    if descriptor.is_empty() {
-        return Err(JsValue::from_str("empty report descriptor"));
+    // GET_DESCRIPTOR(Report) over the vendor-class interface. A vendor-class
+    // interface owes no HID class descriptor, and hidra has to say so rather
+    // than hand back an empty buffer.
+    match (has_descriptor, dev.report_descriptor()) {
+        (true, Ok(d)) if !d.is_empty() => log.push(format!("report_descriptor={} bytes", d.len())),
+        (true, Ok(_)) => return Err(JsValue::from_str("empty report descriptor")),
+        (true, Err(e)) => return Err(jerr(e)),
+        (false, Err(e)) => log.push(format!("report_descriptor unsupported: {e}")),
+        (false, Ok(d)) => {
+            return Err(JsValue::from_str(&format!(
+                "expected no report descriptor, got {} bytes",
+                d.len()
+            )))
+        }
     }
-    log.push(format!("report_descriptor={} bytes", descriptor.len()));
 
     // GET_REPORT(Feature): buf[0] carries the report ID on entry.
     let mut buf = vec![0u8; 1 + FEAT_PAYLOAD.len()];
@@ -79,26 +92,50 @@ pub async fn run_webusb_test() -> Result<String, JsValue> {
     dev.send_feature_report(&out).await.map_err(jerr)?;
     log.push("send_feature_report ok".into());
 
-    // Interrupt OUT.
+    // An output report goes out on the interrupt OUT endpoint when there is
+    // one, and falls back to SET_REPORT(Output) on the control pipe when there
+    // is not — the shape the Sinowealth ISP bootloaders take.
     let mut written = vec![RID_INPUT];
     written.extend_from_slice(&OUT_PAYLOAD);
     let n = dev.write(&written).await.map_err(jerr)?;
     log.push(format!("write={n} bytes"));
 
-    // Interrupt IN: the fixture streams a known report.
-    let mut inbuf = vec![0u8; 64];
-    let n = dev.read(&mut inbuf).await.map_err(jerr)?;
-    if n == 0 {
-        return Err(JsValue::from_str("read returned 0 bytes"));
-    }
-    let expected = [&[RID_INPUT][..], &IN_PAYLOAD[..]].concat();
-    if inbuf[..n] != expected[..] {
-        return Err(JsValue::from_str(&format!(
-            "input report mismatch: {:02x?}",
-            &inbuf[..n]
-        )));
-    }
-    log.push(format!("read={n} bytes"));
+    if endpoints {
+        // Interrupt IN: the fixture streams a known report.
+        let mut inbuf = vec![0u8; 64];
+        let n = dev.read(&mut inbuf).await.map_err(jerr)?;
+        if n == 0 {
+            return Err(JsValue::from_str("read returned 0 bytes"));
+        }
+        let expected = [&[RID_INPUT][..], &IN_PAYLOAD[..]].concat();
+        if inbuf[..n] != expected[..] {
+            return Err(JsValue::from_str(&format!(
+                "input report mismatch: {:02x?}",
+                &inbuf[..n]
+            )));
+        }
+        log.push(format!("read={n} bytes"));
+    } else {
+        // No interrupt IN endpoint: read must refuse rather than hang, and
+        // GET_REPORT(Input) stays available as the way to poll.
+        let mut inbuf = vec![0u8; 64];
+        match dev.read(&mut inbuf).await {
+            Ok(n) => {
+                return Err(JsValue::from_str(&format!(
+                    "read succeeded ({n} bytes) on an interface with no interrupt IN"
+                )))
+            }
+            Err(e) => log.push(format!("read refused: {e}")),
+        }
 
-    Ok(format!("PASS: webusb conformance ({})", log.join("; ")))
+        let mut poll = vec![0u8; 1 + FEAT_PAYLOAD.len()];
+        poll[0] = RID_INPUT;
+        let n = dev.get_input_report(&mut poll).await.map_err(jerr)?;
+        log.push(format!("get_input_report={n} bytes"));
+    }
+
+    Ok(format!(
+        "PASS: webusb conformance [{variant}] ({})",
+        log.join("; ")
+    ))
 }

@@ -40,17 +40,38 @@ cat > "$POLICY" <<JSON
 }
 JSON
 
-FIXLOG="$(mktemp)"
-"$FIXTURE" > "$FIXLOG" 2>&1 &
-FPID=$!
-for _ in $(seq 1 50); do grep -q READY "$FIXLOG" 2>/dev/null && break; sleep 0.2; done
-grep -q READY "$FIXLOG" || { echo "fixture never became READY"; cat "$FIXLOG"; exit 3; }
+# Each variant is a different device shape, so the gadget is torn down and
+# rebuilt between them.
+#
+#   full                  two interrupt endpoints and a report descriptor
+#   control-only          bNumEndpoints 0 — every report over the control pipe,
+#                         which is what the Sinowealth ISP bootloaders look like
+#   no-report-descriptor  endpoints, but GET_DESCRIPTOR(Report) stalls, the
+#                         usual shape for a vendor-class interface
+VARIANTS="${VARIANTS:-full control-only no-report-descriptor}"
+STATUS=0
 
-cd "$WEB"
-CHROMIUM="$CHROMIUM" HOME="${HOME:-/root}" "$XVFB_RUN" -a "$NODE" webusb_run.mjs
-RC=$?
+for variant in $VARIANTS; do
+  echo "########## webusb variant: $variant ##########"
+  FIXLOG="$(mktemp)"
+  "$FIXTURE" "$variant" > "$FIXLOG" 2>&1 &
+  FPID=$!
+  for _ in $(seq 1 50); do grep -q READY "$FIXLOG" 2>/dev/null && break; sleep 0.2; done
+  if ! grep -q READY "$FIXLOG"; then
+    echo "fixture never became READY ($variant)"; cat "$FIXLOG"; exit 3
+  fi
 
-echo "--- fixture (device side) saw ---"
-grep -E 'OUTPUT|SET_REPORT|GET_REPORT|GET_DESCRIPTOR|STALL' "$FIXLOG" || echo "(nothing captured)"
-rm -f "$FIXLOG"
-exit $RC
+  ( cd "$WEB" && CHROMIUM="$CHROMIUM" HOME="${HOME:-/root}" VARIANT="$variant" \
+      "$XVFB_RUN" -a "$NODE" webusb_run.mjs )
+  RC=$?
+  [ $RC -eq 0 ] || STATUS=$RC
+
+  echo "--- fixture (device side) saw ---"
+  grep -E 'OUTPUT|SET_REPORT|GET_REPORT|GET_DESCRIPTOR|STALL' "$FIXLOG" || echo '(nothing captured)'
+  kill "$FPID" 2>/dev/null
+  wait "$FPID" 2>/dev/null
+  FPID=
+  rm -f "$FIXLOG"
+done
+
+exit $STATUS

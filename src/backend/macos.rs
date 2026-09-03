@@ -676,7 +676,7 @@ fn read_thread(device: SendRef<c_void>, mode: SendRef<c_void>, shared: Arc<Share
     }
 }
 
-/// An open IOHIDDevice.
+/// An open `IOHIDDevice`.
 pub struct MacDevice {
     device: IOHIDDeviceRef,
     /// Options the device was opened with; `IOHIDDeviceClose` wants them back.
@@ -1043,6 +1043,24 @@ impl std::future::Future for ReadAsync<'_> {
     ) -> std::task::Poll<Self::Output> {
         let this = self.get_mut();
         this.dev.shared.queue.poll_read(this.buf, cx)
+    }
+}
+
+impl core::fmt::Debug for MacApi {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MacApi").finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Debug for MacDevice {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MacDevice").finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Debug for ReadAsync<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ReadAsync").finish_non_exhaustive()
     }
 }
 

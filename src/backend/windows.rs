@@ -476,7 +476,7 @@ fn query_device_info(handle: HANDLE, path: &str, bus_type: BusType) -> DeviceInf
 
 // --- backend API -------------------------------------------------------------
 
-/// The Windows `hid.dll` / SetupAPI backend.
+/// The Windows `hid.dll` / `SetupAPI` backend.
 pub struct WinApi;
 
 impl HidBackend for WinApi {
@@ -1670,6 +1670,24 @@ fn emit_main(b: &mut DescriptorBuilder, kind: ReportKind, flags: MainFlags) {
         ReportKind::Output => b.output(flags),
         ReportKind::Feature => b.feature(flags),
     };
+}
+
+impl core::fmt::Debug for WinApi {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WinApi").finish()
+    }
+}
+
+impl core::fmt::Debug for WinDevice {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WinDevice").finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Debug for ReadAsync<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ReadAsync").finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

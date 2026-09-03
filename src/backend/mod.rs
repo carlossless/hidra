@@ -23,7 +23,7 @@ use crate::{DeviceInfo, HidError, HidResult};
 /// documented as usable from any thread, and the bound makes that a compile
 /// error to break instead of a doc comment to disbelieve.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) trait HidBackend: Sized + Send + Sync {
+pub trait HidBackend: Sized + Send + Sync {
     /// The open-device handle this backend produces.
     type Device: HidDeviceBackend;
 
@@ -71,14 +71,13 @@ pub(crate) trait HidBackend: Sized + Send + Sync {
 /// * `get_feature_report` / `get_input_report`: `buf[0]` must contain the
 ///   report ID on entry; on return the buffer starts with that ID.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) trait HidDeviceBackend: Send + Sync {
+pub trait HidDeviceBackend: Send + Sync {
     /// The future [`read_async`](Self::read_async) returns.
     ///
-    /// Named rather than `impl Future` so [`dispatch::DynRead`] can hold one
-    /// variant per backend; `Unpin` lets that enum project to the selected
-    /// variant without unsafe. Every backend's read future is a plain struct
-    /// borrowing the device and the caller's buffer, so the bound costs
-    /// nothing.
+    /// Named rather than `impl Future` so a caller holding several backends
+    /// can name it; `Unpin` lets an enum over them project to a variant
+    /// without unsafe. Every backend's read future is a plain struct borrowing
+    /// the device and the caller's buffer, so the bound costs nothing.
     type Read<'a>: Future<Output = HidResult<usize>> + Send + Unpin + 'a
     where
         Self: 'a;
@@ -176,13 +175,17 @@ pub(crate) mod windows;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
 
-// Dead whenever both dispatch slots are filled by a real backend.
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)]
-mod unsupported;
+// The per-OS backend for this target. A target without one has no `Native`,
+// so selecting it is a name resolution error rather than a runtime one.
+#[cfg(target_os = "linux")]
+pub use hidraw::{HidrawApi as Native, HidrawDevice as NativeDevice};
+#[cfg(target_os = "macos")]
+pub use macos::{MacApi as Native, MacDevice as NativeDevice};
+#[cfg(target_os = "windows")]
+pub use windows::{WinApi as Native, WinDevice as NativeDevice};
 
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) mod dispatch;
-
-#[cfg(not(target_arch = "wasm32"))]
-pub use dispatch::Backend;
+#[cfg(all(
+    feature = "nusb",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+pub use nusb::{NusbApi as Nusb, NusbDevice};

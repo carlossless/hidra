@@ -305,7 +305,7 @@ fn windows_virtual_conformance() {
     for numbered in [false, true] {
         match WinUHidDevice::create(&api, numbered) {
             Some(dev) => {
-                run_conformance(numbered, &caps, &dev);
+                run_conformance::<hidra::Native>(numbered, &caps, &dev);
                 drop(dev);
             }
             None => {

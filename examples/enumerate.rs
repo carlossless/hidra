@@ -5,22 +5,26 @@
 //! HIDRA_BACKEND=nusb cargo run --features nusb --example enumerate
 //! ```
 
-use hidra::Backend;
+use hidra::{HidBackend, Hidra, Native};
 
 fn main() -> hidra::HidResult<()> {
-    let backend = match std::env::var("HIDRA_BACKEND") {
-        Ok(name) => name.parse::<Backend>()?,
-        Err(_) => Backend::default(),
-    };
-    eprintln!(
-        "backend: {backend} (available: {})",
-        Backend::available()
-            .map(Backend::as_str)
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    // The backend is a type, so the choice is made once, here, and the rest of
+    // the program is generic over it.
+    match std::env::var("HIDRA_BACKEND").as_deref() {
+        #[cfg(all(
+            feature = "nusb",
+            any(target_os = "linux", target_os = "macos", target_os = "windows")
+        ))]
+        Ok("nusb") => run::<hidra::Nusb>(),
+        Ok(other) if other != "native" => Err(hidra::HidError::Unsupported {
+            message: format!("no backend named {other:?} in this build"),
+        }),
+        _ => run::<Native>(),
+    }
+}
 
-    let api = hidra::Hidra::builder().backend(backend).build()?;
+fn run<B: HidBackend>() -> hidra::HidResult<()> {
+    let api = Hidra::<B>::builder().build()?;
     for dev in api.device_list() {
         println!(
             "{:04x}:{:04x} bus={} usage={:04x}:{:04x} iface={} path={}",

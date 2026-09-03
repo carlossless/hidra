@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use conformance::{
     make_descriptor, MANUFACTURER, PRODUCT, RID_FEATURE, SERIAL, TEST_PID, TEST_VID,
 };
-use hidra::{Backend, Hidra, MaybeFuture};
+use hidra::{Hidra, MaybeFuture, Nusb};
 
 const GADGET: &str = "/sys/kernel/config/usb_gadget/hidra_ctrl";
 const FFS_INSTANCE: &str = "hidractl";
@@ -307,10 +307,7 @@ fn nusb_control_only_device() {
     let report_desc = make_descriptor(true);
     let gadget = ControlOnlyGadget::create(report_desc.clone());
 
-    let api = Hidra::builder()
-        .backend(Backend::Nusb)
-        .build()
-        .expect("open nusb backend");
+    let api = Hidra::<Nusb>::builder().build().expect("open nusb backend");
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let info = loop {

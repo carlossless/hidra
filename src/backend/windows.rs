@@ -476,7 +476,8 @@ fn query_device_info(handle: HANDLE, path: &str, bus_type: BusType) -> DeviceInf
 
 // --- backend API -------------------------------------------------------------
 
-pub(crate) struct WinApi;
+/// The Windows `hid.dll` / SetupAPI backend.
+pub struct WinApi;
 
 impl HidBackend for WinApi {
     type Device = WinDevice;
@@ -665,7 +666,8 @@ struct WriteState {
     buf: Vec<u8>,
 }
 
-pub(crate) struct WinDevice {
+/// An open Windows HID handle.
+pub struct WinDevice {
     read: Mutex<ReadState>,
     /// Waker hand-off for `read_async`; see [`ReadWake`] for the lifecycle.
     wake: Arc<ReadWake>,
@@ -997,7 +999,7 @@ impl WinDevice {
     /// `hid_winapi_get_container_id`: the `DEVPKEY_Device_ContainerId` GUID
     /// of the devnode behind this interface, as 16 bytes in the GUID's
     /// in-memory (little-endian fields) layout.
-    pub(crate) fn container_id(&self) -> HidResult<[u8; 16]> {
+    pub fn container_id(&self) -> HidResult<[u8; 16]> {
         let (list, devinfo) = devnode_for_interface(&self.path)?;
         let mut guid: GUID = unsafe { core::mem::zeroed() };
         let mut prop_type: DEVPROPTYPE = 0;
@@ -1024,7 +1026,7 @@ impl WinDevice {
     }
 
     /// `hid_winapi_set_write_timeout`.
-    pub(crate) fn set_write_timeout(&self, timeout_ms: u32) {
+    pub fn set_write_timeout(&self, timeout_ms: u32) {
         self.write_timeout_ms.store(timeout_ms, Ordering::Relaxed);
     }
 }
@@ -1278,7 +1280,8 @@ impl Drop for WinDevice {
 /// drop may leave the one-shot thread-pool wait armed with a stale waker; it
 /// fires at most once as a spurious (or no-op) wake and is unregistered on the
 /// next registration, or blockingly in `WinDevice`'s `Drop`.
-pub(crate) struct ReadAsync<'a> {
+/// The future [`WinDevice::read_async`] returns.
+pub struct ReadAsync<'a> {
     dev: &'a WinDevice,
     buf: &'a mut [u8],
 }

@@ -279,7 +279,7 @@ fn uhid_conformance() {
     let caps = linux_caps();
     for numbered in [false, true] {
         let dev = UhidDevice::create(numbered);
-        run_conformance(numbered, &caps, &dev);
+        run_conformance::<hidra::Native>(numbered, &caps, &dev);
         drop(dev);
     }
     eprintln!("PASS: uhid full-API conformance test");

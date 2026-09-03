@@ -236,7 +236,7 @@ fn nusb_conformance() {
     let caps = nusb_caps();
     for numbered in [false, true] {
         let dev = NusbGadget::create(numbered);
-        run_conformance(numbered, &caps, &dev);
+        run_conformance::<hidra::Nusb>(numbered, &caps, &dev);
         drop(dev);
     }
     eprintln!("PASS: nusb gadget full-API conformance test");

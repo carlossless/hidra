@@ -428,7 +428,8 @@ unsafe fn device_infos(device: IOHIDDeviceRef) -> Vec<DeviceInfo> {
 
 // --- backend API -----------------------------------------------------------------
 
-pub(crate) struct MacApi {
+/// The macOS `IOHIDManager` backend.
+pub struct MacApi {
     /// Whether `open`/`open_path` seize the device
     /// (`hid_darwin_set_open_exclusive`). Defaults to shared.
     open_exclusive: AtomicBool,
@@ -439,12 +440,12 @@ pub(crate) struct MacApi {
 
 impl MacApi {
     /// `hid_darwin_set_open_exclusive` equivalent.
-    pub(crate) fn set_open_exclusive(&self, exclusive: bool) {
+    pub fn set_open_exclusive(&self, exclusive: bool) {
         self.open_exclusive.store(exclusive, Ordering::Relaxed);
     }
 
     /// `hid_darwin_get_open_exclusive` equivalent.
-    pub(crate) fn open_exclusive(&self) -> bool {
+    pub fn open_exclusive(&self) -> bool {
         self.open_exclusive.load(Ordering::Relaxed)
     }
 }
@@ -675,7 +676,8 @@ fn read_thread(device: SendRef<c_void>, mode: SendRef<c_void>, shared: Arc<Share
     }
 }
 
-pub(crate) struct MacDevice {
+/// An open IOHIDDevice.
+pub struct MacDevice {
     device: IOHIDDeviceRef,
     /// Options the device was opened with; `IOHIDDeviceClose` wants them back.
     open_options: IOOptionBits,
@@ -1026,7 +1028,8 @@ impl Drop for MacDevice {
 /// queued for the next read. A waker left behind by a dropped future causes
 /// at most one spurious wake-up; the queue drains its whole waker list on
 /// every wake, so stale entries never accumulate.
-pub(crate) struct ReadAsync<'a> {
+/// The future [`MacDevice::read_async`] returns.
+pub struct ReadAsync<'a> {
     dev: &'a MacDevice,
     buf: &'a mut [u8],
 }

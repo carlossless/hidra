@@ -13,7 +13,26 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use hidra::descriptor::{CollectionKind, DescriptorBuilder, MainFlags, ReportKind};
-pub use hidra::{Backend, BusType};
+pub use hidra::BusType;
+
+/// Which backend a suite is driving. Descriptive only: the backend itself is
+/// a type parameter, this just says which expectations apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// The per-OS backend.
+    Native,
+    /// The raw-USB backend.
+    Nusb,
+}
+
+impl core::fmt::Display for Backend {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Backend::Native => "native",
+            Backend::Nusb => "nusb",
+        })
+    }
+}
 use hidra::{HidError, MaybeFuture};
 
 pub const TEST_VID: u16 = 0x1209;
@@ -194,7 +213,11 @@ fn assert_get_framing(op: &str, lb: &str, numbered: bool, report_id: u8, buf: &[
 
 /// Run the full suite against one freshly created virtual device. `numbered`
 /// selects the descriptor variant; the platform must have created + started it.
-pub fn run_conformance(numbered: bool, caps: &Caps, vdev: &dyn VirtualDevice) {
+pub fn run_conformance<B: hidra::HidBackend>(
+    numbered: bool,
+    caps: &Caps,
+    vdev: &dyn VirtualDevice,
+) {
     let lb = label(numbered);
     if numbered {
         assert!(
@@ -204,11 +227,7 @@ pub fn run_conformance(numbered: bool, caps: &Caps, vdev: &dyn VirtualDevice) {
     }
     let rd = make_descriptor(numbered);
 
-    let api = hidra::Hidra::builder()
-        .backend(caps.backend)
-        .build()
-        .unwrap();
-    assert_eq!(api.backend(), caps.backend, "[{lb}] selected backend");
+    let api = hidra::Hidra::<B>::builder().build().unwrap();
     let info = {
         let deadline = Instant::now() + Duration::from_secs(6);
         loop {
@@ -242,28 +261,11 @@ pub fn run_conformance(numbered: bool, caps: &Caps, vdev: &dyn VirtualDevice) {
     // Exercise the alternate constructors as open-and-drop before the long-lived
     // handle below: a USB interface claims once at a time, so nusb can't hold two
     // handles to one device concurrently.
-    hidra::Hidra::builder()
-        .backend(caps.backend)
+    hidra::Hidra::<B>::builder()
         .enumerate_on_build(false)
         .build()
         .unwrap();
-    if caps.backend == Backend::default() {
-        // The no-argument constructors are the same thing with the default
-        // backend; only this run can check they agree.
-        assert_eq!(
-            hidra::Hidra::new().unwrap().backend(),
-            caps.backend,
-            "[{lb}] Hidra::new() backend"
-        );
-        hidra::Hidra::builder()
-            .enumerate_on_build(false)
-            .build()
-            .unwrap();
-    }
-    let mut api2 = hidra::Hidra::builder()
-        .backend(caps.backend)
-        .build()
-        .unwrap();
+    let mut api2 = hidra::Hidra::<B>::builder().build().unwrap();
     api2.refresh_devices().unwrap();
     assert!(
         api2.device_list()
@@ -651,10 +653,7 @@ pub fn run_conformance(numbered: bool, caps: &Caps, vdev: &dyn VirtualDevice) {
 
     // Error paths last, on a throwaway handle, so a failed open can't perturb the
     // live device: opening an absent VID/PID or a bogus path must fail cleanly.
-    let probe = hidra::Hidra::builder()
-        .backend(caps.backend)
-        .build()
-        .unwrap();
+    let probe = hidra::Hidra::<B>::builder().build().unwrap();
     assert!(
         probe.open(0xFFFF, 0xFFFF).wait().is_err(),
         "[{lb}] open() of an absent device should return an error"

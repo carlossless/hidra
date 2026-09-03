@@ -8,14 +8,14 @@ A pure-Rust HID library: one async API across Linux, Windows, macOS and the
 browser, with blocking `.wait()` on native targets, plus standalone HID
 report-descriptor primitives.
 
-| Platform | `Backend::Native` | Notes |
+| Platform | `Native` | Notes |
 |----------|-------------------|-------|
 | Linux | `hidraw` device nodes, sysfs enumeration | no libudev dependency |
 | Windows | `hid.dll` + SetupAPI (via `windows-sys` declarations) | |
 | macOS | IOHIDManager (direct framework FFI) | |
-| Browsers | [WebHID](https://wicg.github.io/webhid/) via `web-sys` | same types, await-only; no `Backend` |
+| Browsers | [WebHID](https://wicg.github.io/webhid/) via `web-sys` | same types, await-only |
 
-`Backend::Nusb` adds raw USB transfers via [nusb](https://docs.rs/nusb) on the
+`Nusb` adds raw USB transfers via [nusb](https://docs.rs/nusb) on the
 three native targets — see [Backends](#backends).
 
 ## Quick start
@@ -42,36 +42,39 @@ See `examples/` for runnable versions (`cargo run --example enumerate`).
 
 ## Backends
 
-Native builds carry both, and `Backend` picks between them **at run time**, per
-`Hidra` instance:
+The backend is a type parameter, so the choice is made at the call site and a
+backend this build does not have cannot be named:
 
-| `Backend` | Talks to | Available when |
-|-----------|----------|----------------|
+| Type | Talks to | Exists when |
+|------|----------|-------------|
 | `Native` (default) | the OS HID stack: hidraw, `hid.dll`, IOHIDManager | Linux, Windows, macOS |
 | `Nusb` | raw USB interrupt/control transfers, bypassing the OS HID stack | the `nusb` feature is on, and the target is Linux, macOS or Windows |
 
 ```rust
-use hidra::{Backend, Hidra};
+use hidra::{Hidra, Nusb};
 
-// Prefer the OS HID stack; fall back to raw USB where it has no node for the
-// device, or refuses access to it.
-let api = match Hidra::builder().backend(Backend::Native).build() {
-    Ok(api) => api,
-    Err(_) => Hidra::builder().backend(Backend::Nusb).build()?,
-};
+let native = Hidra::new()?;                    // the OS HID stack
+let usb = Hidra::<Nusb>::builder().build()?;   // raw USB transfers
 ```
 
-`Backend` implements `Display` and `FromStr` (`HIDRA_BACKEND=nusb`), and
-`Backend::is_available()` reports whether this build has one — an absent backend
-errors rather than falling back silently.
+`Hidra::new()` is on `Hidra<Native>` for the same reason `HashMap::new` is on
+the `RandomState` impl: a default type parameter does not drive inference, so
+it would otherwise need a turbofish. Other backends go through `builder()`.
+
+The two are different types, so a variable that holds either is yours to
+declare — `examples/backends.rs` is a complete one in about thirty lines,
+forwarding only the methods that program uses.
 
 Reach for `Nusb` when the OS HID stack has no node for a device, restricts it,
 or must be taken out of the way; `get_indexed_string` needs it too. It sees
 **USB devices only**, **claims the whole interface** while open, and needs
 raw-USB permissions (udev rules on Linux, a WinUSB-compatible driver on
-Windows). `Native`-only extensions (`set_open_exclusive`, `container_id`,
-`set_write_timeout`) report `Unsupported` under it. The feature is additive, so
-enabling it never changes which backend another crate gets.
+Windows). The per-OS extensions (`set_open_exclusive` on macOS, `container_id`
+and `set_write_timeout` on Windows) are inherent to `Native`, so calling one
+through `Nusb` is a compile error rather than a run-time `Unsupported`.
+
+The `nusb` feature is additive: the second backend is compiled in beside the
+first, so enabling it cannot change which backend another crate ends up using.
 
 ## Async and blocking
 

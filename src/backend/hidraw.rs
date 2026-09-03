@@ -241,7 +241,9 @@ fn device_infos(hid_dev_dir: &Path, dev_path: &str) -> Option<Vec<DeviceInfo>> {
 
 // --- backend API -------------------------------------------------------------
 
-pub(crate) struct HidrawApi;
+/// The Linux `hidraw` backend: device nodes plus sysfs enumeration.
+#[derive(Debug)]
+pub struct HidrawApi;
 
 impl HidBackend for HidrawApi {
     type Device = HidrawDevice;
@@ -287,7 +289,9 @@ impl HidBackend for HidrawApi {
 
 // --- device handle ------------------------------------------------------------
 
-pub(crate) struct HidrawDevice {
+/// An open hidraw device node.
+#[derive(Debug)]
+pub struct HidrawDevice {
     fd: OwnedFd,
     /// Metadata read from sysfs at open time.
     ///
@@ -402,7 +406,7 @@ impl HidDeviceBackend for HidrawDevice {
         Ok(res)
     }
 
-    /// Wake-ups come from the crate's [`reactor`](super::reactor).
+    /// Wake-ups come from the crate's epoll reactor.
     fn read_async<'a>(&'a self, buf: &'a mut [u8]) -> ReadAsync<'a> {
         ReadAsync { dev: self, buf }
     }
@@ -531,7 +535,9 @@ impl Drop for HidrawDevice {
 /// Cancel-safe: dropping it before completion leaves any pending report in
 /// the kernel's hidraw queue (the read syscall only happens when the fd is
 /// already readable).
-pub(crate) struct ReadAsync<'a> {
+/// The future [`HidrawDevice::read_async`] returns.
+#[derive(Debug)]
+pub struct ReadAsync<'a> {
     dev: &'a HidrawDevice,
     buf: &'a mut [u8],
 }

@@ -341,7 +341,7 @@ fn macos_conformance() {
     for numbered in [false, true] {
         match MacDevice::create(numbered) {
             Some(dev) => {
-                run_conformance(numbered, &caps, &dev);
+                run_conformance::<hidra::Native>(numbered, &caps, &dev);
                 drop(dev);
                 wait_gone();
             }

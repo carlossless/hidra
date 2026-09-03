@@ -96,9 +96,10 @@ fn numbered() -> bool {
 /// Which hidra backend to drive the same physical device through. Both are
 /// compiled in, so one binary covers the matrix; `run.sh` sets this per run.
 fn backend() -> Backend {
-    match std::env::var("HIDRA_BACKEND") {
-        Ok(name) => name.parse().expect("HIDRA_BACKEND"),
-        Err(_) => Backend::default(),
+    match std::env::var("HIDRA_BACKEND").as_deref() {
+        Ok("nusb") => Backend::Nusb,
+        Ok("native") | Err(_) => Backend::Native,
+        Ok(other) => panic!("HIDRA_BACKEND: no backend named {other:?}"),
     }
 }
 
@@ -155,6 +156,10 @@ fn cynthion_conformance() {
     let caps = cynthion_caps(numbered, backend);
 
     dev.cmd("reset");
-    run_conformance(numbered, &caps, &dev);
+    // The backend is a type, so the run-time choice picks the instantiation.
+    match caps.backend {
+        Backend::Native => run_conformance::<hidra::Native>(numbered, &caps, &dev),
+        Backend::Nusb => run_conformance::<hidra::Nusb>(numbered, &caps, &dev),
+    }
     eprintln!("PASS: cynthion (real USB HID) conformance test on the {backend} backend");
 }
